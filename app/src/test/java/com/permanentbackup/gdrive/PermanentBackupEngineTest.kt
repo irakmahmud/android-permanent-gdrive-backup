@@ -1508,7 +1508,7 @@ class PermanentBackupEngineTest {
                 .putString("display_name", "Legacy User")
                 .putString("access_token", "ya29.legacy_compromised_access")
                 .putString("refresh_token", "1//legacy_compromised_refresh_token")
-                .putBoolean("v2_security_migration_done", false)
+                .putBoolean("v2_compromised_token_purged", false)
                 .apply()
         }
 
@@ -1526,7 +1526,7 @@ class PermanentBackupEngineTest {
         // 2. Legacy tokens were wiped from SharedPreferences and migration flag set
         assertEquals("", legacyPrefs.getString("refresh_token", null))
         assertEquals("", legacyPrefs.getString("access_token", null))
-        assertTrue(legacyPrefs.getBoolean("v2_security_migration_done", false))
+        assertTrue(legacyPrefs.getBoolean("v2_compromised_token_purged", false))
         assertTrue(legacyPrefs.getBoolean("v2_legacy_token_was_purged", false))
 
         // 3. Account state preserves email identity but requires re-authorization (isConnected = false)
