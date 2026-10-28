@@ -1591,7 +1591,7 @@ class PermanentBackupEngineTest {
         assertEquals(256L * 1024L, savedRecord!!.uploadedBytes)
         assertEquals(UploadStatus.PENDING_RETRY, savedRecord.uploadStatus)
         assertTrue(savedRecord.resumableSessionUri?.contains("pause_session_1") == true)
-        assertEquals(SyncJobState.RETRY_SCHEDULED, dao.getSyncJobByRecordId(savedRecord.id)?.state)
+        assertEquals(SyncJobState.RETRY_SCHEDULED, dao.getSyncJobByRecordId(savedRecord.id)?.currentState)
     }
 
     // 22. Per-Folder Backup Enable/Disable & Folder Completeness Reporting (Section 5B & 12)
@@ -1725,7 +1725,6 @@ class PermanentBackupEngineTest {
         assertEquals(503, caught503!!.httpStatusCode)
 
         // Verify exponential backoff in BackupDao.transitionSyncJobState
-        val baseTime = 1_700_000_000_000L
         dao.transitionSyncJobState(
             accountId = "user@example.com",
             recordId = 99L,
@@ -1735,8 +1734,7 @@ class PermanentBackupEngineTest {
             backupVersion = 1,
             newState = SyncJobState.FAILED_RETRYABLE,
             uploadedBytes = 0L,
-            totalBytes = 1024L,
-            nowMs = baseTime
+            totalBytes = 1024L
         )
         dao.transitionSyncJobState(
             accountId = "user@example.com",
@@ -1747,11 +1745,10 @@ class PermanentBackupEngineTest {
             backupVersion = 1,
             newState = SyncJobState.RETRY_SCHEDULED,
             uploadedBytes = 0L,
-            totalBytes = 1024L,
-            nowMs = baseTime
+            totalBytes = 1024L
         )
         val job1 = dao.getSyncJobByRecordId(99L)!!
-        assertEquals(baseTime + 30_000L, job1.nextRetryAtMs)
+        assertEquals(30_000L, job1.nextRetryAtMs!! - job1.updatedAtMs)
 
         // Second failure -> retryCount = 2 -> backoff = 60_000L
         dao.transitionSyncJobState(
@@ -1763,8 +1760,7 @@ class PermanentBackupEngineTest {
             backupVersion = 1,
             newState = SyncJobState.FAILED_RETRYABLE,
             uploadedBytes = 0L,
-            totalBytes = 1024L,
-            nowMs = baseTime
+            totalBytes = 1024L
         )
         dao.transitionSyncJobState(
             accountId = "user@example.com",
@@ -1775,11 +1771,10 @@ class PermanentBackupEngineTest {
             backupVersion = 1,
             newState = SyncJobState.RETRY_SCHEDULED,
             uploadedBytes = 0L,
-            totalBytes = 1024L,
-            nowMs = baseTime
+            totalBytes = 1024L
         )
         val job2 = dao.getSyncJobByRecordId(99L)!!
-        assertEquals(baseTime + 60_000L, job2.nextRetryAtMs)
+        assertEquals(60_000L, job2.nextRetryAtMs!! - job2.updatedAtMs)
     }
 }
 
