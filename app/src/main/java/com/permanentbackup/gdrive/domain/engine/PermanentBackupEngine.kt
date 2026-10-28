@@ -328,7 +328,7 @@ class PermanentBackupEngine(
             // Load per-folder backup enable/disable rules for the active account
             val accountId = currentAccountId()
             val disabledFolders = backupDao.getBackupFoldersForAccount(accountId).filter { !it.backupEnabled }
-            val disabledCategories = disabledFolders.map { it.folderCategory }.toSet()
+            val disabledCategories = disabledFolders.map { it.folderName }.toSet()
             val disabledPaths = disabledFolders
                 .map { it.relativePath.replace('\\', '/').trim('/').lowercase() }
                 .filter { it.isNotBlank() }

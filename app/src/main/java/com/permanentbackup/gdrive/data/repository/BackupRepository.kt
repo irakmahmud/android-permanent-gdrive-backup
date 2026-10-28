@@ -305,7 +305,7 @@ class BackupRepository(
      * Queues a single local file from the Local Phone Storage Explorer for immediate backup.
      */
     suspend fun queueSingleLocalFile(item: LocalBrowseItem): Boolean {
-        if (item.isDirectory || item.isRestrictedAndroidFolder) return false
+        if (item.isDirectory || item.isRestrictedByOs) return false
         val normalizedTarget = item.relativePath.replace('\\', '/').trim('/')
         val discovered = storageSource.scanFilesSequence(computeHashes = true)
             .firstOrNull { it.relativePath.replace('\\', '/').trim('/').equals(normalizedTarget, ignoreCase = true) }
@@ -461,7 +461,7 @@ class BackupRepository(
         val accountId = currentAccountId()
         val savedFolders = backupDao.getBackupFoldersForAccount(accountId)
         val savedByPath = savedFolders.associateBy { it.relativePath }
-        val savedByName = savedFolders.associateBy { it.folderCategory }
+        val savedByName = savedFolders.associateBy { it.folderName }
 
         return storageSource.getFolderCoverageReport(backedUpMap).map { item ->
             val saved = savedByPath[item.relativePath] ?: savedByName[item.folderName]
