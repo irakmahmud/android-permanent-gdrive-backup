@@ -1591,7 +1591,7 @@ class PermanentBackupEngineTest {
         assertEquals(256L * 1024L, savedRecord!!.uploadedBytes)
         assertEquals(UploadStatus.PENDING_RETRY, savedRecord.uploadStatus)
         assertTrue(savedRecord.resumableSessionUri?.contains("pause_session_1") == true)
-        assertEquals(SyncJobState.RETRY_SCHEDULED, dao.getSyncJobByRecordId(savedRecord.id)?.currentState)
+        assertEquals(SyncJobState.RETRY_SCHEDULED, dao.getSyncJobByRecordId(savedRecord.id)?.syncState)
     }
 
     // 22. Per-Folder Backup Enable/Disable & Folder Completeness Reporting (Section 5B & 12)
