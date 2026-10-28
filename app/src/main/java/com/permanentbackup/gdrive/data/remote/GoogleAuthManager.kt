@@ -53,7 +53,7 @@ class GoogleAuthManager(
     private val httpClient: OkHttpClient = OkHttpClient(),
     private val tokenEndpointUrl: String = "https://oauth2.googleapis.com/token",
     private val revokeEndpointUrl: String = "https://oauth2.googleapis.com/revoke",
-    customPrefs: SharedPreferences? = null
+    private val customPrefs: SharedPreferences? = null
 ) {
     companion object {
         const val LEAST_PRIVILEGE_SCOPE = "https://www.googleapis.com/auth/drive.file"
