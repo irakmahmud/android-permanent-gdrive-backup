@@ -65,7 +65,8 @@ jobs:
           test -f "$APK_FILE"
           unzip -t "$APK_FILE" | tail -n 5
           echo "=== APK Signing Certificate Fingerprints (Register SHA-1 in Google Cloud Console) ==="
-          keytool -printcert -jarfile "$APK_FILE" | tee app/build/outputs/apk/debug/apk-signing-certificate.txt
+          APKSIGNER_BIN=$(find "${ANDROID_HOME:-$ANDROID_SDK_ROOT}/build-tools" -name apksigner | sort -V | tail -n 1)
+          "$APKSIGNER_BIN" verify --verbose --print-certs "$APK_FILE" | tee app/build/outputs/apk/debug/apk-signing-certificate.txt
           sha256sum "$APK_FILE" | tee app/build/outputs/apk/debug/app-debug.apk.sha256
           ls -lh "$APK_FILE"
 

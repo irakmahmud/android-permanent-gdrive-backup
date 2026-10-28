@@ -86,6 +86,11 @@ android {
         unitTests {
             isReturnDefaultValues = true
             isIncludeAndroidResources = false
+            all {
+                it.testLogging {
+                    events("passed", "skipped", "failed")
+                }
+            }
         }
     }
 

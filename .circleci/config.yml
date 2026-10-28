@@ -105,7 +105,8 @@ jobs:
             APK_PATH="app/build/outputs/apk/debug/app-debug.apk"
             test -f "$APK_PATH"
             unzip -t "$APK_PATH" > /tmp/circleci-artifacts/reports/apk-zip-integrity.txt
-            keytool -printcert -jarfile "$APK_PATH" | tee /tmp/circleci-artifacts/reports/apk-signing-certificate.txt
+            APKSIGNER_BIN=$(find "${ANDROID_HOME:-/opt/android/sdk}/build-tools" -name apksigner | sort -V | tail -n 1)
+            "$APKSIGNER_BIN" verify --verbose --print-certs "$APK_PATH" | tee /tmp/circleci-artifacts/reports/apk-signing-certificate.txt
             sha256sum "$APK_PATH" | tee /tmp/circleci-artifacts/apk/app-debug.apk.sha256
             cp "$APK_PATH" /tmp/circleci-artifacts/apk/app-debug.apk
             if [ -f "app/build/outputs/apk/release/app-release.apk" ]; then
