@@ -1,0 +1,31 @@
+# Agent Workspace Files (Excluded from Git Repo)
+AGENTS.md
+GEMINI.md
+config/
+logs/
+scripts/
+sync_jobs/
+
+# Android / Gradle Build Artifacts (Strictly never generated locally)
+*.iml
+.gradle/
+/local.properties
+/.idea/
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+app/build/
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+bin/
+gen/
+out/
+release/
+*.keystore
+*.jks
+google-services.json

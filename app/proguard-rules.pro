@@ -1,0 +1,5 @@
+-keepattributes *Annotation*,Signature,InnerClasses,EnclosingMethod
+-keep class com.permanentbackup.gdrive.data.local.** { *; }
+-keep class com.permanentbackup.gdrive.domain.model.** { *; }
+-dontwarn okhttp3.**
+-dontwarn okio.**

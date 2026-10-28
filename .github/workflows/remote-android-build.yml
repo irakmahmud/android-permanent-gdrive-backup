@@ -1,0 +1,78 @@
+name: Remote Cloud Android Build & Verification
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  remote-android-apk-build:
+    name: Remote Cloud Build, Lint, 13 Unit Tests & APK Artifact
+    runs-on: ubuntu-latest
+    steps:
+      - name: "1. GitHub Repository Checkout"
+        uses: actions/checkout@v4
+
+      - name: "2 & 3. Set up Remote JDK 17 & Verify Android SDK"
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: "4. Verify Gradle Wrapper"
+        run: |
+          chmod +x ./gradlew
+          ./gradlew --version
+
+      - name: "5 & 6. Dependency Resolution & Kotlin Compilation"
+        run: |
+          ./gradlew :app:compileDebugKotlin :app:compileDebugUnitTestKotlin --no-daemon
+
+      - name: "7. Run Android Lint"
+        run: |
+          ./gradlew :app:lintDebug --no-daemon
+
+      - name: "8. Run All 13 Automated Reliability & Never-Delete Unit Tests"
+        run: |
+          ./gradlew :app:testDebugUnitTest --info --no-daemon
+
+      - name: "9. Assemble Installable Debug APK"
+        run: |
+          ./gradlew :app:assembleDebug --no-daemon
+
+      - name: "10. Verify APK Integrity & Compute SHA-256"
+        run: |
+          APK_FILE="app/build/outputs/apk/debug/app-debug.apk"
+          test -f "$APK_FILE"
+          unzip -t "$APK_FILE" | tail -n 5
+          sha256sum "$APK_FILE" | tee app/build/outputs/apk/debug/app-debug.apk.sha256
+          ls -lh "$APK_FILE"
+
+      - name: "11. Upload Downloadable APK Artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: Android-Permanent-Backup-Debug-APK
+          path: |
+            app/build/outputs/apk/debug/app-debug.apk
+            app/build/outputs/apk/debug/app-debug.apk.sha256
+            app/build/reports/tests/testDebugUnitTest/
+            app/build/reports/lint-results-debug.html
+
+      - name: "12. Publish Direct Downloadable APK to GitHub Releases (v1.0.0)"
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.0
+          name: "Android Permanent Google Drive Backup v1.0.0 (Debug APK)"
+          body: |
+            Automated Remote Cloud Build of **Android Permanent Google Drive Backup App**.
+            - **Policy**: Strictly Upload-Only, Append-Only, NEVER DELETE (`NeverDeleteGuardInterceptor`).
+            - **Root Drive Folder**: `Android_Permanent_Backup`
+            - **OAuth Scope**: `https://www.googleapis.com/auth/drive.file`
+            - **Automated Tests**: All 13 JUnit4 + MockWebServer Reliability & Security tests passed.
+          files: |
+            app/build/outputs/apk/debug/app-debug.apk
+            app/build/outputs/apk/debug/app-debug.apk.sha256

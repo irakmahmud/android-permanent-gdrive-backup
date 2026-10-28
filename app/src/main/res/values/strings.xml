@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Permanent Drive Backup</string>
+    <string name="notification_channel_name">Permanent Cloud Backup Engine</string>
+    <string name="notification_channel_desc">Upload-Only Append-Only Google Drive Backup</string>
+</resources>
