@@ -1504,11 +1504,11 @@ class PermanentBackupEngineTest {
 
         val legacyPrefs = TestInMemorySharedPreferences().apply {
             edit()
-                .putString("email", "legacy_user@gmail.com")
+                .putString("account_email", "legacy_user@gmail.com")
                 .putString("display_name", "Legacy User")
                 .putString("access_token", "ya29.legacy_compromised_access")
                 .putString("refresh_token", "1//legacy_compromised_refresh_token")
-                .putBoolean("legacy_v1_3_token_purged", false)
+                .putBoolean("v2_security_migration_done", false)
                 .apply()
         }
 
@@ -1524,9 +1524,10 @@ class PermanentBackupEngineTest {
         assertTrue(revokedTokens.single().contains("legacy_compromised_refresh_token"))
 
         // 2. Legacy tokens were wiped from SharedPreferences and migration flag set
-        assertEquals(null, legacyPrefs.getString("refresh_token", null))
-        assertEquals(null, legacyPrefs.getString("access_token", null))
-        assertTrue(legacyPrefs.getBoolean("legacy_v1_3_token_purged", false))
+        assertEquals("", legacyPrefs.getString("refresh_token", null))
+        assertEquals("", legacyPrefs.getString("access_token", null))
+        assertTrue(legacyPrefs.getBoolean("v2_security_migration_done", false))
+        assertTrue(legacyPrefs.getBoolean("v2_legacy_token_was_purged", false))
 
         // 3. Account state preserves email identity but requires re-authorization (isConnected = false)
         assertEquals("legacy_user@gmail.com", migratedAuth.accountState.value.email)
@@ -1586,7 +1587,7 @@ class PermanentBackupEngineTest {
         assertEquals(0, summary.uploadedAndVerifiedFiles)
         assertEquals(0, summary.failedUploads)
 
-        val savedRecord = dao.getLatestVersionForIdentity("fs:Documents/large_archive.bin")
+        val savedRecord = dao.getLatestVersionForIdentity("vol0:Documents/large_archive.bin")
         assertNotNull(savedRecord)
         assertEquals(256L * 1024L, savedRecord!!.uploadedBytes)
         assertEquals(UploadStatus.PENDING_RETRY, savedRecord.uploadStatus)
@@ -1628,8 +1629,8 @@ class PermanentBackupEngineTest {
         assertEquals(1, summary.skippedUnchangedFiles)
 
         // Verify DCIM was backed up while Documents was skipped
-        assertNotNull(dao.getLatestVersionForIdentity("fs:DCIM/camera_01.jpg"))
-        assertEquals(null, dao.getLatestVersionForIdentity("fs:Documents/private_notes.txt"))
+        assertNotNull(dao.getLatestVersionForIdentity("vol0:DCIM/camera_01.jpg"))
+        assertEquals(null, dao.getLatestVersionForIdentity("vol0:Documents/private_notes.txt"))
 
         val updatedCoverage = repository.getFolderCoverageItems()
         val dcimAfter = updatedCoverage.first { it.folderName == "DCIM" }
