@@ -1519,9 +1519,9 @@ class PermanentBackupEngineTest {
             revokeEndpointUrl = mockWebServer.url("/oauth2/revoke").toString()
         )
 
-        // 1. Remote revocation endpoint was called with the legacy refresh token
+        // 1. Remote revocation endpoint was called with the legacy refresh token (URL-encoded)
         assertEquals(1, revokedTokens.size)
-        assertTrue(revokedTokens.single().contains("1//legacy_compromised_refresh_token"))
+        assertTrue(revokedTokens.single().contains("legacy_compromised_refresh_token"))
 
         // 2. Legacy tokens were wiped from SharedPreferences and migration flag set
         assertEquals(null, legacyPrefs.getString("refresh_token", null))
@@ -1586,7 +1586,7 @@ class PermanentBackupEngineTest {
         assertEquals(0, summary.uploadedAndVerifiedFiles)
         assertEquals(0, summary.failedUploads)
 
-        val savedRecord = dao.getLatestVersionForIdentity("Documents/large_archive.bin")
+        val savedRecord = dao.getLatestVersionForIdentity("fs:Documents/large_archive.bin")
         assertNotNull(savedRecord)
         assertEquals(256L * 1024L, savedRecord!!.uploadedBytes)
         assertEquals(UploadStatus.PENDING_RETRY, savedRecord.uploadStatus)
@@ -1628,8 +1628,8 @@ class PermanentBackupEngineTest {
         assertEquals(1, summary.skippedUnchangedFiles)
 
         // Verify DCIM was backed up while Documents was skipped
-        assertNotNull(dao.getLatestVersionForIdentity("DCIM/camera_01.jpg"))
-        assertEquals(null, dao.getLatestVersionForIdentity("Documents/private_notes.txt"))
+        assertNotNull(dao.getLatestVersionForIdentity("fs:DCIM/camera_01.jpg"))
+        assertEquals(null, dao.getLatestVersionForIdentity("fs:Documents/private_notes.txt"))
 
         val updatedCoverage = repository.getFolderCoverageItems()
         val dcimAfter = updatedCoverage.first { it.folderName == "DCIM" }

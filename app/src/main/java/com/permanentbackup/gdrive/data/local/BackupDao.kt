@@ -388,7 +388,10 @@ interface BackupDao {
         val now = System.currentTimeMillis()
         val existing = getSyncJobByRecordId(recordId)
         val fromState = existing?.syncState?.name
-        val retryCount = if (newState == SyncJobState.FAILED_RETRYABLE || newState == SyncJobState.RETRY_SCHEDULED) {
+        val retryCount = if (
+            newState == SyncJobState.FAILED_RETRYABLE ||
+            (newState == SyncJobState.RETRY_SCHEDULED && existing?.syncState != SyncJobState.FAILED_RETRYABLE)
+        ) {
             (existing?.retryCount ?: 0) + 1
         } else {
             existing?.retryCount ?: 0
