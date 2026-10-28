@@ -5,6 +5,7 @@ config/
 logs/
 scripts/
 sync_jobs/
+.wa_media/
 
 # Android / Gradle Build Artifacts (Strictly never generated locally)
 *.iml

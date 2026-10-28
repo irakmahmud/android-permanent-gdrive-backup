@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.LinearProgressIndicator
@@ -39,19 +40,22 @@ import java.util.Locale
 
 enum class AppScreen(val title: String) {
     DASHBOARD("Dashboard"),
-    ACTIVITY("Activity"),
-    HISTORY("History"),
-    FAILED("Failed"),
+    ACCOUNT("Account"),
     FOLDERS("Folders"),
     SETTINGS("Settings"),
-    ACCOUNT("Account")
+    ACTIVITY("Activity"),
+    HISTORY("History"),
+    FAILED("Failed")
 }
 
 @Composable
 fun DashboardScreen(
     summary: DashboardSummary,
+    settings: BackupSettings,
     onBackupNow: () -> Unit,
-    onOpenPermissions: () -> Unit,
+    onOpenAccountScreen: () -> Unit,
+    onOpenFoldersScreen: () -> Unit,
+    onEnableConsentAndPermissions: () -> Unit,
     onRefresh: () -> Unit
 ) {
     LazyColumn(
@@ -60,6 +64,64 @@ fun DashboardScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
+        // Prominent Quick Setup Card right at the top of Dashboard!
+        item {
+            Card(
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.secondaryContainer
+                ),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        text = "Quick Setup (গুগল ড্রাইভ ও ফোল্ডার পারমিশন)",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Button(
+                        onClick = onOpenAccountScreen,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            if (summary.accountState.isConnected) {
+                                "✓ Google Account Connected (${summary.accountState.email}) — Manage"
+                            } else {
+                                "১. গুগল ড্রাইভ একাউন্ট যুক্ত করুন (Connect Google Account)"
+                            }
+                        )
+                    }
+                    Button(
+                        onClick = onEnableConsentAndPermissions,
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (settings.userBackupConsentGranted && summary.accessibleFolderCount > 0) {
+                                MaterialTheme.colorScheme.secondary
+                            } else {
+                                MaterialTheme.colorScheme.primary
+                        }
+                        )
+                    ) {
+                        Text(
+                            if (settings.userBackupConsentGranted && summary.accessibleFolderCount > 0) {
+                                "✓ স্টোরেজ পারমিশন সক্রিয় (${summary.accessibleFolderCount} Folders)"
+                            } else {
+                                "২. ফোল্ডার ও স্টোরেজ পারমিশন দিন (Grant Storage Access)"
+                            }
+                        )
+                    }
+                    OutlinedButton(
+                        onClick = onOpenFoldersScreen,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("ফোল্ডার তালিকা দেখুন (View Accessible & Restricted Folders)")
+                    }
+                }
+            }
+        }
+
         item {
             Card(
                 colors = CardDefaults.cardColors(
@@ -88,7 +150,7 @@ fun DashboardScreen(
                     title = "Permission Required",
                     message = summary.permissionFailureMessage,
                     actionLabel = "Grant Storage Access",
-                    onAction = onOpenPermissions
+                    onAction = onEnableConsentAndPermissions
                 )
             }
         }
@@ -466,6 +528,7 @@ fun SettingsScreen(
 @Composable
 fun GoogleAccountScreen(
     summary: DashboardSummary,
+    signInFeedbackMessage: String? = null,
     onLaunchGoogleSignIn: () -> Unit,
     onConnectTokenManually: (String, String, String, String?) -> Unit,
     onSwitchAccount: (String, String, String, String?) -> Unit,
@@ -489,17 +552,20 @@ fun GoogleAccountScreen(
                     verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     Text(
-                        text = "Google Drive OAuth 2.0 Connection",
+                        text = "Google Drive OAuth 2.0 Connection (গুগল ড্রাইভ একাউন্ট)",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
                     )
-                    Text("Status: ${if (summary.accountState.isConnected) "Connected" else "Disconnected"}")
+                    Text("Status: ${if (summary.accountState.isConnected) "Connected ✓" else "Disconnected"}")
                     Text("Account Email: ${summary.accountState.email.ifBlank { "Not signed in" }}")
                     Text("OAuth Scope: ${summary.accountState.grantedScope} (Least-Privilege drive.file)")
                     Text("Root Backup Folder: ${summary.accountState.rootDriveFolderName}")
                     Text("Root Folder ID: ${summary.accountState.rootDriveFolderId ?: "Will be created on first upload"}")
                     summary.accountState.connectionError?.let { err ->
                         Text("Notice: $err", color = MaterialTheme.colorScheme.error)
+                    }
+                    signInFeedbackMessage?.let { msg ->
+                        Text(msg, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold)
                     }
                     Spacer(modifier = Modifier.height(8.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -522,33 +588,36 @@ fun GoogleAccountScreen(
                     modifier = Modifier.padding(16.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Text("Account Reconnection / Switch Google Account", fontWeight = FontWeight.Bold)
                     Text(
-                        "Switching Google Accounts preserves all historical Room database records and never deletes files from the previous or new Google Drive.",
+                        "Direct Google Drive Account & OAuth Token Setup",
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        "এখানে আপনার Google ইমেইল এবং OAuth 2.0 Access Token দিয়ে সরাসরি Google Drive সংযুক্ত বা একাউন্ট পরিবর্তন করতে পারবেন। পুরোনো কোনো ব্যাকআপ কখনো ডিলিট হবে না।",
                         style = MaterialTheme.typography.bodySmall
                     )
                     OutlinedTextField(
                         value = emailInput,
                         onValueChange = { emailInput = it },
-                        label = { Text("Google Account Email") },
+                        label = { Text("Google Account Email (যেমন: yourname@gmail.com)") },
                         modifier = Modifier.fillMaxWidth()
                     )
                     OutlinedTextField(
                         value = nameInput,
                         onValueChange = { nameInput = it },
-                        label = { Text("Display Name") },
+                        label = { Text("Display Name (ঐচ্ছিক)") },
                         modifier = Modifier.fillMaxWidth()
                     )
                     OutlinedTextField(
                         value = accessTokenInput,
                         onValueChange = { accessTokenInput = it },
-                        label = { Text("OAuth 2.0 Access Token (drive.file)") },
+                        label = { Text("OAuth 2.0 Access Token (ya29...)") },
                         modifier = Modifier.fillMaxWidth()
                     )
                     OutlinedTextField(
                         value = refreshTokenInput,
                         onValueChange = { refreshTokenInput = it },
-                        label = { Text("OAuth 2.0 Refresh Token (Optional for Auto-Refresh)") },
+                        label = { Text("OAuth 2.0 Refresh Token (1//... স্বয়ংক্রিয় রিফ্রেশের জন্য)") },
                         modifier = Modifier.fillMaxWidth()
                     )
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {

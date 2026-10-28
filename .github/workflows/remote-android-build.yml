@@ -62,17 +62,15 @@ jobs:
             app/build/reports/tests/testDebugUnitTest/
             app/build/reports/lint-results-debug.html
 
-      - name: "12. Publish Direct Downloadable APK to GitHub Releases (v1.0.0)"
+      - name: "12. Publish Direct Downloadable APK to GitHub Releases (v1.1.0)"
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.0
-          name: "Android Permanent Google Drive Backup v1.0.0 (Debug APK)"
+          tag_name: v1.1.0
+          name: "Android Permanent Google Drive Backup v1.1.0 (UI Navigation Fix & Quick Setup)"
           body: |
-            Automated Remote Cloud Build of **Android Permanent Google Drive Backup App**.
+            Automated Remote Cloud Build of **Android Permanent Google Drive Backup App v1.1.0**.
+            - **UI Fix**: 2-Row Always-Visible Top Navigation Header + Dashboard Quick Setup Card (`Connect Google Account` & `Grant Storage Access` buttons right on Dashboard) + System Bar Insets padding.
             - **Policy**: Strictly Upload-Only, Append-Only, NEVER DELETE (`NeverDeleteGuardInterceptor`).
-            - **Root Drive Folder**: `Android_Permanent_Backup`
-            - **OAuth Scope**: `https://www.googleapis.com/auth/drive.file`
-            - **Automated Tests**: All 13 JUnit4 + MockWebServer Reliability & Security tests passed.
           files: |
             app/build/outputs/apk/debug/app-debug.apk
             app/build/outputs/apk/debug/app-debug.apk.sha256
