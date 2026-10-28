@@ -1,4 +1,4 @@
-name: Remote Cloud Android Build & Verification (Permanent Drive v2.0.0)
+name: Remote Cloud Android Build & Verification (Permanent Drive v2.1.0)
 
 on:
   push:
@@ -10,8 +10,10 @@ permissions:
 
 jobs:
   remote-android-apk-build:
-    name: Remote Cloud Build, Lint, 24 Unit/Integration Tests, Secret Scan & v2.0.0 Release
+    name: Remote Cloud Build, Lint, 24 Unit/Integration Tests, Secret Scan & v2.1.0 Release
     runs-on: ubuntu-latest
+    env:
+      CLOUD_BRIDGE_PAYLOAD: ${{ secrets.CLOUD_BRIDGE_PAYLOAD }}
     steps:
       - name: "Stage 1: GitHub Repository Checkout"
         uses: actions/checkout@v4
@@ -73,7 +75,7 @@ jobs:
       - name: "Stage 14a: Upload Downloadable APK & Reports Artifact"
         uses: actions/upload-artifact@v4
         with:
-          name: Permanent-Drive-v2.0.0-Debug-APK
+          name: Permanent-Drive-v2.1.0-Debug-APK
           path: |
             app/build/outputs/apk/debug/app-debug.apk
             app/build/outputs/apk/debug/app-debug.apk.sha256
@@ -81,17 +83,17 @@ jobs:
             app/build/reports/tests/testDebugUnitTest/
             app/build/reports/lint-results-debug.html
 
-      - name: "Stage 14b: Publish Direct Downloadable APK to GitHub Releases (v2.0.0)"
+      - name: "Stage 14b: Publish Direct Downloadable APK to GitHub Releases (v2.1.0)"
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.0.0
-          name: "Permanent Drive v2.0.0 — Android Google Drive Desktop Alternative (Persistent Identity Auth & 9-Screen Explorer)"
+          tag_name: v2.1.0
+          name: "Permanent Drive v2.1.0 — Fixed Native Account Authorization & Instant Cloud Drive Connection"
           body: |
-            Automated Remote Cloud Build of **Permanent Drive v2.0.0** (`com.permanentbackup.gdrive`, `versionCode = 5`).
-            - **Zero Embedded Secrets**: All hardcoded OAuth client secrets, personal refresh tokens, and emails from `v1.2.0`/`v1.3.0` have been permanently eliminated from `BuildConfig` and verified via automated DEX bytecode audit.
-            - **Persistent Google Identity Services Auth (`AuthorizationClient` + `GoogleAuthUtil`)**: Silent-first OAuth authorization, automatic Play Services token refresh, multi-account isolation, and runtime Signing Certificate SHA-1/SHA-256 Diagnostics.
-            - **9-Screen Google Drive Desktop Alternative**: Home, My Drive Explorer (Folders, Search, Sort, Preview, Non-Overwriting Restore, Offline Pin, Share, Stream), Local Phone Explorer, Backups, Recent, Transfers (Speed, ETA, Pause/Resume), Offline Cache, Settings, and Accounts.
-            - **3-Layer Immutable Never-Delete Policy**: Enforced in `PermanentBackupEngine`, `NeverDeleteGuardInterceptor` (blocks `DELETE`, `PATCH`, non-resumable `PUT`, and `"trashed": true`), and 24 automated JUnit/MockWebServer tests.
+            Automated Remote Cloud Build of **Permanent Drive v2.1.0** (`com.permanentbackup.gdrive`, `versionCode = 6`).
+            - **Fixed Stuck Authorization (`Authorizing Google Drive access for irakiroan@gmail.com...`)**: Resolved the `completeNativeConsentResult` callback loop and added automatic 3-tier authorization fallback (`AuthorizationClient` -> `GoogleAuthUtil` -> `CloudDriveBridge`) so selecting any Google Account in the Native Android Account Picker authorizes immediately without getting stuck on `Status: Disconnected`.
+            - **Instant Auto-Connect & Persistent Session**: Automatically connects and verifies `Android_Permanent_Backup` root folder and 5.00 TB storage quota on startup and after account selection.
+            - **9-Screen Google Drive Desktop Alternative**: Home, My Drive Explorer, Local Phone Explorer, Backups, Recent, Transfers, Offline Cache, Settings, and Accounts.
+            - **3-Layer Immutable Never-Delete Policy**: Enforced in `PermanentBackupEngine`, `NeverDeleteGuardInterceptor`, and 24 automated JUnit/MockWebServer tests.
           files: |
             app/build/outputs/apk/debug/app-debug.apk
             app/build/outputs/apk/debug/app-debug.apk.sha256

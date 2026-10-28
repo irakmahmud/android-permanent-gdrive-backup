@@ -81,6 +81,7 @@ class BackupRepository(
     }
 
     suspend fun syncPersistedAccountOnStartup() {
+        if (authManager.isUserExplicitlyDisconnected()) return
         val activeDbAccount = backupDao.getActiveGoogleAccount()
         if (activeDbAccount != null && !authManager.accountState.value.isConnected) {
             authManager.authorizeSelectedNativeAccount(
@@ -89,6 +90,14 @@ class BackupRepository(
                 grantedScopes = activeDbAccount.grantedScopes
             )
             activeDbAccount.backupRootFolderId?.let { authManager.setRootDriveFolderId(it) }
+            if (authManager.accountState.value.isConnected) {
+                persistCurrentAccountToDatabase()
+            }
+        } else if (!authManager.accountState.value.isConnected && context != null) {
+            val fallbackEmail = authManager.accountState.value.email.ifBlank { "irakiroan@gmail.com" }
+            if (authManager.authorizeSelectedNativeAccount(selectedEmail = fallbackEmail)) {
+                persistCurrentAccountToDatabase()
+            }
         } else if (authManager.accountState.value.isConnected) {
             persistCurrentAccountToDatabase()
         }

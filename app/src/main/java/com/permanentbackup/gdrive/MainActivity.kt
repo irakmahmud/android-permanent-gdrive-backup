@@ -44,6 +44,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.google.android.gms.auth.api.identity.Identity
 import com.permanentbackup.gdrive.domain.model.CloudBrowseItem
 import com.permanentbackup.gdrive.provider.DriveStreamingContentProvider
 import com.permanentbackup.gdrive.ui.screens.AppScreen
@@ -108,19 +109,6 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
-                // Official Google Identity Services AuthorizationClient PendingIntent resolution launcher
-                val identityAuthorizationLauncher = rememberLauncherForActivityResult(
-                    contract = ActivityResultContracts.StartIntentSenderForResult()
-                ) {
-                    if (pendingSelectedEmail.isNotBlank()) {
-                        viewModel.completeNativeConsentResult(
-                            context = this@MainActivity,
-                            selectedEmail = pendingSelectedEmail,
-                            requestFullDriveRead = pendingFullReadScope
-                        )
-                    }
-                }
-
                 // Fallback Play Services Consent Intent Launcher
                 val recoverableConsentLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.StartActivityForResult()
@@ -134,6 +122,32 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
+                // Official Google Identity Services AuthorizationClient PendingIntent resolution launcher
+                val identityAuthorizationLauncher = rememberLauncherForActivityResult(
+                    contract = ActivityResultContracts.StartIntentSenderForResult()
+                ) { result ->
+                    if (pendingSelectedEmail.isNotBlank()) {
+                        val gisToken = try {
+                            result.data?.let { data ->
+                                Identity.getAuthorizationClient(this@MainActivity)
+                                    .getAuthorizationResultFromIntent(data)
+                                    .accessToken
+                            }
+                        } catch (_: Throwable) {
+                            null
+                        }
+                        viewModel.completeNativeConsentResult(
+                            context = this@MainActivity,
+                            selectedEmail = pendingSelectedEmail,
+                            requestFullDriveRead = pendingFullReadScope,
+                            gisAccessToken = gisToken,
+                            onRecoverableConsentIntent = { consentIntent ->
+                                recoverableConsentLauncher.launch(consentIntent)
+                            }
+                        )
+                    }
+                }
+
                 // Native Android System Account Picker -> Followed by Official Drive AuthorizationClient
                 val nativeAccountPickerLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.StartActivityForResult()
@@ -142,22 +156,21 @@ class MainActivity : ComponentActivity() {
                         val selectedEmail = result.data
                             ?.getStringExtra(AccountManager.KEY_ACCOUNT_NAME)
                             .orEmpty()
-                        if (selectedEmail.isNotBlank()) {
-                            pendingSelectedEmail = selectedEmail
-                            viewModel.onNativeGoogleAccountSelected(
-                                context = this@MainActivity,
-                                selectedEmail = selectedEmail,
-                                requestFullDriveRead = pendingFullReadScope,
-                                onResolutionPendingIntent = { pendingIntent ->
-                                    identityAuthorizationLauncher.launch(
-                                        IntentSenderRequest.Builder(pendingIntent).build()
-                                    )
-                                },
-                                onRecoverableConsentIntent = { consentIntent ->
-                                    recoverableConsentLauncher.launch(consentIntent)
-                                }
-                            )
-                        }
+                            .ifBlank { summary.accountState.email.ifBlank { "irakiroan@gmail.com" } }
+                        pendingSelectedEmail = selectedEmail
+                        viewModel.onNativeGoogleAccountSelected(
+                            context = this@MainActivity,
+                            selectedEmail = selectedEmail,
+                            requestFullDriveRead = pendingFullReadScope,
+                            onResolutionPendingIntent = { pendingIntent ->
+                                identityAuthorizationLauncher.launch(
+                                    IntentSenderRequest.Builder(pendingIntent).build()
+                                )
+                            },
+                            onRecoverableConsentIntent = { consentIntent ->
+                                recoverableConsentLauncher.launch(consentIntent)
+                            }
+                        )
                     }
                 }
 

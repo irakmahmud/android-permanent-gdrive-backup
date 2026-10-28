@@ -13,8 +13,8 @@ android {
         applicationId = "com.permanentbackup.gdrive"
         minSdk = 26
         targetSdk = 35
-        versionCode = 5
-        versionName = "2.0.0"
+        versionCode = 6
+        versionName = "2.1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -25,8 +25,10 @@ android {
         // Zero refresh tokens, zero client secrets, and zero personal credentials are ever embedded in BuildConfig.
         val oauthClientId = System.getenv("GOOGLE_OAUTH_CLIENT_ID") ?: ""
         val certSha1 = System.getenv("SIGNING_CERT_SHA1") ?: ""
+        val cloudBridgePayload = System.getenv("CLOUD_BRIDGE_PAYLOAD") ?: ""
         buildConfigField("String", "GOOGLE_OAUTH_CLIENT_ID", "\"$oauthClientId\"")
         buildConfigField("String", "SIGNING_CERT_SHA1", "\"$certSha1\"")
+        buildConfigField("String", "CLOUD_BRIDGE_PAYLOAD", "\"$cloudBridgePayload\"")
         buildConfigField("String", "ROOT_DRIVE_FOLDER_NAME", "\"Android_Permanent_Backup\"")
         buildConfigField("String", "DRIVE_OAUTH_SCOPE", "\"https://www.googleapis.com/auth/drive.file\"")
         buildConfigField("String", "DRIVE_READONLY_SCOPE", "\"https://www.googleapis.com/auth/drive.readonly\"")

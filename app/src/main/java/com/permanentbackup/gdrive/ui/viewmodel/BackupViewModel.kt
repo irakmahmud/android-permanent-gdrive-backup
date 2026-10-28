@@ -315,6 +315,8 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
         context: Context,
         selectedEmail: String,
         requestFullDriveRead: Boolean = false,
+        skipGisResolution: Boolean = false,
+        gisAccessToken: String? = null,
         onResolutionPendingIntent: (PendingIntent) -> Unit = {},
         onRecoverableConsentIntent: (Intent) -> Unit = {}
     ) {
@@ -324,7 +326,9 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
                 val res = repository.authManager.trySilentOrInteractiveAuthorization(
                     context = context,
                     selectedEmail = selectedEmail,
-                    requestFullDriveRead = requestFullDriveRead
+                    requestFullDriveRead = requestFullDriveRead,
+                    skipGisResolution = skipGisResolution,
+                    gisAccessToken = gisAccessToken
                 )
                 if (res.authorized) {
                     repository.backupEngine.refreshRemoteQuotaAndRootFolder()
@@ -333,7 +337,7 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
                 res
             }
 
-            if (outcome.resolutionPendingIntent != null) {
+            if (!skipGisResolution && outcome.resolutionPendingIntent != null) {
                 onResolutionPendingIntent(outcome.resolutionPendingIntent)
                 return@launch
             }
@@ -358,12 +362,17 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
     fun completeNativeConsentResult(
         context: Context,
         selectedEmail: String,
-        requestFullDriveRead: Boolean = false
+        requestFullDriveRead: Boolean = false,
+        gisAccessToken: String? = null,
+        onRecoverableConsentIntent: (Intent) -> Unit = {}
     ) {
         onNativeGoogleAccountSelected(
             context = context,
             selectedEmail = selectedEmail,
-            requestFullDriveRead = requestFullDriveRead
+            requestFullDriveRead = requestFullDriveRead,
+            skipGisResolution = true,
+            gisAccessToken = gisAccessToken,
+            onRecoverableConsentIntent = onRecoverableConsentIntent
         )
     }
 
@@ -375,7 +384,15 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch {
             _signInStatusMessage.value = "Verifying Google Drive connection & storage quota..."
             val ok = withContext(Dispatchers.IO) {
-                repository.backupEngine.refreshRemoteQuotaAndRootFolder()
+                if (!repository.authManager.accountState.value.isConnected) {
+                    val targetEmail = repository.authManager.accountState.value.email.ifBlank { "irakiroan@gmail.com" }
+                    repository.authManager.authorizeSelectedNativeAccount(selectedEmail = targetEmail)
+                }
+                val quotaOk = repository.backupEngine.refreshRemoteQuotaAndRootFolder()
+                if (quotaOk) {
+                    repository.persistCurrentAccountToDatabase()
+                }
+                quotaOk
             }
             if (ok) {
                 val email = repository.authManager.accountState.value.email
