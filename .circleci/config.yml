@@ -64,9 +64,9 @@ jobs:
           command: |
             ./gradlew :app:lintDebug --no-daemon
 
-      # 8, 9 & 10. Unit Tests, Integration Tests & Never-Delete Policy Verification Tests (All 19 Automated Tests)
+      # 8, 9 & 10. Unit Tests, Integration Tests & Never-Delete Policy Verification Tests (All 24 Automated Tests)
       - run:
-          name: "Stage 8, 9 & 10: Execute 19 Unit, Integration & 3-Layer Never-Delete Policy Tests"
+          name: "Stage 8, 9 & 10: Execute 24 Unit, Integration & 3-Layer Never-Delete Policy Tests"
           command: |
             ./gradlew :app:testDebugUnitTest --info --no-daemon
 

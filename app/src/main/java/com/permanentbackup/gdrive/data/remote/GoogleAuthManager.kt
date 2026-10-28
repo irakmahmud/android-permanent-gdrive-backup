@@ -62,6 +62,7 @@ class GoogleAuthManager(
 
         private const val PREF_FILE_NAME = "encrypted_google_oauth_prefs"
         private const val KEY_V2_SECURITY_MIGRATION_DONE = "v2_compromised_token_purged"
+        private const val KEY_LEGACY_TOKEN_WAS_PURGED = "v2_legacy_token_was_purged"
         private const val KEY_CONNECTED = "is_connected"
         private const val KEY_USER_DISCONNECTED = "user_explicitly_disconnected"
         private const val KEY_EMAIL = "account_email"
@@ -107,18 +108,29 @@ class GoogleAuthManager(
     val accountState: StateFlow<GoogleAccountState> = _accountState.asStateFlow()
 
     /**
-     * Section 4 & 16: Purges any legacy refresh_token that was auto-populated from BuildConfig
-     * in v1.2.0 / v1.3.0 while preserving the user's account email and backup history.
+     * Section 4 & 16: Purges and remotely revokes any legacy refresh_token that was auto-populated
+     * from BuildConfig in v1.2.0 / v1.3.0 while preserving the user's account email, root folder ID,
+     * and backup history.
      */
     private fun purgeLegacyCompromisedTokensIfNeeded() {
         val alreadyPurged = getBoolean(KEY_V2_SECURITY_MIGRATION_DONE, false)
         if (alreadyPurged) return
 
         val legacyRefresh = getString(KEY_REFRESH_TOKEN, "")
-        if (legacyRefresh.isNotBlank() && prefs != null && customPrefs == null) {
+        if (legacyRefresh.isNotBlank() && prefs != null) {
             putString(KEY_REFRESH_TOKEN, "")
             putString(KEY_ACCESS_TOKEN, "")
             putLong(KEY_TOKEN_EXPIRES_AT, 0L)
+            putBoolean(KEY_LEGACY_TOKEN_WAS_PURGED, true)
+            if (appContext == null) {
+                revokeTokenRemotely(legacyRefresh)
+            } else {
+                Thread { revokeTokenRemotely(legacyRefresh) }.apply {
+                    name = "RevokeLegacyCompromisedToken"
+                    isDaemon = true
+                    start()
+                }
+            }
         }
         putBoolean(KEY_V2_SECURITY_MIGRATION_DONE, true)
     }
@@ -148,16 +160,18 @@ class GoogleAuthManager(
         }
         val expiresAt = getAccountScopedLong(accountId, KEY_TOKEN_EXPIRES_AT, getLong(KEY_TOKEN_EXPIRES_AT, 0L))
         val lastRefresh = getAccountScopedLong(accountId, KEY_LAST_REFRESH, getLong(KEY_LAST_REFRESH, 0L))
+        val legacyTokenWasPurged = getBoolean(KEY_LEGACY_TOKEN_WAS_PURGED, false)
 
         val authState = when {
             !connected || email.isBlank() -> AccountAuthState.DISCONNECTED
+            legacyTokenWasPurged -> AccountAuthState.AUTHORIZATION_REQUIRED
             scopes.contains(DRIVE_READONLY_SCOPE) -> AccountAuthState.AUTHORIZED
             else -> AccountAuthState.AUTHORIZED
         }
 
         return GoogleAccountState(
             accountId = accountId,
-            isConnected = connected && email.isNotBlank(),
+            isConnected = connected && email.isNotBlank() && !legacyTokenWasPurged,
             email = email,
             displayName = displayName.ifBlank { email.substringBefore("@") },
             selectedAccountRef = email,
@@ -168,8 +182,17 @@ class GoogleAuthManager(
             rootDriveFolderName = ROOT_BACKUP_FOLDER_NAME,
             tokenExpiresAtMs = expiresAt,
             lastTokenRefreshMs = lastRefresh,
-            lastTokenRefreshStatus = if (connected) "OK" else "DISCONNECTED",
-            lastSuccessfulConnectionMs = lastRefresh
+            lastTokenRefreshStatus = when {
+                legacyTokenWasPurged -> "REAUTH_REQUIRED"
+                connected -> "OK"
+                else -> "DISCONNECTED"
+            },
+            lastSuccessfulConnectionMs = lastRefresh,
+            connectionError = if (legacyTokenWasPurged) {
+                "Legacy v1.3.0 token was purged for security. Tap 'Connect Google Account' to re-authorize once."
+            } else {
+                null
+            }
         )
     }
 
@@ -292,6 +315,7 @@ class GoogleAuthManager(
 
         putBoolean(KEY_CONNECTED, true)
         putBoolean(KEY_USER_DISCONNECTED, false)
+        putBoolean(KEY_LEGACY_TOKEN_WAS_PURGED, false)
         putString(KEY_EMAIL, cleanEmail)
         putString(KEY_DISPLAY_NAME, displayName.ifBlank { deriveDisplayName(cleanEmail) })
         putString(KEY_ACCESS_TOKEN, accessToken)

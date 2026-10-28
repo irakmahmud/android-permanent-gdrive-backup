@@ -292,3 +292,10 @@ class DriveBadRequestException(
 ) : Exception(message)
 
 class DriveRateLimitException(message: String) : Exception(message)
+
+class DriveResourceNotFoundException(message: String) : java.io.IOException(message)
+
+class DriveConflictException(message: String) : java.io.IOException(message)
+
+class DriveServerException(val httpStatusCode: Int, message: String) : java.io.IOException(message)
+

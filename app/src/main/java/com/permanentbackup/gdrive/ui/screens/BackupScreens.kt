@@ -669,7 +669,9 @@ fun PhoneStorageExplorerScreen(
     onNavigateFolder: (String) -> Unit,
     onNavigateUp: () -> Unit,
     onGrantAllFilesAccess: () -> Unit,
-    onSelectSafTree: () -> Unit
+    onSelectSafTree: () -> Unit,
+    onToggleFolderBackup: (FolderCoverageItem, Boolean) -> Unit = { _, _ -> },
+    onBackupSingleFile: (LocalBrowseItem) -> Unit = {}
 ) {
     var showCoverageTab by remember { mutableStateOf(false) }
 
@@ -741,21 +743,37 @@ fun PhoneStorageExplorerScreen(
                                     onNavigateFolder(item.relativePath)
                                 }
                         ) {
-                            Column(modifier = Modifier.padding(12.dp)) {
-                                Text(
-                                    text = if (item.isDirectory) "📁 ${item.name}" else "📄 ${item.name}",
-                                    fontWeight = FontWeight.Bold
-                                )
-                                Text(
-                                    text = if (item.isRestrictedByOs) {
-                                        "Restricted by Android OS Sandbox (Never read or claimed)"
-                                    } else if (item.isDirectory) {
-                                        "Category: ${item.folderCategory} • ${item.childCount} items"
-                                    } else {
-                                        "${formatBytes(item.sizeBytes)} • ${item.mimeType} • Modified ${formatTimestamp(item.lastModifiedMs)}"
-                                    },
-                                    style = MaterialTheme.typography.bodySmall
-                                )
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(12.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = if (item.isDirectory) "📁 ${item.name}" else "📄 ${item.name}",
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                    Text(
+                                        text = if (item.isRestrictedByOs) {
+                                            "Restricted by Android OS Sandbox (Never read or claimed)"
+                                        } else if (item.isDirectory) {
+                                            "Category: ${item.folderCategory} • ${item.childCount} items"
+                                        } else {
+                                            "${formatBytes(item.sizeBytes)} • ${item.mimeType} • Modified ${formatTimestamp(item.lastModifiedMs)}"
+                                        },
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
+                                }
+                                if (!item.isDirectory && !item.isRestrictedByOs) {
+                                    OutlinedButton(
+                                        onClick = { onBackupSingleFile(item) },
+                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                                    ) {
+                                        Text("Backup File", fontSize = 11.sp)
+                                    }
+                                }
                             }
                         }
                     }
@@ -772,11 +790,29 @@ fun PhoneStorageExplorerScreen(
             }
             LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 items(coverageItems, key = { it.folderName + it.relativePath }) { item ->
+                    val isRestricted = item.accessStatus == com.permanentbackup.gdrive.domain.model.FolderAccessStatus.RESTRICTED_BY_ANDROID_OS
                     Card(modifier = Modifier.fillMaxWidth()) {
                         Column(modifier = Modifier.padding(12.dp)) {
-                            Text(item.folderName, fontWeight = FontWeight.Bold)
-                            Text("Relative Path: ${item.relativePath}")
-                            Text("Status: ${item.accessStatus} | Discovered Files: ${item.discoveredFileCount}")
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(item.folderName, fontWeight = FontWeight.Bold)
+                                    Text("Relative Path: ${item.relativePath}", style = MaterialTheme.typography.bodySmall)
+                                }
+                                Switch(
+                                    checked = item.backupEnabled && !isRestricted,
+                                    enabled = !isRestricted,
+                                    onCheckedChange = { enabled ->
+                                        onToggleFolderBackup(item, enabled)
+                                    }
+                                )
+                            }
+                            Text(
+                                "Status: ${item.accessStatus} | Backed Up: ${item.backedUpFileCount}/${item.discoveredFileCount} files"
+                            )
                             Text("Completeness: ${(item.completenessFraction * 100).toInt()}% | Last Scan: ${formatTimestamp(item.lastScanTimeMs)}")
                             Text(item.restrictionExplanation, style = MaterialTheme.typography.bodySmall)
                         }

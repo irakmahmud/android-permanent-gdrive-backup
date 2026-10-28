@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   remote-android-apk-build:
-    name: Remote Cloud Build, Lint, 19 Unit/Integration Tests, Secret Scan & v2.0.0 Release
+    name: Remote Cloud Build, Lint, 24 Unit/Integration Tests, Secret Scan & v2.0.0 Release
     runs-on: ubuntu-latest
     steps:
       - name: "Stage 1: GitHub Repository Checkout"
@@ -40,7 +40,7 @@ jobs:
         run: |
           ./gradlew :app:lintDebug --no-daemon
 
-      - name: "Stage 8, 9 & 10: Execute 19 Unit, Integration & 3-Layer Never-Delete Policy Tests"
+      - name: "Stage 8, 9 & 10: Execute 24 Unit, Integration & 3-Layer Never-Delete Policy Tests"
         run: |
           ./gradlew :app:testDebugUnitTest --info --no-daemon
 
@@ -91,7 +91,7 @@ jobs:
             - **Zero Embedded Secrets**: All hardcoded OAuth client secrets, personal refresh tokens, and emails from `v1.2.0`/`v1.3.0` have been permanently eliminated from `BuildConfig` and verified via automated DEX bytecode audit.
             - **Persistent Google Identity Services Auth (`AuthorizationClient` + `GoogleAuthUtil`)**: Silent-first OAuth authorization, automatic Play Services token refresh, multi-account isolation, and runtime Signing Certificate SHA-1/SHA-256 Diagnostics.
             - **9-Screen Google Drive Desktop Alternative**: Home, My Drive Explorer (Folders, Search, Sort, Preview, Non-Overwriting Restore, Offline Pin, Share, Stream), Local Phone Explorer, Backups, Recent, Transfers (Speed, ETA, Pause/Resume), Offline Cache, Settings, and Accounts.
-            - **3-Layer Immutable Never-Delete Policy**: Enforced in `PermanentBackupEngine`, `NeverDeleteGuardInterceptor` (blocks `DELETE`, `PATCH`, non-resumable `PUT`, and `"trashed": true`), and 19 automated JUnit/MockWebServer tests.
+            - **3-Layer Immutable Never-Delete Policy**: Enforced in `PermanentBackupEngine`, `NeverDeleteGuardInterceptor` (blocks `DELETE`, `PATCH`, non-resumable `PUT`, and `"trashed": true`), and 24 automated JUnit/MockWebServer tests.
           files: |
             app/build/outputs/apk/debug/app-debug.apk
             app/build/outputs/apk/debug/app-debug.apk.sha256

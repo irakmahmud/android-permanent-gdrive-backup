@@ -297,7 +297,13 @@ class MainActivity : ComponentActivity() {
                                     viewModel.updateSettings(settings.copy(userBackupConsentGranted = true))
                                     requestManageAllFilesAccess()
                                 },
-                                onSelectSafTree = { safTreeLauncher.launch(null) }
+                                onSelectSafTree = { safTreeLauncher.launch(null) },
+                                onToggleFolderBackup = { item, enabled ->
+                                    viewModel.toggleFolderBackup(item, enabled)
+                                },
+                                onBackupSingleFile = { item ->
+                                    viewModel.backupSingleLocalFile(item)
+                                }
                             )
                             AppScreen.BACKUPS -> BackupVersionHistoryScreen(
                                 verifiedHistory = verifiedHistory,

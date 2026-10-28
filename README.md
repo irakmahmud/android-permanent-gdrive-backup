@@ -14,13 +14,13 @@ A production-grade, strictly **Upload-Only, Append-Only, Never-Delete** Android 
 | 4 | `127.0.0.1:53682` Localhost Timeout | `rclone authorize "drive"` spins up a desktop loopback web server on `127.0.0.1:53682`, which does not exist on an Android phone. | Completely banned `127.0.0.1:53682` and all loopback OAuth URLs. |
 | 5 | `rclone`-Dependent Authentication | Previous versions instructed users to run `rclone` on a PC to extract tokens. | Zero `rclone` dependency anywhere in the Android app. |
 | 6 | Manual Token Copy-Paste | Users were asked to manually paste JSON tokens or `ya29.*` access tokens into text fields. | Removed manual token input UI; replaced with one-tap native Android Google Account sign-in. |
-| 7 | Post-Account Picker Drive Authorization Failure | `AccountManager.newChooseAccountIntent` only returns account email/type without requesting OAuth scope consent (`drive.file`), causing `UserRecoverableAuthException` on background threads. | `GoogleAuthManager.authorizeWithIdentityClient` immediately executes `AuthorizationClient.authorize(AuthorizationRequest)` and handles `PendingIntent` consent resolution on the UI thread before saving session state. |
-| 8 | Repeated Login Prompts | Access tokens expired after 1 hour (`HTTP 401`) without silent token refresh or persistent `GoogleAccountEntity` tracking. | Added `GoogleAccountEntity` in Room + `EncryptedSharedPreferences`, silent token refresh via `GoogleAuthUtil.clearToken` + `getToken` on `HTTP 401`, and automatic startup session restoration (`restorePersistedSessionOnStartup`). |
+| 7 | Post-Account Picker Drive Authorization Failure | `AccountManager.newChooseAccountIntent` only returns account email/type without requesting OAuth scope consent (`drive.file`), causing `UserRecoverableAuthException` on background threads. | `GoogleAuthManager.trySilentOrInteractiveAuthorization` immediately executes `AuthorizationClient.authorize(AuthorizationRequest)` and handles `PendingIntent` consent resolution on the UI thread before saving session state. |
+| 8 | Repeated Login Prompts | Access tokens expired after 1 hour (`HTTP 401`) without silent token refresh or persistent `GoogleAccountEntity` tracking. | Added `GoogleAccountEntity` in Room + `EncryptedSharedPreferences`, silent token refresh via `GoogleAuthUtil.clearToken` + `getToken` on `HTTP 401`, and automatic startup session restoration (`syncPersistedAccountOnStartup`). |
 | 9 | Refresh Token Exposure Risk | `v1.2.0` and `v1.3.0` injected `DEFAULT_GDRIVE_REFRESH_TOKEN` and `GOOGLE_OAUTH_CLIENT_SECRET` into `BuildConfig.java`. | Removed all secret `buildConfigField` entries from `app/build.gradle.kts`, purged all 5 GitHub repository secrets, deleted compromised `v1.2.0`/`v1.3.0` APK assets, and added an automated CI DEX bytecode secret scanner. |
-| 10 | Embedded OAuth Credentials in APK | Anyone decompiling `BuildConfig.class` from `v1.2.0`/`v1.3.0` could extract the embedded refresh token. | `GoogleAuthManager.purgeLegacyCompromisedTokensIfPresent()` detects any legacy `v1.2.0`/`v1.3.0` token on upgrade, revokes it via `https://oauth2.googleapis.com/revoke`, and clears it from storage. |
+| 10 | Embedded OAuth Credentials in APK | Anyone decompiling `BuildConfig.class` from `v1.2.0`/`v1.3.0` could extract the embedded refresh token. | `GoogleAuthManager.purgeLegacyCompromisedTokensIfNeeded()` detects any legacy `v1.2.0`/`v1.3.0` token on upgrade, revokes it via `https://oauth2.googleapis.com/revoke`, and clears it from storage. |
 | 11 | Inactive CircleCI Pipeline Transparency | CircleCI API returned `{"message":"Project not found"}` because the repo had not been enabled in CircleCI Web UI. | `.circleci/config.yml` is maintained with all 14 stages, while `scripts/fetch_cloud_apk.sh` transparently queries CircleCI API and distinguishes it from GitHub Actions builds. |
 | 12 | Confusing GitHub Actions vs CircleCI Builds | Previous reports did not clearly separate CircleCI status from GitHub Actions runner builds. | Build scripts and documentation explicitly distinguish CircleCI API status (`Project not found` until activated with `CIRCLE_TOKEN`) from active GitHub Actions remote cloud builds. |
-| 13 | Unverified Physical Device Claims | MockWebServer JVM tests were previously not clearly distinguished from physical Android phone + real Google Drive interactive tests. | All verification reports explicitly separate JVM/MockWebServer automated tests (`19/19 PASSED`) from physical device interactive tests (`Requires Physical Android Device & User Google Account`). |
+| 13 | Unverified Physical Device Claims | MockWebServer JVM tests were previously not clearly distinguished from physical Android phone + real Google Drive interactive tests. | All verification reports explicitly separate JVM/MockWebServer automated tests (`24/24 PASSED`) from physical device interactive tests (`Requires Physical Android Device & User Google Account`). |
 
 ---
 
@@ -30,7 +30,7 @@ A production-grade, strictly **Upload-Only, Append-Only, Never-Delete** Android 
 1. **Layer 1 — Domain Engine (`PermanentBackupEngine` & `CloudFileOperationsManager`)**:
    - Local file deletion only sets `localExists = false` in Room (`backup_file_records` and `local_files`). Cloud backups are never deleted.
    - Local file modification preserves Version $N$ on Google Drive and uploads Version $N+1$ (`filename__v2_<hash8>.ext`) as a distinct immutable Drive file (`BackupVersionEntity`).
-   - File Restore (`CloudFileOperationsManager.restoreCloudFileToPhone`) never overwrites an existing local file; if `photo.jpg` exists with different content, it restores to `photo (Restored_1).jpg`.
+   - File Restore (`CloudFileOperationsManager.restoreCloudFileToLocal`) never overwrites an existing local file; if `photo.jpg` exists with different content, it restores to `photo (Restored_1).jpg`.
 2. **Layer 2 — HTTP Transport Guard (`NeverDeleteGuardInterceptor`)**:
    - Intercepts every outgoing OkHttp request to `googleapis.com` and throws `NeverDeletePolicyViolationException` on any:
      - `HTTP DELETE`
@@ -38,7 +38,7 @@ A production-grade, strictly **Upload-Only, Append-Only, Never-Delete** Android 
      - Non-resumable `HTTP PUT` without `uploadType=resumable` and `upload_id=`
      - Request body containing `"trashed"\s*:\s*true`
 3. **Layer 3 — Automated Verification (`PermanentBackupEngineTest`)**:
-   - 19 JUnit + MockWebServer tests verify every state transition, crash reconciliation, non-overwriting restore, offline cache eviction budget, and transport-level blocking of `DELETE`/`PATCH`/`PUT`/`trashed:true`.
+   - 24 JUnit + MockWebServer tests verify every state transition, crash reconciliation, mid-upload pause/resume, per-folder enable/disable filtering, multi-account isolation, legacy token purge + revocation, non-overwriting restore, offline cache eviction budget, and transport-level blocking of `DELETE`/`PATCH`/`PUT`/`trashed:true`.
 
 ### B. 12 Mandatory Room Entities + 2 Legacy Compatibility Entities (Database v2, WAL Mode)
 - `GoogleAccountEntity` (`google_accounts`)

@@ -123,7 +123,7 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
                 }
             }
             val dbOk = withContext(Dispatchers.IO) {
-                app.database.checkDatabaseIntegrity()
+                app.database.checkDatabaseIntegrity() || app.database.attemptNonDestructiveRecovery()
             }
             _dashboardSummary.value = repository.buildDashboardSummary().copy(dbIntegrityOk = dbOk)
             _folderCoverage.value = repository.getFolderCoverageItems()
@@ -191,6 +191,31 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
         val curr = _currentLocalPath.value.trim('/')
         val parent = if (curr.contains('/')) curr.substringBeforeLast('/') else ""
         refreshLocalPhoneBrowser(parent)
+    }
+
+    fun toggleFolderBackup(item: FolderCoverageItem, enabled: Boolean) {
+        viewModelScope.launch(Dispatchers.IO) {
+            repository.toggleFolderBackupEnabled(item, enabled)
+            _actionFeedbackMessage.value = if (enabled) {
+                "Enabled permanent backup for folder '${item.folderName}'."
+            } else {
+                "Paused new backups for folder '${item.folderName}' (existing cloud files preserved)."
+            }
+            refreshDashboardAndCoverage()
+        }
+    }
+
+    fun backupSingleLocalFile(item: LocalBrowseItem) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val queued = repository.queueSingleLocalFile(item)
+            if (queued) {
+                _actionFeedbackMessage.value = "Queued '${item.name}' for permanent Google Drive backup."
+                repository.runBackupNow()
+            } else {
+                _actionFeedbackMessage.value = "'${item.name}' is already backed up and unchanged."
+            }
+            refreshDashboardAndCoverage(fetchRemoteQuota = true)
+        }
     }
 
     fun triggerManualBackupNow() {

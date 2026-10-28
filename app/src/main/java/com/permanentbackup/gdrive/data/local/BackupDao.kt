@@ -166,6 +166,9 @@ interface BackupDao {
     @Query("SELECT COUNT(*) FROM backup_file_records WHERE uploadStatus = 'VERIFIED'")
     suspend fun countVerifiedRecords(): Int
 
+    @Query("SELECT COUNT(DISTINCT sourceFileIdentity) FROM backup_file_records WHERE uploadStatus = 'VERIFIED' AND folderCategory = :category")
+    suspend fun countVerifiedFilesInCategory(category: String): Int
+
     @Query("SELECT COUNT(*) FROM backup_file_records WHERE uploadStatus IN ('PENDING', 'PENDING_RETRY', 'IN_PROGRESS')")
     suspend fun countPendingRecords(): Int
 
@@ -391,7 +394,8 @@ interface BackupDao {
             existing?.retryCount ?: 0
         }
         val nextRetryAt = if (newState == SyncJobState.RETRY_SCHEDULED) {
-            now + (minOf(retryCount, 6) * 60_000L)
+            val expShift = (retryCount - 1).coerceIn(0, 6)
+            now + ((1L shl expShift) * 30_000L)
         } else {
             null
         }

@@ -16,18 +16,24 @@ import com.permanentbackup.gdrive.domain.model.AuthTokenExpiredException
 import com.permanentbackup.gdrive.domain.model.BackupSettings
 import com.permanentbackup.gdrive.domain.model.DiscoveredSourceFile
 import com.permanentbackup.gdrive.domain.model.DriveBadRequestException
+import com.permanentbackup.gdrive.domain.model.DriveConflictException
 import com.permanentbackup.gdrive.domain.model.DrivePermissionException
 import com.permanentbackup.gdrive.domain.model.DriveQuotaInfo
 import com.permanentbackup.gdrive.domain.model.DriveRateLimitException
+import com.permanentbackup.gdrive.domain.model.DriveResourceNotFoundException
+import com.permanentbackup.gdrive.domain.model.DriveServerException
 import com.permanentbackup.gdrive.domain.model.FailureReason
 import com.permanentbackup.gdrive.domain.model.StorageQuotaFullException
 import com.permanentbackup.gdrive.domain.model.SyncJobState
 import com.permanentbackup.gdrive.domain.model.UploadSessionExpiredException
 import com.permanentbackup.gdrive.domain.model.UploadStatus
 import com.permanentbackup.gdrive.domain.model.VerificationStatus
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.IOException
 import java.util.Collections
 
@@ -90,6 +96,9 @@ class PermanentBackupEngine(
     val latestQuotaInfo: StateFlow<DriveQuotaInfo> = _latestQuotaInfo.asStateFlow()
 
     private val pausedRecordIds: MutableSet<Long> = Collections.synchronizedSet(HashSet())
+    private val cycleMutex = Mutex()
+    @Volatile
+    private var activeCycleDeferred: CompletableDeferred<BackupCycleSummary>? = null
 
     fun setEnginePaused(paused: Boolean) {
         _isPaused.value = paused
@@ -176,7 +185,7 @@ class PermanentBackupEngine(
     }
 
     /**
-     * Incremental Google Drive Changes API v3 sync (Section 9).
+     * Incremental Google Drive Changes API v3 sync across all available pages (Section 9).
      */
     suspend fun syncCloudChangesIncremental(): Int {
         if (!authManager.accountState.value.isConnected) return 0
@@ -195,49 +204,64 @@ class PermanentBackupEngine(
                 return 0
             }
 
-            val changesPage = driveApiClient.fetchDriveChanges(
-                accessToken = token,
-                accountId = accountId,
-                pageToken = existingTokenEntity.startPageToken
-            )
-            if (changesPage.changedFiles.isNotEmpty()) {
-                val entities = changesPage.changedFiles.map { item ->
-                    val prev = backupDao.getCloudFileById(item.driveFileId)
-                    CloudFileEntity(
-                        driveFileId = item.driveFileId,
-                        accountId = accountId,
-                        name = item.name,
-                        mimeType = item.mimeType,
-                        sizeBytes = item.sizeBytes,
-                        md5Checksum = item.md5Checksum,
-                        sha256Checksum = item.sha256Checksum,
-                        parentFolderId = item.parentFolderId,
-                        isFolder = item.isFolder,
-                        isProtectedBackupFile = item.isProtectedBackupFile,
-                        starred = item.starred,
-                        shared = item.shared,
-                        webViewLink = item.webViewLink,
-                        createdTimeMs = item.createdTimeMs,
-                        modifiedTimeMs = item.modifiedTimeMs,
-                        isPinnedOffline = prev?.isPinnedOffline ?: false,
-                        offlineLocalPath = prev?.offlineLocalPath,
-                        offlineCachedBytes = prev?.offlineCachedBytes ?: 0L
-                    )
+            var currentPageToken: String? = existingTokenEntity.startPageToken
+            var latestStartPageToken: String? = null
+            var totalChanged = 0
+            var pageCount = 0
+
+            while (!currentPageToken.isNullOrBlank() && pageCount < 10) {
+                pageCount++
+                val changesPage = driveApiClient.fetchDriveChanges(
+                    accessToken = token,
+                    accountId = accountId,
+                    pageToken = currentPageToken
+                )
+                if (changesPage.changedFiles.isNotEmpty()) {
+                    val entities = changesPage.changedFiles.map { item ->
+                        val prev = backupDao.getCloudFileById(item.driveFileId)
+                        CloudFileEntity(
+                            driveFileId = item.driveFileId,
+                            accountId = accountId,
+                            name = item.name,
+                            mimeType = item.mimeType,
+                            sizeBytes = item.sizeBytes,
+                            md5Checksum = item.md5Checksum,
+                            sha256Checksum = item.sha256Checksum,
+                            parentFolderId = item.parentFolderId,
+                            isFolder = item.isFolder,
+                            isProtectedBackupFile = item.isProtectedBackupFile,
+                            starred = item.starred,
+                            shared = item.shared,
+                            webViewLink = item.webViewLink,
+                            createdTimeMs = item.createdTimeMs,
+                            modifiedTimeMs = item.modifiedTimeMs,
+                            isPinnedOffline = prev?.isPinnedOffline ?: false,
+                            offlineLocalPath = prev?.offlineLocalPath,
+                            offlineCachedBytes = prev?.offlineCachedBytes ?: 0L
+                        )
+                    }
+                    backupDao.upsertCloudFiles(entities)
+                    totalChanged += changesPage.changedFiles.size
                 }
-                backupDao.upsertCloudFiles(entities)
+                if (!changesPage.newStartPageToken.isNullOrBlank()) {
+                    latestStartPageToken = changesPage.newStartPageToken
+                }
+                currentPageToken = changesPage.nextPageToken
+                if (!currentPageToken.isNullOrBlank()) {
+                    latestStartPageToken = currentPageToken
+                }
             }
-            val updatedToken = changesPage.newStartPageToken
-                ?: changesPage.nextPageToken
-                ?: existingTokenEntity.startPageToken
+
+            val updatedToken = latestStartPageToken ?: existingTokenEntity.startPageToken
             backupDao.upsertDriveChangeToken(
                 DriveChangeTokenEntity(
                     accountId = accountId,
                     startPageToken = updatedToken,
                     lastChangesPollMs = System.currentTimeMillis(),
-                    changesDetectedCount = existingTokenEntity.changesDetectedCount + changesPage.changedFiles.size
+                    changesDetectedCount = existingTokenEntity.changesDetectedCount + totalChanged
                 )
             )
-            changesPage.changedFiles.size
+            totalChanged
         } catch (_: Throwable) {
             0
         }
@@ -245,8 +269,31 @@ class PermanentBackupEngine(
 
     /**
      * Executes a complete scan + deduplication + version detection + resumable upload cycle.
+     * Coalesces concurrent invocations so two callers never scan or upload in parallel.
      */
     suspend fun runBackupCycle(settings: BackupSettings): BackupCycleSummary {
+        activeCycleDeferred?.let { inFlight ->
+            if (inFlight.isActive) {
+                return inFlight.await()
+            }
+        }
+        return cycleMutex.withLock {
+            val deferred = CompletableDeferred<BackupCycleSummary>()
+            activeCycleDeferred = deferred
+            try {
+                val summary = executeBackupCycleInternal(settings)
+                deferred.complete(summary)
+                summary
+            } catch (t: Throwable) {
+                deferred.completeExceptionally(t)
+                throw t
+            } finally {
+                activeCycleDeferred = null
+            }
+        }
+    }
+
+    private suspend fun executeBackupCycleInternal(settings: BackupSettings): BackupCycleSummary {
         if (!settings.userBackupConsentGranted) {
             val msg = "User backup consent not granted yet. No files were scanned or read."
             _lastPermissionError.value = msg
@@ -278,6 +325,15 @@ class PermanentBackupEngine(
             // Step 1: Recover any interrupted tasks from previous crash/reboot
             recoverInterruptedUploadsAfterRestart()
 
+            // Load per-folder backup enable/disable rules for the active account
+            val accountId = currentAccountId()
+            val disabledFolders = backupDao.getBackupFoldersForAccount(accountId).filter { !it.backupEnabled }
+            val disabledCategories = disabledFolders.map { it.folderCategory }.toSet()
+            val disabledPaths = disabledFolders
+                .map { it.relativePath.replace('\\', '/').trim('/').lowercase() }
+                .filter { it.isNotBlank() }
+                .toSet()
+
             // Step 2: Scan accessible folders in streaming sequence & evaluate deduplication/versioning
             var scannedCount = 0
             var newlyQueued = 0
@@ -287,6 +343,15 @@ class PermanentBackupEngine(
             for (discovered in storageSource.scanFilesSequence(computeHashes = true)) {
                 scannedCount++
                 discoveredIdentities.add(discovered.sourceFileIdentity)
+
+                val normalizedRelPath = discovered.relativePath.replace('\\', '/').trim('/').lowercase()
+                val isFolderDisabled = discovered.folderCategory in disabledCategories ||
+                    disabledPaths.any { dp -> normalizedRelPath == dp || normalizedRelPath.startsWith("$dp/") }
+                if (isFolderDisabled) {
+                    skippedUnchanged++
+                    continue
+                }
+
                 val queued = evaluateAndQueueDiscoveredFile(discovered)
                 if (queued) {
                     newlyQueued++
@@ -331,7 +396,8 @@ class PermanentBackupEngine(
 
     /**
      * Evaluates a single discovered file against the Room database:
-     * - Unchanged file -> skipped (returns false)
+     * - Unchanged file (already backed up for the active account) -> skipped (returns false)
+     * - Unchanged file not yet backed up for the active account -> queued for active account (returns true)
      * - New file -> queued as version 1 (returns true)
      * - Modified file -> previous verified version preserved untouched; new version (N+1) queued (returns true)
      */
@@ -389,7 +455,11 @@ class PermanentBackupEngine(
         }
 
         val isSameContent = isUnchangedFile(latest, discovered)
-        if (isSameContent) {
+        val existingVersions = backupDao.getBackupVersionsForIdentity(discovered.sourceFileIdentity)
+        val accountHasVerifiedBackup = existingVersions.isEmpty() ||
+            existingVersions.any { it.accountId == accountId }
+
+        if (isSameContent && accountHasVerifiedBackup) {
             if (!latest.localExists) {
                 backupDao.updateRecord(latest.copy(localExists = true))
             }
@@ -397,12 +467,17 @@ class PermanentBackupEngine(
         }
 
         val nextVersion = latest.backupVersion + 1
-        val versionedDriveName = buildVersionedDriveFileName(
-            originalName = discovered.displayName,
-            version = nextVersion,
-            sha256Hash = discovered.sha256Hash,
-            lastModifiedMs = discovered.lastModifiedMs
-        )
+        val isFirstBackupForThisAccount = isSameContent && !accountHasVerifiedBackup
+        val versionedDriveName = if (isFirstBackupForThisAccount) {
+            discovered.displayName
+        } else {
+            buildVersionedDriveFileName(
+                originalName = discovered.displayName,
+                version = nextVersion,
+                sha256Hash = discovered.sha256Hash,
+                lastModifiedMs = discovered.lastModifiedMs
+            )
+        }
 
         val recordId = backupDao.insertRecord(
             BackupFileEntity(
@@ -569,7 +644,7 @@ class PermanentBackupEngine(
                 if (success) {
                     verifiedCount++
                     madeProgressInBatch = true
-                } else {
+                } else if (!_isPaused.value && record.id !in pausedRecordIds) {
                     failedCount++
                     if (_quotaFullState.value) {
                         return verifiedCount to failedCount
@@ -804,6 +879,28 @@ class PermanentBackupEngine(
                     completedDriveFileId = emptyResult.driveFileId
                 } else {
                     while (currentOffset < record.fileSize) {
+                        if (_isPaused.value || record.id in pausedRecordIds) {
+                            backupDao.updateUploadProgress(
+                                id = record.id,
+                                uploadedBytes = currentOffset,
+                                sessionUri = sessionUri,
+                                status = UploadStatus.PENDING_RETRY
+                            )
+                            backupDao.transitionSyncJobState(
+                                accountId = accountId,
+                                recordId = record.id,
+                                sourceFileIdentity = record.sourceFileIdentity,
+                                fileName = record.driveStoredName,
+                                relativePath = record.relativePath,
+                                backupVersion = record.backupVersion,
+                                newState = SyncJobState.RETRY_SCHEDULED,
+                                uploadedBytes = currentOffset,
+                                totalBytes = record.fileSize,
+                                errorMessage = "Upload paused by user at byte offset $currentOffset"
+                            )
+                            return false
+                        }
+
                         val elapsedMs = (System.currentTimeMillis() - uploadStartTimeMs).coerceAtLeast(1L)
                         val bytesTransferredThisRun = (currentOffset - initialOffsetAtStart).coerceAtLeast(0L)
                         val speedBps = if (bytesTransferredThisRun > 0L) {
@@ -895,6 +992,67 @@ class PermanentBackupEngine(
                 detail = e.message ?: "Upload session expired",
                 retryable = true,
                 sessionUri = null
+            )
+            return false
+        } catch (e: DriveResourceNotFoundException) {
+            _lastNetworkError.value = e.message
+            backupDao.markUploadFailed(
+                id = record.id,
+                status = UploadStatus.PENDING_RETRY,
+                reason = FailureReason.SESSION_EXPIRED_RESTARTED,
+                detail = e.message,
+                sessionUri = null
+            )
+            recordFailureInDatabase(
+                accountId = accountId,
+                record = record,
+                reason = FailureReason.SESSION_EXPIRED_RESTARTED,
+                detail = e.message ?: "HTTP 404 Resource Not Found",
+                retryable = true,
+                sessionUri = null,
+                httpStatusCode = 404
+            )
+            return false
+        } catch (e: DriveConflictException) {
+            val latestSaved = backupDao.getRecordById(record.id)
+            val savedSession = latestSaved?.resumableSessionUri ?: record.resumableSessionUri
+            _lastNetworkError.value = e.message
+            backupDao.markUploadFailed(
+                id = record.id,
+                status = UploadStatus.PENDING_RETRY,
+                reason = FailureReason.NETWORK_ERROR,
+                detail = e.message,
+                sessionUri = savedSession
+            )
+            recordFailureInDatabase(
+                accountId = accountId,
+                record = latestSaved ?: record,
+                reason = FailureReason.NETWORK_ERROR,
+                detail = e.message ?: "HTTP 409 Conflict",
+                retryable = true,
+                sessionUri = savedSession,
+                httpStatusCode = 409
+            )
+            return false
+        } catch (e: DriveServerException) {
+            val latestSaved = backupDao.getRecordById(record.id)
+            val savedSession = latestSaved?.resumableSessionUri ?: record.resumableSessionUri
+            _lastNetworkError.value = e.message
+            backupDao.markUploadFailed(
+                id = record.id,
+                status = UploadStatus.PENDING_RETRY,
+                reason = FailureReason.NETWORK_ERROR,
+                detail = e.message,
+                sessionUri = savedSession
+            )
+            recordFailureInDatabase(
+                accountId = accountId,
+                record = latestSaved ?: record,
+                reason = FailureReason.NETWORK_ERROR,
+                detail = e.message ?: "HTTP ${e.httpStatusCode} Server Error",
+                retryable = true,
+                sessionUri = savedSession,
+                httpStatusCode = e.httpStatusCode
             )
             return false
         } catch (e: StorageQuotaFullException) {

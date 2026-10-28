@@ -3,9 +3,12 @@ package com.permanentbackup.gdrive.data.remote
 import com.permanentbackup.gdrive.domain.model.AuthTokenExpiredException
 import com.permanentbackup.gdrive.domain.model.CloudBrowseItem
 import com.permanentbackup.gdrive.domain.model.DriveBadRequestException
+import com.permanentbackup.gdrive.domain.model.DriveConflictException
 import com.permanentbackup.gdrive.domain.model.DrivePermissionException
 import com.permanentbackup.gdrive.domain.model.DriveQuotaInfo
 import com.permanentbackup.gdrive.domain.model.DriveRateLimitException
+import com.permanentbackup.gdrive.domain.model.DriveResourceNotFoundException
+import com.permanentbackup.gdrive.domain.model.DriveServerException
 import com.permanentbackup.gdrive.domain.model.DriveSortOrder
 import com.permanentbackup.gdrive.domain.model.DriveViewFilter
 import com.permanentbackup.gdrive.domain.model.StorageQuotaFullException
@@ -263,6 +266,9 @@ class DriveApiClient(
         when {
             !parentFolderId.isNullOrBlank() -> {
                 qParts.add("'${escapeDriveQueryLiteral(parentFolderId)}' in parents")
+            }
+            filter == DriveViewFilter.MY_DRIVE && searchQuery.isBlank() -> {
+                qParts.add("'root' in parents")
             }
             filter == DriveViewFilter.STARRED -> {
                 qParts.add("starred = true")
@@ -900,8 +906,17 @@ class DriveApiClient(
                     "Google Drive permission or scope insufficient (HTTP 403): $sanitizedBody"
                 )
             }
+            404 -> {
+                throw DriveResourceNotFoundException("Google Drive resource not found (HTTP 404): $sanitizedBody")
+            }
+            409 -> {
+                throw DriveConflictException("Google Drive resource conflict (HTTP 409): $sanitizedBody")
+            }
             429 -> {
                 throw DriveRateLimitException("Google Drive API HTTP 429 Too Many Requests: $sanitizedBody")
+            }
+            in 500..599 -> {
+                throw DriveServerException(code, "Google Drive API server error (HTTP $code): $sanitizedBody")
             }
             else -> {
                 throw IOException("Google Drive API error HTTP $code: $sanitizedBody")

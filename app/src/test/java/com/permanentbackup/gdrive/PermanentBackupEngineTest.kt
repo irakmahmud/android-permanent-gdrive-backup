@@ -1,5 +1,6 @@
 package com.permanentbackup.gdrive
 
+import android.content.SharedPreferences
 import com.permanentbackup.gdrive.data.local.AppSettingsEntity
 import com.permanentbackup.gdrive.data.local.BackupDao
 import com.permanentbackup.gdrive.data.local.BackupFileEntity
@@ -17,17 +18,24 @@ import com.permanentbackup.gdrive.data.local.SyncJobEntity
 import com.permanentbackup.gdrive.data.local.UploadSessionEntity
 import com.permanentbackup.gdrive.data.remote.DriveApiClient
 import com.permanentbackup.gdrive.data.remote.GoogleAuthManager
+import com.permanentbackup.gdrive.data.repository.BackupRepository
 import com.permanentbackup.gdrive.domain.engine.AndroidStorageScanner
 import com.permanentbackup.gdrive.domain.engine.CloudFileOperationsManager
 import com.permanentbackup.gdrive.domain.engine.PermanentBackupEngine
 import com.permanentbackup.gdrive.domain.engine.SourceFileReadOnlyGuard
+import com.permanentbackup.gdrive.domain.model.AccountAuthState
 import com.permanentbackup.gdrive.domain.model.BackupSettings
 import com.permanentbackup.gdrive.domain.model.CloudBrowseItem
 import com.permanentbackup.gdrive.domain.model.DiscoveredSourceFile
 import com.permanentbackup.gdrive.domain.model.DriveBadRequestException
+import com.permanentbackup.gdrive.domain.model.DriveConflictException
+import com.permanentbackup.gdrive.domain.model.DriveResourceNotFoundException
+import com.permanentbackup.gdrive.domain.model.DriveServerException
 import com.permanentbackup.gdrive.domain.model.DriveSortOrder
 import com.permanentbackup.gdrive.domain.model.DriveViewFilter
 import com.permanentbackup.gdrive.domain.model.FailureReason
+import com.permanentbackup.gdrive.domain.model.FolderAccessStatus
+import com.permanentbackup.gdrive.domain.model.FolderCoverageItem
 import com.permanentbackup.gdrive.domain.model.NeverDeletePolicyViolationException
 import com.permanentbackup.gdrive.domain.model.SourceFileModificationForbiddenException
 import com.permanentbackup.gdrive.domain.model.SyncJobState
@@ -236,6 +244,13 @@ class InMemoryBackupDao : BackupDao {
     override suspend fun countAllRecords(): Int = records.size
     override suspend fun countVerifiedRecords(): Int =
         records.values.count { it.uploadStatus == UploadStatus.VERIFIED }
+
+    override suspend fun countVerifiedFilesInCategory(category: String): Int =
+        records.values
+            .filter { it.uploadStatus == UploadStatus.VERIFIED && it.folderCategory == category }
+            .map { it.sourceFileIdentity }
+            .distinct()
+            .size
 
     override suspend fun countPendingRecords(): Int =
         records.values.count {
@@ -1471,4 +1486,358 @@ class PermanentBackupEngineTest {
         assertEquals("101", dao.getDriveChangeToken("user@example.com")?.startPageToken)
         assertNotNull(dao.getCloudFileById("cloud_doc_1"))
     }
+
+    // 20. Legacy v1.3.0 Compromised Token Purge, Remote Revocation & Re-Auth Requirement (Section 15)
+    @Test
+    fun test20_legacyCompromisedTokenPurge_revokesRemotelyAndRequiresReauth() {
+        val revokedTokens = ArrayList<String>()
+        mockWebServer.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                if (request.path?.startsWith("/oauth2/revoke") == true) {
+                    val bodyStr = request.body.readUtf8()
+                    revokedTokens.add(bodyStr)
+                    return MockResponse().setResponseCode(200).setBody("{}")
+                }
+                return MockResponse().setResponseCode(404)
+            }
+        }
+
+        val legacyPrefs = TestInMemorySharedPreferences().apply {
+            edit()
+                .putString("email", "legacy_user@gmail.com")
+                .putString("display_name", "Legacy User")
+                .putString("access_token", "ya29.legacy_compromised_access")
+                .putString("refresh_token", "1//legacy_compromised_refresh_token")
+                .putBoolean("legacy_v1_3_token_purged", false)
+                .apply()
+        }
+
+        val migratedAuth = GoogleAuthManager(
+            context = null,
+            customPrefs = legacyPrefs,
+            tokenEndpointUrl = mockWebServer.url("/oauth2/token").toString(),
+            revokeEndpointUrl = mockWebServer.url("/oauth2/revoke").toString()
+        )
+
+        // 1. Remote revocation endpoint was called with the legacy refresh token
+        assertEquals(1, revokedTokens.size)
+        assertTrue(revokedTokens.single().contains("1//legacy_compromised_refresh_token"))
+
+        // 2. Legacy tokens were wiped from SharedPreferences and migration flag set
+        assertEquals(null, legacyPrefs.getString("refresh_token", null))
+        assertEquals(null, legacyPrefs.getString("access_token", null))
+        assertTrue(legacyPrefs.getBoolean("legacy_v1_3_token_purged", false))
+
+        // 3. Account state preserves email identity but requires re-authorization (isConnected = false)
+        assertEquals("legacy_user@gmail.com", migratedAuth.accountState.value.email)
+        assertFalse(migratedAuth.accountState.value.isConnected)
+        assertEquals(AccountAuthState.AUTHORIZATION_REQUIRED, migratedAuth.accountState.value.authState)
+        assertEquals("REAUTH_REQUIRED", migratedAuth.accountState.value.lastTokenRefreshStatus)
+    }
+
+    // 21. Mid-Upload Pause Halts Multi-Chunk Streaming & Preserves Exact Resume Offset (Section 7)
+    @Test
+    fun test21_midUploadPause_haltsChunkStreamingAndPreservesResumeOffset() = runTest {
+        val docsDir = File(tempStorageDir, "Documents").apply { mkdirs() }
+        val chunkedFile = File(docsDir, "large_archive.bin").apply {
+            writeBytes(ByteArray(600 * 1024) { (it % 251).toByte() })
+        }
+
+        val scanner = AndroidStorageScanner(null, listOf(tempStorageDir), true)
+        val engine = PermanentBackupEngine(dao, scanner, driveApiClient, authManager)
+        val putRequestsReceived = AtomicInteger(0)
+
+        mockWebServer.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                val path = request.path ?: ""
+                val method = request.method ?: "GET"
+
+                if (path.startsWith("/drive/v3/about")) {
+                    return MockResponse()
+                        .setResponseCode(200)
+                        .setBody("""{"storageQuota":{"limit":15000000000,"usage":1000000}}""")
+                }
+                if (method == "GET" && path.startsWith("/drive/v3/files?")) {
+                    return MockResponse().setResponseCode(200).setBody("""{"files":[]}""")
+                }
+                if (method == "POST" && path.startsWith("/drive/v3/files")) {
+                    return MockResponse().setResponseCode(200).setBody("""{"id":"folder_docs","name":"Documents"}""")
+                }
+                if (method == "POST" && path.startsWith("/upload/drive/v3/files?uploadType=resumable")) {
+                    val sessionUrl = mockWebServer.url("/upload/drive/v3/files?uploadType=resumable&upload_id=pause_session_1").toString()
+                    return MockResponse().setResponseCode(200).addHeader("Location", sessionUrl)
+                }
+                if (method == "PUT" && path.contains("upload_id=pause_session_1")) {
+                    val count = putRequestsReceived.incrementAndGet()
+                    // Simulate user pausing the engine right as chunk 1 finishes uploading
+                    engine.setEnginePaused(true)
+                    return MockResponse()
+                        .setResponseCode(308)
+                        .addHeader("Range", "bytes=0-${256 * 1024 - 1}")
+                }
+                return MockResponse().setResponseCode(404)
+            }
+        }
+
+        val summary = engine.runBackupCycle(
+            BackupSettings(userBackupConsentGranted = true, chunkSizeBytes = 256 * 1024)
+        )
+        assertEquals(1, putRequestsReceived.get())
+        assertEquals(0, summary.uploadedAndVerifiedFiles)
+        assertEquals(0, summary.failedUploads)
+
+        val savedRecord = dao.getLatestVersionForIdentity("Documents/large_archive.bin")
+        assertNotNull(savedRecord)
+        assertEquals(256L * 1024L, savedRecord!!.uploadedBytes)
+        assertEquals(UploadStatus.PENDING_RETRY, savedRecord.uploadStatus)
+        assertTrue(savedRecord.resumableSessionUri?.contains("pause_session_1") == true)
+        assertEquals(SyncJobState.RETRY_SCHEDULED, dao.getSyncJobByRecordId(savedRecord.id)?.state)
+    }
+
+    // 22. Per-Folder Backup Enable/Disable & Folder Completeness Reporting (Section 5B & 12)
+    @Test
+    fun test22_perFolderBackupDisable_skipsDisabledFolderAndReportsCoverage() = runTest {
+        installStandardDriveMockDispatcher()
+        File(tempStorageDir, "DCIM").apply { mkdirs() }.let {
+            File(it, "camera_01.jpg").writeText("CAMERA_IMAGE_DATA_01")
+        }
+        File(tempStorageDir, "Documents").apply { mkdirs() }.let {
+            File(it, "private_notes.txt").writeText("DO_NOT_BACKUP_WHEN_FOLDER_DISABLED")
+        }
+
+        val scanner = AndroidStorageScanner(null, listOf(tempStorageDir), true)
+        val repository = BackupRepository(
+            context = null,
+            backupDao = dao,
+            storageSource = scanner,
+            driveApiClient = driveApiClient,
+            authManager = authManager,
+            customSettingsPrefs = TestInMemorySharedPreferences()
+        )
+        repository.updateSettings(BackupSettings(userBackupConsentGranted = true))
+
+        // Disable backup for "Documents" folder
+        val initialCoverage = repository.getFolderCoverageItems()
+        val docsCoverage = initialCoverage.first { it.folderName == "Documents" }
+        repository.toggleFolderBackupEnabled(docsCoverage, enabled = false)
+
+        val summary = repository.runBackupNow()
+        assertEquals(2, summary.scannedFiles)
+        assertEquals(1, summary.newlyQueuedVersions)
+        assertEquals(1, summary.uploadedAndVerifiedFiles)
+        assertEquals(1, summary.skippedUnchangedFiles)
+
+        // Verify DCIM was backed up while Documents was skipped
+        assertNotNull(dao.getLatestVersionForIdentity("DCIM/camera_01.jpg"))
+        assertEquals(null, dao.getLatestVersionForIdentity("Documents/private_notes.txt"))
+
+        val updatedCoverage = repository.getFolderCoverageItems()
+        val dcimAfter = updatedCoverage.first { it.folderName == "DCIM" }
+        val docsAfter = updatedCoverage.first { it.folderName == "Documents" }
+        assertEquals(1, dcimAfter.backedUpFileCount)
+        assertEquals(1.0f, dcimAfter.completenessFraction, 0.01f)
+        assertTrue(dcimAfter.backupEnabled)
+        assertEquals(0, docsAfter.backedUpFileCount)
+        assertFalse(docsAfter.backupEnabled)
+    }
+
+    // 23. Multi-Account Backup Isolation: Alice and Bob Both Backup Unchanged Files Independently (Section 4)
+    @Test
+    fun test23_multiAccountBackupIsolation_aliceAndBobBothBackupIndependently() = runTest {
+        installStandardDriveMockDispatcher()
+        val dcimDir = File(tempStorageDir, "DCIM").apply { mkdirs() }
+        File(dcimDir, "SHARED_FAMILY_PHOTO.jpg").writeText("FAMILY_PHOTO_BYTES_2026")
+
+        val scanner = AndroidStorageScanner(null, listOf(tempStorageDir), true)
+        val engine = PermanentBackupEngine(dao, scanner, driveApiClient, authManager)
+
+        // 1. Alice backs up the photo
+        authManager.onAccountAuthorized(
+            email = "alice@example.com",
+            displayName = "Alice",
+            accessToken = "alice_token",
+            refreshToken = "alice_refresh",
+            expiresInSeconds = 3600L
+        )
+        val aliceSummary = engine.runBackupCycle(BackupSettings(userBackupConsentGranted = true))
+        assertEquals(1, aliceSummary.uploadedAndVerifiedFiles)
+        val aliceVersions = dao.getBackupVersionsForAccountPaged("alice@example.com", 10, 0)
+        assertEquals(1, aliceVersions.size)
+
+        // 2. Switch to Bob -> Bob backs up the exact same unchanged local photo to Bob's Drive root!
+        authManager.switchGoogleAccount(
+            newEmail = "bob@example.com",
+            newDisplayName = "Bob",
+            newAccessToken = "bob_token",
+            newRefreshToken = "bob_refresh"
+        )
+        val bobSummary = engine.runBackupCycle(BackupSettings(userBackupConsentGranted = true))
+        assertEquals(1, bobSummary.uploadedAndVerifiedFiles)
+
+        val bobVersions = dao.getBackupVersionsForAccountPaged("bob@example.com", 10, 0)
+        assertEquals(1, bobVersions.size)
+        assertEquals("SHARED_FAMILY_PHOTO.jpg", bobVersions.single().driveStoredName)
+
+        // Alice's version remains 100% intact
+        assertEquals(1, dao.getBackupVersionsForAccountPaged("alice@example.com", 10, 0).size)
+    }
+
+    // 24. HTTP 404, 409, 5xx Classification & Exponential Backoff Retry Scheduling (Section 9)
+    @Test
+    fun test24_http404_409_5xxAndExponentialBackoff() = runTest {
+        var nextStatusCode = 404
+        mockWebServer.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                return MockResponse()
+                    .setResponseCode(nextStatusCode)
+                    .setBody("""{"error":{"code":$nextStatusCode,"message":"Simulated error $nextStatusCode"}}""")
+            }
+        }
+
+        // Verify 404 -> DriveResourceNotFoundException
+        var caught404: DriveResourceNotFoundException? = null
+        try {
+            driveApiClient.fetchDriveQuota("token")
+        } catch (e: DriveResourceNotFoundException) {
+            caught404 = e
+        }
+        assertNotNull(caught404)
+
+        // Verify 409 -> DriveConflictException
+        nextStatusCode = 409
+        var caught409: DriveConflictException? = null
+        try {
+            driveApiClient.fetchDriveQuota("token")
+        } catch (e: DriveConflictException) {
+            caught409 = e
+        }
+        assertNotNull(caught409)
+
+        // Verify 503 -> DriveServerException
+        nextStatusCode = 503
+        var caught503: DriveServerException? = null
+        try {
+            driveApiClient.fetchDriveQuota("token")
+        } catch (e: DriveServerException) {
+            caught503 = e
+        }
+        assertNotNull(caught503)
+        assertEquals(503, caught503!!.httpStatusCode)
+
+        // Verify exponential backoff in BackupDao.transitionSyncJobState
+        val baseTime = 1_700_000_000_000L
+        dao.transitionSyncJobState(
+            accountId = "user@example.com",
+            recordId = 99L,
+            sourceFileIdentity = "DCIM/test.jpg",
+            fileName = "test.jpg",
+            relativePath = "DCIM/test.jpg",
+            backupVersion = 1,
+            newState = SyncJobState.FAILED_RETRYABLE,
+            uploadedBytes = 0L,
+            totalBytes = 1024L,
+            nowMs = baseTime
+        )
+        dao.transitionSyncJobState(
+            accountId = "user@example.com",
+            recordId = 99L,
+            sourceFileIdentity = "DCIM/test.jpg",
+            fileName = "test.jpg",
+            relativePath = "DCIM/test.jpg",
+            backupVersion = 1,
+            newState = SyncJobState.RETRY_SCHEDULED,
+            uploadedBytes = 0L,
+            totalBytes = 1024L,
+            nowMs = baseTime
+        )
+        val job1 = dao.getSyncJobByRecordId(99L)!!
+        assertEquals(baseTime + 30_000L, job1.nextRetryAtMs)
+
+        // Second failure -> retryCount = 2 -> backoff = 60_000L
+        dao.transitionSyncJobState(
+            accountId = "user@example.com",
+            recordId = 99L,
+            sourceFileIdentity = "DCIM/test.jpg",
+            fileName = "test.jpg",
+            relativePath = "DCIM/test.jpg",
+            backupVersion = 1,
+            newState = SyncJobState.FAILED_RETRYABLE,
+            uploadedBytes = 0L,
+            totalBytes = 1024L,
+            nowMs = baseTime
+        )
+        dao.transitionSyncJobState(
+            accountId = "user@example.com",
+            recordId = 99L,
+            sourceFileIdentity = "DCIM/test.jpg",
+            fileName = "test.jpg",
+            relativePath = "DCIM/test.jpg",
+            backupVersion = 1,
+            newState = SyncJobState.RETRY_SCHEDULED,
+            uploadedBytes = 0L,
+            totalBytes = 1024L,
+            nowMs = baseTime
+        )
+        val job2 = dao.getSyncJobByRecordId(99L)!!
+        assertEquals(baseTime + 60_000L, job2.nextRetryAtMs)
+    }
 }
+
+class TestInMemorySharedPreferences : SharedPreferences {
+    private val map = LinkedHashMap<String, Any?>()
+
+    override fun getAll(): MutableMap<String, *> = LinkedHashMap(map)
+    override fun getString(key: String?, defValue: String?): String? = (map[key] as? String) ?: defValue
+    @Suppress("UNCHECKED_CAST")
+    override fun getStringSet(key: String?, defValues: MutableSet<String>?): MutableSet<String>? =
+        (map[key] as? MutableSet<String>) ?: defValues
+    override fun getInt(key: String?, defValue: Int): Int = (map[key] as? Int) ?: defValue
+    override fun getLong(key: String?, defValue: Long): Long = (map[key] as? Long) ?: defValue
+    override fun getFloat(key: String?, defValue: Float): Float = (map[key] as? Float) ?: defValue
+    override fun getBoolean(key: String?, defValue: Boolean): Boolean = (map[key] as? Boolean) ?: defValue
+    override fun contains(key: String?): Boolean = map.containsKey(key)
+
+    override fun edit(): SharedPreferences.Editor = object : SharedPreferences.Editor {
+        private val pending = LinkedHashMap<String, Any?>()
+        private val removals = HashSet<String>()
+        private var clearAll = false
+
+        override fun putString(key: String?, value: String?): SharedPreferences.Editor = apply {
+            if (key != null) pending[key] = value
+        }
+        override fun putStringSet(key: String?, values: MutableSet<String>?): SharedPreferences.Editor = apply {
+            if (key != null) pending[key] = values
+        }
+        override fun putInt(key: String?, value: Int): SharedPreferences.Editor = apply {
+            if (key != null) pending[key] = value
+        }
+        override fun putLong(key: String?, value: Long): SharedPreferences.Editor = apply {
+            if (key != null) pending[key] = value
+        }
+        override fun putFloat(key: String?, value: Float): SharedPreferences.Editor = apply {
+            if (key != null) pending[key] = value
+        }
+        override fun putBoolean(key: String?, value: Boolean): SharedPreferences.Editor = apply {
+            if (key != null) pending[key] = value
+        }
+        override fun remove(key: String?): SharedPreferences.Editor = apply {
+            if (key != null) removals.add(key)
+        }
+        override fun clear(): SharedPreferences.Editor = apply { clearAll = true }
+        override fun commit(): Boolean {
+            apply()
+            return true
+        }
+        override fun apply() {
+            if (clearAll) map.clear()
+            removals.forEach { map.remove(it) }
+            for ((k, v) in pending) {
+                if (v == null) map.remove(k) else map[k] = v
+            }
+        }
+    }
+
+    override fun registerOnSharedPreferenceChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener?) {}
+    override fun unregisterOnSharedPreferenceChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener?) {}
+}
+

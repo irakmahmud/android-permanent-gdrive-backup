@@ -81,6 +81,21 @@ abstract class PermanentBackupDatabase : RoomDatabase() {
         }
     }
 
+    /**
+     * Section 8: Non-destructive SQLite recovery strategy if integrity_check detects index or WAL anomalies.
+     * Checkpoints WAL and rebuilds SQLite B-tree indices via REINDEX without deleting any backup history rows.
+     */
+    fun attemptNonDestructiveRecovery(): Boolean {
+        return try {
+            val db = openHelper.writableDatabase
+            db.query("PRAGMA wal_checkpoint(TRUNCATE)").close()
+            db.execSQL("REINDEX")
+            checkDatabaseIntegrity()
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
     companion object {
         const val DB_NAME = "permanent_gdrive_backup.db"
 

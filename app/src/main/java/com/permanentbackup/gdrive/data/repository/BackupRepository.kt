@@ -193,7 +193,20 @@ class BackupRepository(
             val token = authManager.getValidAccessToken()
             val effectiveParent = when {
                 !parentFolderId.isNullOrBlank() -> parentFolderId
-                filter == DriveViewFilter.BACKUP_ROOT -> authManager.accountState.value.rootDriveFolderId
+                filter == DriveViewFilter.BACKUP_ROOT -> {
+                    val cachedRoot = authManager.accountState.value.rootDriveFolderId
+                    if (!cachedRoot.isNullOrBlank()) {
+                        cachedRoot
+                    } else {
+                        val resolvedRoot = driveApiClient.ensureFolderExists(
+                            accessToken = token,
+                            folderName = PermanentBackupEngine.ROOT_DRIVE_FOLDER_NAME,
+                            parentFolderId = null
+                        )
+                        authManager.setRootDriveFolderId(resolvedRoot)
+                        resolvedRoot
+                    }
+                }
                 else -> null
             }
             val page = driveApiClient.listDriveFiles(
@@ -286,6 +299,18 @@ class BackupRepository(
      */
     fun browseLocalPhoneStorage(relativeSubPath: String = ""): List<LocalBrowseItem> {
         return storageSource.browseLocalDirectory(relativeSubPath)
+    }
+
+    /**
+     * Queues a single local file from the Local Phone Storage Explorer for immediate backup.
+     */
+    suspend fun queueSingleLocalFile(item: LocalBrowseItem): Boolean {
+        if (item.isDirectory || item.isRestrictedAndroidFolder) return false
+        val normalizedTarget = item.relativePath.replace('\\', '/').trim('/')
+        val discovered = storageSource.scanFilesSequence(computeHashes = true)
+            .firstOrNull { it.relativePath.replace('\\', '/').trim('/').equals(normalizedTarget, ignoreCase = true) }
+            ?: return false
+        return backupEngine.evaluateAndQueueDiscoveredFile(discovered)
     }
 
     suspend fun restoreBackupRecord(record: BackupFileEntity): RestoreOutcome {
@@ -427,8 +452,25 @@ class BackupRepository(
         }
     }
 
-    fun getFolderCoverageItems(): List<FolderCoverageItem> {
-        return storageSource.getFolderCoverageReport(emptyMap())
+    suspend fun getFolderCoverageItems(): List<FolderCoverageItem> {
+        val baseItems = storageSource.getFolderCoverageReport(emptyMap())
+        val backedUpMap = mutableMapOf<String, Int>()
+        for (item in baseItems) {
+            backedUpMap[item.folderName] = backupDao.countVerifiedFilesInCategory(item.folderName)
+        }
+        val accountId = currentAccountId()
+        val savedFolders = backupDao.getBackupFoldersForAccount(accountId)
+        val savedByPath = savedFolders.associateBy { it.relativePath }
+        val savedByName = savedFolders.associateBy { it.folderCategory }
+
+        return storageSource.getFolderCoverageReport(backedUpMap).map { item ->
+            val saved = savedByPath[item.relativePath] ?: savedByName[item.folderName]
+            if (saved != null && item.accessStatus != FolderAccessStatus.RESTRICTED_BY_ANDROID_OS) {
+                item.copy(backupEnabled = saved.backupEnabled)
+            } else {
+                item
+            }
+        }
     }
 
     suspend fun requeueFailedRecord(recordId: Long) {
