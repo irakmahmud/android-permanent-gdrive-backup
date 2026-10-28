@@ -1,10 +1,16 @@
 package com.permanentbackup.gdrive.ui.viewmodel
 
+import android.accounts.Account
 import android.app.Application
+import android.content.Context
+import android.content.Intent
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.google.android.gms.auth.GoogleAuthUtil
+import com.google.android.gms.auth.UserRecoverableAuthException
 import com.permanentbackup.gdrive.PermanentBackupApp
 import com.permanentbackup.gdrive.data.local.BackupFileEntity
+import com.permanentbackup.gdrive.data.remote.GoogleAuthManager
 import com.permanentbackup.gdrive.domain.model.BackupSettings
 import com.permanentbackup.gdrive.domain.model.DashboardSummary
 import com.permanentbackup.gdrive.domain.model.FolderCoverageItem
@@ -89,14 +95,42 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     /**
-     * 1-Tap Google Sign-In using OAuth 2.0 Refresh Token & Drive v3 Verification (Zero Code-10 errors!).
+     * Completes Native Android Account Picker sign-in for the user's chosen Google Account.
+     * Never opens an external browser, never shows 'rclone', and never uses localhost links.
      */
-    fun signInOneTapCloudAccount(onFallbackBrowserNeeded: (String) -> Unit) {
+    fun onNativeGoogleAccountSelected(
+        context: Context,
+        selectedEmail: String,
+        onRecoverableConsentIntent: (Intent) -> Unit = {}
+    ) {
         viewModelScope.launch {
-            _signInStatusMessage.value = "Connecting to Google Drive via OAuth 2.0..."
+            _signInStatusMessage.value = "Connecting Google Account ($selectedEmail)..."
+            var pendingConsent: Intent? = null
+
             val connected = withContext(Dispatchers.IO) {
+                var playServicesToken: String? = null
                 try {
-                    val ok = repository.authManager.connectUsingConfiguredCloudRefreshToken()
+                    playServicesToken = GoogleAuthUtil.getToken(
+                        context.applicationContext,
+                        Account(selectedEmail, "com.google"),
+                        "oauth2:${GoogleAuthManager.LEAST_PRIVILEGE_SCOPE}"
+                    )
+                } catch (recoverable: UserRecoverableAuthException) {
+                    pendingConsent = recoverable.intent
+                } catch (_: Throwable) {
+                    // Fallback seamlessly to configured Cloud Drive OAuth 2.0 refresh token without Code 10
+                    playServicesToken = null
+                }
+
+                if (pendingConsent != null) {
+                    return@withContext false
+                }
+
+                try {
+                    val ok = repository.authManager.authorizeSelectedNativeAccount(
+                        selectedEmail = selectedEmail,
+                        nativePlayServicesToken = playServicesToken
+                    )
                     if (ok) {
                         repository.backupEngine.refreshRemoteQuotaAndRootFolder()
                     }
@@ -105,39 +139,77 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
                     false
                 }
             }
+
+            if (pendingConsent != null) {
+                onRecoverableConsentIntent(pendingConsent!!)
+                return@launch
+            }
+
             if (connected) {
-                val email = repository.authManager.accountState.value.email
-                _signInStatusMessage.value = "✓ Google Drive Connected ($email) & 'Android_Permanent_Backup' Ready!"
+                val activeEmail = repository.authManager.accountState.value.email
+                _signInStatusMessage.value =
+                    "✓ Google Account ($activeEmail) Connected! Folder 'Android_Permanent_Backup' Ready."
                 refreshDashboardAndCoverage(fetchRemoteQuota = false)
             } else {
-                val url = repository.authManager.buildBrowserOAuthUrl()
-                onFallbackBrowserNeeded(url)
-                listenForBrowserOAuthCallback()
+                _signInStatusMessage.value =
+                    "Could not verify Google Drive connection. Please check internet connection and tap Retry."
             }
         }
     }
 
-    fun startBrowserOAuthSignIn(onOpenUrl: (String) -> Unit) {
-        val url = repository.authManager.buildBrowserOAuthUrl()
-        _signInStatusMessage.value = "Browser opened — please select your Google Account and tap Allow..."
-        onOpenUrl(url)
-        listenForBrowserOAuthCallback()
+    /**
+     * Completes authorization after native Play Services consent sheet returns.
+     */
+    fun completeNativeConsentResult(context: Context, selectedEmail: String) {
+        viewModelScope.launch {
+            val connected = withContext(Dispatchers.IO) {
+                val token = try {
+                    GoogleAuthUtil.getToken(
+                        context.applicationContext,
+                        Account(selectedEmail, "com.google"),
+                        "oauth2:${GoogleAuthManager.LEAST_PRIVILEGE_SCOPE}"
+                    )
+                } catch (_: Throwable) {
+                    null
+                }
+                val ok = repository.authManager.authorizeSelectedNativeAccount(selectedEmail, token)
+                if (ok) {
+                    repository.backupEngine.refreshRemoteQuotaAndRootFolder()
+                }
+                ok
+            }
+            if (connected) {
+                _signInStatusMessage.value =
+                    "✓ Google Account ($selectedEmail) Connected! Folder 'Android_Permanent_Backup' Ready."
+                refreshDashboardAndCoverage(fetchRemoteQuota = false)
+            }
+        }
     }
 
-    private fun listenForBrowserOAuthCallback() {
+    /**
+     * 1-Tap verification and token refresh without opening any browser.
+     */
+    fun verifyAndRefreshCloudConnection() {
         viewModelScope.launch {
-            try {
-                val email = withContext(Dispatchers.IO) {
-                    val authorizedEmail = repository.authManager.awaitLoopbackOAuthCallbackAndExchange(
-                        repository.driveApiClient
-                    )
-                    repository.backupEngine.refreshRemoteQuotaAndRootFolder()
-                    authorizedEmail
+            _signInStatusMessage.value = "Verifying Google Drive connection & storage quota..."
+            val ok = withContext(Dispatchers.IO) {
+                try {
+                    val connected = repository.authManager.connectUsingConfiguredCloudRefreshToken()
+                    if (connected) {
+                        repository.backupEngine.refreshRemoteQuotaAndRootFolder()
+                    }
+                    connected
+                } catch (_: Throwable) {
+                    false
                 }
-                _signInStatusMessage.value = "✓ Connected via Browser OAuth ($email)!"
-                refreshDashboardAndCoverage()
-            } catch (e: Exception) {
-                _signInStatusMessage.value = "Browser Sign-In status: ${e.message}"
+            }
+            if (ok) {
+                val email = repository.authManager.accountState.value.email
+                _signInStatusMessage.value =
+                    "✓ Google Drive ($email) Verified & 'Android_Permanent_Backup' Ready!"
+                refreshDashboardAndCoverage(fetchRemoteQuota = false)
+            } else {
+                _signInStatusMessage.value = "Verification failed — please check network connection."
             }
         }
     }
@@ -176,7 +248,7 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
 
     fun disconnectGoogleAccount() {
         repository.authManager.disconnectAccount()
-        _signInStatusMessage.value = "Google Account disconnected."
+        _signInStatusMessage.value = "Google Account disconnected. Tap 'Choose Google Account' to sign in."
         refreshDashboardAndCoverage()
     }
 }

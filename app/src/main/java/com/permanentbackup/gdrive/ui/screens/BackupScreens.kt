@@ -531,15 +531,10 @@ fun GoogleAccountScreen(
     signInFeedbackMessage: String? = null,
     onLaunchGoogleSignIn: () -> Unit,
     onLaunchBrowserOAuth: () -> Unit = {},
-    onConnectTokenManually: (String, String, String, String?) -> Unit,
-    onSwitchAccount: (String, String, String, String?) -> Unit,
+    @Suppress("UNUSED_PARAMETER") onConnectTokenManually: (String, String, String, String?) -> Unit = { _, _, _, _ -> },
+    @Suppress("UNUSED_PARAMETER") onSwitchAccount: (String, String, String, String?) -> Unit = { _, _, _, _ -> },
     onDisconnect: () -> Unit
 ) {
-    var emailInput by remember { mutableStateOf(summary.accountState.email) }
-    var nameInput by remember { mutableStateOf(summary.accountState.displayName) }
-    var accessTokenInput by remember { mutableStateOf("") }
-    var refreshTokenInput by remember { mutableStateOf("") }
-
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
@@ -550,37 +545,47 @@ fun GoogleAccountScreen(
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(
                     modifier = Modifier.padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Text(
-                        text = "Google Drive OAuth 2.0 Connection (গুগল ড্রাইভ একাউন্ট)",
+                        text = "Google Drive Account (গুগল ড্রাইভ একাউন্ট)",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
                     )
-                    Text("Status: ${if (summary.accountState.isConnected) "Connected ✓" else "Disconnected"}")
-                    Text("Account Email: ${summary.accountState.email.ifBlank { "Not signed in" }}")
-                    Text("Display Name: ${summary.accountState.displayName.ifBlank { "N/A" }}")
+                    Text(
+                        text = "Status: ${if (summary.accountState.isConnected) "Connected ✓ (সংযুক্ত)" else "Disconnected (সংযুক্ত নয়)"}",
+                        fontWeight = FontWeight.SemiBold,
+                        color = if (summary.accountState.isConnected) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            MaterialTheme.colorScheme.error
+                        }
+                    )
+                    Text("Google Account: ${summary.accountState.email.ifBlank { "Not signed in" }}")
+                    Text("Account Holder: ${summary.accountState.displayName.ifBlank { "N/A" }}")
                     Text(
                         "Available Drive Storage: ${formatBytes(summary.driveQuota.availableBytes)} free of ${formatBytes(summary.driveQuota.limitBytes)}"
                     )
-                    Text("Root Backup Folder: ${summary.accountState.rootDriveFolderName}")
-                    Text("Root Folder ID: ${summary.accountState.rootDriveFolderId ?: "Will be created on first upload"}")
+                    Text("Backup Destination Folder: ${summary.accountState.rootDriveFolderName}")
+                    Text(
+                        "Drive Folder ID: ${summary.accountState.rootDriveFolderId ?: "Auto-created on first backup"}"
+                    )
                     summary.accountState.connectionError?.let { err ->
                         Text("Notice: $err", color = MaterialTheme.colorScheme.error)
                     }
                     signInFeedbackMessage?.let { msg ->
                         Text(msg, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold)
                     }
-                    Spacer(modifier = Modifier.height(8.dp))
+                    Spacer(modifier = Modifier.height(6.dp))
                     Button(
                         onClick = onLaunchGoogleSignIn,
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Text(
                             if (summary.accountState.isConnected) {
-                                "✓ Re-Verify & Refresh Google Drive Token (1-Tap)"
+                                "Switch / Choose Google Account (ফোনের গুগল একাউন্ট নির্বাচন)"
                             } else {
-                                "Sign in with Google (1-Tap Auto-Connect)"
+                                "Sign in with Google (ফোনের গুগল একাউন্ট নির্বাচন)"
                             }
                         )
                     }
@@ -592,7 +597,7 @@ fun GoogleAccountScreen(
                             onClick = onLaunchBrowserOAuth,
                             modifier = Modifier.weight(1f)
                         ) {
-                            Text("Browser Sign-In (অন্য একাউন্ট)")
+                            Text("Verify Drive Quota")
                         }
                         if (summary.accountState.isConnected) {
                             OutlinedButton(
@@ -611,71 +616,16 @@ fun GoogleAccountScreen(
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(
                     modifier = Modifier.padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     Text(
-                        "Direct Google Drive Account & OAuth Token Setup",
+                        text = "How Native Google Drive Connection Works",
                         fontWeight = FontWeight.Bold
                     )
                     Text(
-                        "অন্য কোনো কাস্টম Google একাউন্ট ও OAuth 2.0 Token সরাসরি দিতে চাইলে নিচের ঘরগুলো পূরণ করে 'Authorize Account' চাপুন:",
+                        text = "১. উপরের 'Sign in / Switch Google Account' বাটনে ট্যাপ করলে ফোনের নিজস্ব Android Google Account Picker পপ-আপ খুলবে (কোনো ব্রাউজার, rclone বা localhost লিংক লাগবে না)।\n" +
+                            "২. আপনার গুগল একাউন্টের ওপর ট্যাপ করলেই অ্যাপটি স্বয়ংক্রিয়ভাবে Google Drive-এর সাথে সংযুক্ত হবে এবং 'Android_Permanent_Backup' ফোল্ডার প্রস্তুত করবে।",
                         style = MaterialTheme.typography.bodySmall
-                    )
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(
-                            onClick = {
-                                if (emailInput.isNotBlank() && (accessTokenInput.isNotBlank() || refreshTokenInput.isNotBlank())) {
-                                    onConnectTokenManually(
-                                        emailInput.trim(),
-                                        nameInput.trim().ifBlank { emailInput.trim() },
-                                        accessTokenInput.trim(),
-                                        refreshTokenInput.trim().ifBlank { null }
-                                    )
-                                }
-                            },
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Text("Authorize Account")
-                        }
-                        OutlinedButton(
-                            onClick = {
-                                if (emailInput.isNotBlank() && (accessTokenInput.isNotBlank() || refreshTokenInput.isNotBlank())) {
-                                    onSwitchAccount(
-                                        emailInput.trim(),
-                                        nameInput.trim().ifBlank { emailInput.trim() },
-                                        accessTokenInput.trim(),
-                                        refreshTokenInput.trim().ifBlank { null }
-                                    )
-                                }
-                            },
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Text("Switch Account")
-                        }
-                    }
-                    OutlinedTextField(
-                        value = emailInput,
-                        onValueChange = { emailInput = it },
-                        label = { Text("Google Account Email (যেমন: yourname@gmail.com)") },
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    OutlinedTextField(
-                        value = nameInput,
-                        onValueChange = { nameInput = it },
-                        label = { Text("Display Name (ঐচ্ছিক)") },
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    OutlinedTextField(
-                        value = accessTokenInput,
-                        onValueChange = { accessTokenInput = it },
-                        label = { Text("OAuth 2.0 Access Token (ya29...)") },
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    OutlinedTextField(
-                        value = refreshTokenInput,
-                        onValueChange = { refreshTokenInput = it },
-                        label = { Text("OAuth 2.0 Refresh Token (1//... স্বয়ংক্রিয় রিফ্রেশের জন্য)") },
-                        modifier = Modifier.fillMaxWidth()
                     )
                 }
             }

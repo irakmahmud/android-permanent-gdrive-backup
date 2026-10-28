@@ -1,5 +1,7 @@
 package com.permanentbackup.gdrive
 
+import android.accounts.AccountManager
+import android.app.Activity
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
@@ -63,6 +65,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             PermanentBackupTheme {
                 var currentScreen by remember { mutableStateOf(AppScreen.DASHBOARD) }
+                var pendingSelectedEmail by remember { mutableStateOf("") }
 
                 val summary by viewModel.dashboardSummary.collectAsState()
                 val activeQueue by viewModel.activeQueue.collectAsState()
@@ -81,6 +84,54 @@ class MainActivity : ComponentActivity() {
                             Intent.FLAG_GRANT_READ_URI_PERMISSION
                         )
                         viewModel.refreshDashboardAndCoverage()
+                    }
+                }
+
+                // Native Play Services Consent Launcher (if Play Services requests Drive permission sheet)
+                val recoverableConsentLauncher = rememberLauncherForActivityResult(
+                    contract = ActivityResultContracts.StartActivityForResult()
+                ) {
+                    if (pendingSelectedEmail.isNotBlank()) {
+                        viewModel.completeNativeConsentResult(this@MainActivity, pendingSelectedEmail)
+                    }
+                }
+
+                // 100% Native Android System Google Account Picker (Zero Browser, Zero Localhost, Zero Code-10!)
+                val nativeAccountPickerLauncher = rememberLauncherForActivityResult(
+                    contract = ActivityResultContracts.StartActivityForResult()
+                ) { result ->
+                    if (result.resultCode == Activity.RESULT_OK) {
+                        val selectedEmail = result.data
+                            ?.getStringExtra(AccountManager.KEY_ACCOUNT_NAME)
+                            .orEmpty()
+                        if (selectedEmail.isNotBlank()) {
+                            pendingSelectedEmail = selectedEmail
+                            viewModel.onNativeGoogleAccountSelected(
+                                context = this@MainActivity,
+                                selectedEmail = selectedEmail,
+                                onRecoverableConsentIntent = { consentIntent ->
+                                    recoverableConsentLauncher.launch(consentIntent)
+                                }
+                            )
+                        }
+                    }
+                }
+
+                val launchNativeGoogleAccountPicker: () -> Unit = {
+                    try {
+                        @Suppress("DEPRECATION")
+                        val pickerIntent = AccountManager.newChooseAccountIntent(
+                            null,
+                            null,
+                            arrayOf("com.google"),
+                            null,
+                            null,
+                            null,
+                            null
+                        )
+                        nativeAccountPickerLauncher.launch(pickerIntent)
+                    } catch (_: Throwable) {
+                        viewModel.verifyAndRefreshCloudConnection()
                     }
                 }
 
@@ -124,11 +175,7 @@ class MainActivity : ComponentActivity() {
                                 onBackupNow = { viewModel.triggerManualBackupNow() },
                                 onOpenAccountScreen = {
                                     currentScreen = AppScreen.ACCOUNT
-                                    if (!summary.accountState.isConnected) {
-                                        viewModel.signInOneTapCloudAccount { url ->
-                                            openBrowserUrl(url)
-                                        }
-                                    }
+                                    launchNativeGoogleAccountPicker()
                                 },
                                 onOpenFoldersScreen = { currentScreen = AppScreen.FOLDERS },
                                 onEnableConsentAndPermissions = {
@@ -140,16 +187,8 @@ class MainActivity : ComponentActivity() {
                             AppScreen.ACCOUNT -> GoogleAccountScreen(
                                 summary = summary,
                                 signInFeedbackMessage = signInFeedbackMessage,
-                                onLaunchGoogleSignIn = {
-                                    viewModel.signInOneTapCloudAccount { url ->
-                                        openBrowserUrl(url)
-                                    }
-                                },
-                                onLaunchBrowserOAuth = {
-                                    viewModel.startBrowserOAuthSignIn { url ->
-                                        openBrowserUrl(url)
-                                    }
-                                },
+                                onLaunchGoogleSignIn = launchNativeGoogleAccountPicker,
+                                onLaunchBrowserOAuth = { viewModel.verifyAndRefreshCloudConnection() },
                                 onConnectTokenManually = { email, name, token, refresh ->
                                     viewModel.connectGoogleAccount(email, name, token, refresh)
                                 },
@@ -188,13 +227,6 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
-        }
-    }
-
-    private fun openBrowserUrl(url: String) {
-        try {
-            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
-        } catch (_: Throwable) {
         }
     }
 

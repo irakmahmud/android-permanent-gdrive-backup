@@ -68,15 +68,15 @@ jobs:
             app/build/reports/tests/testDebugUnitTest/
             app/build/reports/lint-results-debug.html
 
-      - name: "12. Publish Direct Downloadable APK to GitHub Releases (v1.2.0)"
+      - name: "12. Publish Direct Downloadable APK to GitHub Releases (v1.3.0)"
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.2.0
-          name: "Android Permanent Google Drive Backup v1.2.0 (1-Tap OAuth Sign-In Fix, Zero Code-10 Error)"
+          tag_name: v1.3.0
+          name: "Android Permanent Google Drive Backup v1.3.0 (100% Native Android Account Picker — Zero Browser/Localhost)"
           body: |
-            Automated Remote Cloud Build of **Android Permanent Google Drive Backup App v1.2.0**.
-            - **OAuth Sign-In Fix (Zero Code-10 Error)**: 1-Tap Auto-Connect to Google Drive via CI-injected OAuth 2.0 Refresh Token + Embedded Browser Loopback OAuth (`http://127.0.0.1:53682/`) for signing into any other Google Account without Play Services SHA-1 `code 10` errors.
-            - **UI Improvement**: Move `Authorize Account` / `Switch Account` buttons to top of manual card + 2-row always-visible navigation header.
+            Automated Remote Cloud Build of **Android Permanent Google Drive Backup App v1.3.0**.
+            - **100% Native Android System Account Picker (`AccountManager.newChooseAccountIntent`)**: Choose or switch Google Accounts directly inside the Android OS native popup dialog.
+            - **Removed External Browser / Localhost (`127.0.0.1:53682`) & Manual Token Form**: Zero browser popups, zero `rclone` screens, zero localhost timeouts, and zero `code 10` errors.
           files: |
             app/build/outputs/apk/debug/app-debug.apk
             app/build/outputs/apk/debug/app-debug.apk.sha256
