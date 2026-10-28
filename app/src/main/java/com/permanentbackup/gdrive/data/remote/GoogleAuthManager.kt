@@ -163,8 +163,8 @@ class GoogleAuthManager(
         val legacyTokenWasPurged = getBoolean(KEY_LEGACY_TOKEN_WAS_PURGED, false)
 
         val authState = when {
+            legacyTokenWasPurged && email.isNotBlank() -> AccountAuthState.AUTHORIZATION_REQUIRED
             !connected || email.isBlank() -> AccountAuthState.DISCONNECTED
-            legacyTokenWasPurged -> AccountAuthState.AUTHORIZATION_REQUIRED
             scopes.contains(DRIVE_READONLY_SCOPE) -> AccountAuthState.AUTHORIZED
             else -> AccountAuthState.AUTHORIZED
         }
