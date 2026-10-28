@@ -13,29 +13,23 @@ android {
         applicationId = "com.permanentbackup.gdrive"
         minSdk = 26
         targetSdk = 35
-        versionCode = 4
-        versionName = "1.3.0"
+        versionCode = 5
+        versionName = "2.0.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
             useSupportLibrary = true
         }
 
-        // OAuth Client ID and Signing Fingerprint injected via CI Environment Variables — No secrets in source code
+        // Public, non-secret OAuth configuration constants only.
+        // Zero refresh tokens, zero client secrets, and zero personal credentials are ever embedded in BuildConfig.
         val oauthClientId = System.getenv("GOOGLE_OAUTH_CLIENT_ID") ?: ""
-        val oauthClientSecret = System.getenv("GOOGLE_OAUTH_CLIENT_SECRET") ?: ""
-        val defaultRefreshToken = System.getenv("DEFAULT_GDRIVE_REFRESH_TOKEN") ?: ""
-        val defaultEmail = System.getenv("DEFAULT_GDRIVE_EMAIL") ?: ""
-        val defaultName = System.getenv("DEFAULT_GDRIVE_NAME") ?: ""
         val certSha1 = System.getenv("SIGNING_CERT_SHA1") ?: ""
         buildConfigField("String", "GOOGLE_OAUTH_CLIENT_ID", "\"$oauthClientId\"")
-        buildConfigField("String", "GOOGLE_OAUTH_CLIENT_SECRET", "\"$oauthClientSecret\"")
-        buildConfigField("String", "DEFAULT_GDRIVE_REFRESH_TOKEN", "\"$defaultRefreshToken\"")
-        buildConfigField("String", "DEFAULT_GDRIVE_EMAIL", "\"$defaultEmail\"")
-        buildConfigField("String", "DEFAULT_GDRIVE_NAME", "\"$defaultName\"")
         buildConfigField("String", "SIGNING_CERT_SHA1", "\"$certSha1\"")
         buildConfigField("String", "ROOT_DRIVE_FOLDER_NAME", "\"Android_Permanent_Backup\"")
         buildConfigField("String", "DRIVE_OAUTH_SCOPE", "\"https://www.googleapis.com/auth/drive.file\"")
+        buildConfigField("String", "DRIVE_READONLY_SCOPE", "\"https://www.googleapis.com/auth/drive.readonly\"")
     }
 
     signingConfigs {
@@ -53,8 +47,6 @@ android {
     buildTypes {
         debug {
             isMinifyEnabled = false
-            applicationIdSuffix = ".debug"
-            versionNameSuffix = "-debug"
         }
         release {
             isMinifyEnabled = true
@@ -132,8 +124,11 @@ dependencies {
     implementation("androidx.documentfile:documentfile:1.0.1")
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
 
-    // Google OAuth 2.0 Sign-In & Authorization
+    // Google Identity Services AuthorizationClient, Credential Manager & OAuth 2.0
     implementation("com.google.android.gms:play-services-auth:21.2.0")
+    implementation("androidx.credentials:credentials:1.3.0")
+    implementation("androidx.credentials:credentials-play-services-auth:1.3.0")
+    implementation("com.google.android.libraries.identity.googleid:googleid:1.1.1")
 
     // Secure HTTPS Client for Streaming Resumable Google Drive API v3
     implementation("com.squareup.okhttp3:okhttp:4.12.0")

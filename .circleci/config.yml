@@ -1,10 +1,8 @@
 version: 2.1
 
 # ==============================================================================
-# CircleCI Remote Cloud Build Pipeline for Android Permanent Google Drive Backup
-# Reference:
-# - https://circleci.com/docs/guides/execute/android-machine-image/
-# - https://circleci.com/docs/guides/optimize/artifacts/
+# CircleCI Remote Cloud Build Pipeline for Permanent Drive v2.0.0
+# (Android Google Drive Desktop Alternative — Strictly Upload-Only / Never-Delete)
 # Zero local SDK/Gradle/JDK required on the user's phone or local workspace.
 # ==============================================================================
 
@@ -24,9 +22,9 @@ jobs:
       # 1. GitHub Repository Checkout
       - checkout
 
-      # 2 & 3. Remote JDK & Android SDK Environment Verification
+      # 2 & 3. Remote JDK 17 & Android SDK Environment Verification
       - run:
-          name: "Step 2 & 3: Verify Remote CircleCI Android Machine Image, JDK 17 & Android SDK"
+          name: "Stage 2 & 3: Verify Remote CircleCI Android Machine Image, JDK 17 & Android SDK"
           command: |
             echo "=== CircleCI Remote Build Environment ==="
             uname -a
@@ -35,9 +33,9 @@ jobs:
             which sdkmanager || true
             ls -la "${ANDROID_HOME:-/opt/android/sdk}/platforms" || true
 
-      # 4. Gradle Wrapper Execution & Permission Check
+      # 4. Gradle Wrapper Permission & Verification
       - run:
-          name: "Step 4: Prepare & Verify Gradle Wrapper"
+          name: "Stage 4: Prepare & Verify Gradle Wrapper"
           command: |
             chmod +x ./gradlew
             ./gradlew --version
@@ -45,38 +43,50 @@ jobs:
       # Restore Gradle Cache on Remote CircleCI Runner
       - restore_cache:
           keys:
-            - v1-gradle-caches-{{ checksum "build.gradle.kts" }}-{{ checksum "app/build.gradle.kts" }}-{{ checksum "gradle/wrapper/gradle-wrapper.properties" }}
-            - v1-gradle-caches-
+            - v2-gradle-caches-{{ checksum "build.gradle.kts" }}-{{ checksum "app/build.gradle.kts" }}-{{ checksum "gradle/wrapper/gradle-wrapper.properties" }}
+            - v2-gradle-caches-
 
       # 5. Dependency Resolution
       - run:
-          name: "Step 5: Resolve Android & Kotlin Dependencies"
+          name: "Stage 5: Resolve Android, Compose, Room & Google Identity Dependencies"
           command: |
             ./gradlew :app:dependencies --configuration debugCompileClasspath --no-daemon
 
       # 6. Kotlin Compilation
       - run:
-          name: "Step 6: Compile Kotlin Sources & Unit Test Sources"
+          name: "Stage 6: Compile Kotlin Sources & Unit/Integration Test Sources"
           command: |
             ./gradlew :app:compileDebugKotlin :app:compileDebugUnitTestKotlin --no-daemon
 
-      # 7. Android Lint Verification
+      # 7. Static Analysis & Lint Check
       - run:
-          name: "Step 7: Run Android Lint Static Analysis"
+          name: "Stage 7: Run Android Lint Static Analysis"
           command: |
             ./gradlew :app:lintDebug --no-daemon
 
-      # 8. Automated Security, Never-Delete & Reliability Unit Tests (All 13 Scenarios)
+      # 8, 9 & 10. Unit Tests, Integration Tests & Never-Delete Policy Verification Tests (All 19 Automated Tests)
       - run:
-          name: "Step 8: Execute Automated JUnit Reliability & Security Tests"
+          name: "Stage 8, 9 & 10: Execute 19 Unit, Integration & 3-Layer Never-Delete Policy Tests"
           command: |
             ./gradlew :app:testDebugUnitTest --info --no-daemon
 
-      # 9. APK Assembly (Installable Debug APK + Conditional Signed Release APK)
+      # 11. APK Assembly & Bytecode Secret Security Audit
       - run:
-          name: "Step 9: Assemble Installable Debug APK & Optional Signed Release APK"
+          name: "Stage 11: Assemble Debug/Release APK & Verify Zero Embedded Secrets"
           command: |
             ./gradlew :app:assembleDebug --no-daemon
+            APK_PATH="app/build/outputs/apk/debug/app-debug.apk"
+            test -f "$APK_PATH"
+            echo "=== Running APK Embedded Secret Audit ==="
+            mkdir -p /tmp/apk-inspect
+            unzip -q -o "$APK_PATH" -d /tmp/apk-inspect
+            if strings /tmp/apk-inspect/classes*.dex | grep -E "DEFAULT_GDRIVE_REFRESH_TOKEN|GOOGLE_OAUTH_CLIENT_SECRET|GOCSPX-|1//0[a-zA-Z0-9_-]{20,}"; then
+              echo "FATAL SECURITY VIOLATION: Hardcoded OAuth secret or refresh token detected in DEX bytecode!"
+              exit 1
+            fi
+            echo "PASS: Zero embedded OAuth client secrets or refresh tokens found in APK DEX bytecode."
+            rm -rf /tmp/apk-inspect
+
             if [ -n "${KEYSTORE_BASE64:-}" ] && [ -n "${KEYSTORE_PASSWORD:-}" ] && [ -n "${KEY_ALIAS:-}" ] && [ -n "${KEY_PASSWORD:-}" ]; then
               echo "Decoding Release Keystore from CircleCI Secret Environment Variable..."
               echo "$KEYSTORE_BASE64" | base64 -d > /tmp/release.keystore
@@ -84,17 +94,18 @@ jobs:
               ./gradlew :app:assembleRelease --no-daemon
               rm -f /tmp/release.keystore
             else
-              echo "KEYSTORE_BASE64 not configured in CircleCI Context; skipping Signed Release APK and providing Installable Debug APK."
+              echo "KEYSTORE_BASE64 not configured in CircleCI Context; providing Installable Debug APK."
             fi
 
-      # 10. APK Integrity & Signature Check
+      # 12 & 13. APK Signature, Zip Verification & SHA-256 Checksum Generation
       - run:
-          name: "Step 10: Verify APK Zip Structure, Signature & SHA-256 Checksum"
+          name: "Stage 12 & 13: Verify APK Zip Structure, Signing Certificate Fingerprints & SHA-256 Checksum"
           command: |
             mkdir -p /tmp/circleci-artifacts/apk /tmp/circleci-artifacts/reports
             APK_PATH="app/build/outputs/apk/debug/app-debug.apk"
             test -f "$APK_PATH"
             unzip -t "$APK_PATH" > /tmp/circleci-artifacts/reports/apk-zip-integrity.txt
+            keytool -printcert -jarfile "$APK_PATH" | tee /tmp/circleci-artifacts/reports/apk-signing-certificate.txt
             sha256sum "$APK_PATH" | tee /tmp/circleci-artifacts/apk/app-debug.apk.sha256
             cp "$APK_PATH" /tmp/circleci-artifacts/apk/app-debug.apk
             if [ -f "app/build/outputs/apk/release/app-release.apk" ]; then
@@ -107,19 +118,22 @@ jobs:
           paths:
             - ~/.gradle/caches
             - ~/.gradle/wrapper
-          key: v1-gradle-caches-{{ checksum "build.gradle.kts" }}-{{ checksum "app/build.gradle.kts" }}-{{ checksum "gradle/wrapper/gradle-wrapper.properties" }}
+          key: v2-gradle-caches-{{ checksum "build.gradle.kts" }}-{{ checksum "app/build.gradle.kts" }}-{{ checksum "gradle/wrapper/gradle-wrapper.properties" }}
 
-      # 11 & 12. Build Result Reporting & Artifact Upload
+      # 14. Build Result Reporting & Artifact Upload
       - run:
-          name: "Step 12: Generate Build & Test Result Report"
+          name: "Stage 14: Generate Build, Security & Test Result Report"
           when: always
           command: |
             cat <<EOF > /tmp/circleci-artifacts/reports/build-summary.txt
-            Project: Android Permanent Google Drive Backup App
+            Project: Permanent Drive v2.0.0 — Android Google Drive Desktop Alternative
+            Package: com.permanentbackup.gdrive
+            Version: 2.0.0 (versionCode 5)
             Commit: ${CIRCLE_SHA1:-HEAD}
             Branch: ${CIRCLE_BRANCH:-main}
             Build Number: ${CIRCLE_BUILD_NUM:-local}
-            Policy: STRICT UPLOAD-ONLY / APPEND-ONLY / NEVER DELETE
+            Policy: 3-LAYER IMMUTABLE NEVER-DELETE POLICY (UPLOAD-ONLY / APPEND-ONLY)
+            Auth Architecture: Google Identity Services AuthorizationClient + GoogleAuthUtil (Zero Embedded Secrets)
             Root Drive Folder: Android_Permanent_Backup
             Default OAuth Scope: https://www.googleapis.com/auth/drive.file
             APK Output: app-debug.apk

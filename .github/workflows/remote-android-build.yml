@@ -1,4 +1,4 @@
-name: Remote Cloud Android Build & Verification
+name: Remote Cloud Android Build & Verification (Permanent Drive v2.0.0)
 
 on:
   push:
@@ -10,73 +10,88 @@ permissions:
 
 jobs:
   remote-android-apk-build:
-    name: Remote Cloud Build, Lint, 13 Unit Tests & APK Artifact
+    name: Remote Cloud Build, Lint, 19 Unit/Integration Tests, Secret Scan & v2.0.0 Release
     runs-on: ubuntu-latest
-    env:
-      GOOGLE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
-      GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
-      DEFAULT_GDRIVE_REFRESH_TOKEN: ${{ secrets.DEFAULT_GDRIVE_REFRESH_TOKEN }}
-      DEFAULT_GDRIVE_EMAIL: ${{ secrets.DEFAULT_GDRIVE_EMAIL }}
-      DEFAULT_GDRIVE_NAME: ${{ secrets.DEFAULT_GDRIVE_NAME }}
     steps:
-      - name: "1. GitHub Repository Checkout"
+      - name: "Stage 1: GitHub Repository Checkout"
         uses: actions/checkout@v4
 
-      - name: "2 & 3. Set up Remote JDK 17 & Verify Android SDK"
+      - name: "Stage 2 & 3: Set up Remote JDK 17 & Verify Android SDK"
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
           cache: 'gradle'
 
-      - name: "4. Verify Gradle Wrapper"
+      - name: "Stage 4: Gradle Wrapper Permission & Verification"
         run: |
           chmod +x ./gradlew
           ./gradlew --version
 
-      - name: "5 & 6. Dependency Resolution & Kotlin Compilation"
+      - name: "Stage 5: Dependency Resolution"
+        run: |
+          ./gradlew :app:dependencies --configuration debugCompileClasspath --no-daemon
+
+      - name: "Stage 6: Kotlin Compilation (App & Test Sources)"
         run: |
           ./gradlew :app:compileDebugKotlin :app:compileDebugUnitTestKotlin --no-daemon
 
-      - name: "7. Run Android Lint"
+      - name: "Stage 7: Static Analysis & Android Lint"
         run: |
           ./gradlew :app:lintDebug --no-daemon
 
-      - name: "8. Run All 13 Automated Reliability & Never-Delete Unit Tests"
+      - name: "Stage 8, 9 & 10: Execute 19 Unit, Integration & 3-Layer Never-Delete Policy Tests"
         run: |
           ./gradlew :app:testDebugUnitTest --info --no-daemon
 
-      - name: "9. Assemble Installable Debug APK"
+      - name: "Stage 11: Assemble Installable APK & Run DEX Bytecode Secret Audit"
         run: |
           ./gradlew :app:assembleDebug --no-daemon
+          APK_FILE="app/build/outputs/apk/debug/app-debug.apk"
+          test -f "$APK_FILE"
+          echo "=== Auditing APK DEX Bytecode for Forbidden Secrets/Tokens ==="
+          mkdir -p /tmp/apk-inspect
+          unzip -q -o "$APK_FILE" -d /tmp/apk-inspect
+          if strings /tmp/apk-inspect/classes*.dex | grep -E "DEFAULT_GDRIVE_REFRESH_TOKEN|GOOGLE_OAUTH_CLIENT_SECRET|GOCSPX-|1//0[a-zA-Z0-9_-]{20,}"; then
+            echo "FATAL SECURITY VIOLATION: Hardcoded OAuth secret or refresh token found in APK DEX bytecode!"
+            exit 1
+          fi
+          echo "SECURITY AUDIT PASSED: Zero embedded refresh tokens, client secrets, or personal credentials in APK bytecode."
+          rm -rf /tmp/apk-inspect
 
-      - name: "10. Verify APK Integrity & Compute SHA-256"
+      - name: "Stage 12 & 13: Verify APK Zip Structure, Extract Signing SHA-1/SHA-256 & Compute APK Checksum"
         run: |
           APK_FILE="app/build/outputs/apk/debug/app-debug.apk"
           test -f "$APK_FILE"
           unzip -t "$APK_FILE" | tail -n 5
+          echo "=== APK Signing Certificate Fingerprints (Register SHA-1 in Google Cloud Console) ==="
+          keytool -printcert -jarfile "$APK_FILE" | tee app/build/outputs/apk/debug/apk-signing-certificate.txt
           sha256sum "$APK_FILE" | tee app/build/outputs/apk/debug/app-debug.apk.sha256
           ls -lh "$APK_FILE"
 
-      - name: "11. Upload Downloadable APK Artifact"
+      - name: "Stage 14a: Upload Downloadable APK & Reports Artifact"
         uses: actions/upload-artifact@v4
         with:
-          name: Android-Permanent-Backup-Debug-APK
+          name: Permanent-Drive-v2.0.0-Debug-APK
           path: |
             app/build/outputs/apk/debug/app-debug.apk
             app/build/outputs/apk/debug/app-debug.apk.sha256
+            app/build/outputs/apk/debug/apk-signing-certificate.txt
             app/build/reports/tests/testDebugUnitTest/
             app/build/reports/lint-results-debug.html
 
-      - name: "12. Publish Direct Downloadable APK to GitHub Releases (v1.3.0)"
+      - name: "Stage 14b: Publish Direct Downloadable APK to GitHub Releases (v2.0.0)"
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.3.0
-          name: "Android Permanent Google Drive Backup v1.3.0 (100% Native Android Account Picker — Zero Browser/Localhost)"
+          tag_name: v2.0.0
+          name: "Permanent Drive v2.0.0 — Android Google Drive Desktop Alternative (Persistent Identity Auth & 9-Screen Explorer)"
           body: |
-            Automated Remote Cloud Build of **Android Permanent Google Drive Backup App v1.3.0**.
-            - **100% Native Android System Account Picker (`AccountManager.newChooseAccountIntent`)**: Choose or switch Google Accounts directly inside the Android OS native popup dialog.
-            - **Removed External Browser / Localhost (`127.0.0.1:53682`) & Manual Token Form**: Zero browser popups, zero `rclone` screens, zero localhost timeouts, and zero `code 10` errors.
+            Automated Remote Cloud Build of **Permanent Drive v2.0.0** (`com.permanentbackup.gdrive`, `versionCode = 5`).
+            - **Zero Embedded Secrets**: All hardcoded OAuth client secrets, personal refresh tokens, and emails from `v1.2.0`/`v1.3.0` have been permanently eliminated from `BuildConfig` and verified via automated DEX bytecode audit.
+            - **Persistent Google Identity Services Auth (`AuthorizationClient` + `GoogleAuthUtil`)**: Silent-first OAuth authorization, automatic Play Services token refresh, multi-account isolation, and runtime Signing Certificate SHA-1/SHA-256 Diagnostics.
+            - **9-Screen Google Drive Desktop Alternative**: Home, My Drive Explorer (Folders, Search, Sort, Preview, Non-Overwriting Restore, Offline Pin, Share, Stream), Local Phone Explorer, Backups, Recent, Transfers (Speed, ETA, Pause/Resume), Offline Cache, Settings, and Accounts.
+            - **3-Layer Immutable Never-Delete Policy**: Enforced in `PermanentBackupEngine`, `NeverDeleteGuardInterceptor` (blocks `DELETE`, `PATCH`, non-resumable `PUT`, and `"trashed": true`), and 19 automated JUnit/MockWebServer tests.
           files: |
             app/build/outputs/apk/debug/app-debug.apk
             app/build/outputs/apk/debug/app-debug.apk.sha256
+            app/build/outputs/apk/debug/apk-signing-certificate.txt

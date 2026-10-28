@@ -10,6 +10,7 @@ import androidx.core.content.ContextCompat
 import com.permanentbackup.gdrive.domain.model.DiscoveredSourceFile
 import com.permanentbackup.gdrive.domain.model.FolderAccessStatus
 import com.permanentbackup.gdrive.domain.model.FolderCoverageItem
+import com.permanentbackup.gdrive.domain.model.LocalBrowseItem
 import java.io.File
 import java.io.InputStream
 
@@ -17,14 +18,16 @@ interface StorageFileSource {
     val hasStoragePermission: Boolean
     fun scanFilesSequence(computeHashes: Boolean = true): Sequence<DiscoveredSourceFile>
     fun getFolderCoverageReport(backedUpCountsByCategory: Map<String, Int>): List<FolderCoverageItem>
+    fun browseLocalDirectory(relativeSubPath: String = ""): List<LocalBrowseItem>
     fun openInputStream(sourceUri: String): InputStream
     fun exists(sourceUri: String): Boolean
 }
 
 /**
- * Discovers accessible files across Shared Internal Storage, WhatsApp Media, Telegram Downloads,
- * and removable SD Card storage while strictly respecting user consent and reporting
- * Android OS restricted folders (Android/data, Android/obb, /data/data) transparently.
+ * Section 5B: Local Phone Explorer & Storage Scanner.
+ * Discovers accessible files across Shared Internal Storage, DCIM, Downloads, Documents, Pictures,
+ * Videos, Audio, WhatsApp Media, Telegram Downloads, and removable SD Card storage while strictly
+ * refusing to read Android OS restricted app-private directories (Android/data, Android/obb, /data/data).
  */
 class AndroidStorageScanner(
     private val context: Context?,
@@ -36,8 +39,9 @@ class AndroidStorageScanner(
         val TARGET_STANDARD_FOLDERS = listOf(
             "DCIM" to "DCIM",
             "Pictures" to "Pictures",
-            "Movies" to "Movies",
-            "Music" to "Music",
+            "Movies" to "Videos",
+            "Video" to "Videos",
+            "Music" to "Audio",
             "Download" to "Downloads",
             "Documents" to "Documents",
             "Android/media/com.whatsapp/WhatsApp/Media" to "WhatsApp Media",
@@ -70,7 +74,11 @@ class AndroidStorageScanner(
                     ctx,
                     Manifest.permission.READ_MEDIA_VIDEO
                 ) == PackageManager.PERMISSION_GRANTED
-                if (hasImages || hasVideo) return true
+                val hasAudio = ContextCompat.checkSelfPermission(
+                    ctx,
+                    Manifest.permission.READ_MEDIA_AUDIO
+                ) == PackageManager.PERMISSION_GRANTED
+                if (hasImages || hasVideo || hasAudio) return true
             }
             return ContextCompat.checkSelfPermission(
                 ctx,
@@ -78,7 +86,7 @@ class AndroidStorageScanner(
             ) == PackageManager.PERMISSION_GRANTED
         }
 
-    private fun resolveStorageRoots(): List<File> {
+    fun resolveStorageRoots(): List<File> {
         if (customRootDirectories != null) return customRootDirectories
         val roots = mutableListOf<File>()
         try {
@@ -119,10 +127,8 @@ class AndroidStorageScanner(
 
             rootDir.walkTopDown()
                 .onEnter { dir ->
-                    val rel = dir.canonicalPath.removePrefix(rootPath).trimStart('/', '\\')
-                    // Skip Android-restricted directories and hidden temporary cache dirs
-                    !rel.startsWith("Android/data") &&
-                        !rel.startsWith("Android/obb") &&
+                    val rel = dir.canonicalPath.removePrefix(rootPath).trimStart('/', '\\').replace('\\', '/')
+                    !isRestrictedAndroidPath(rel) &&
                         !dir.name.startsWith(".thumbnails") &&
                         dir.canRead()
                 }
@@ -133,8 +139,6 @@ class AndroidStorageScanner(
                     val fullRelativePath = "$rootPrefix$relPath"
                     val category = classifyFolderCategory(relPath, rootIndex > 0)
                     val hashes = if (computeHashes && file.length() <= 64L * 1024 * 1024) {
-                        // Compute streaming SHA-256 & MD5 during scan for files up to 64 MB;
-                        // for multi-GB files, hashes are computed lazily right before streaming upload!
                         try {
                             SourceFileReadOnlyGuard.computeStreamingHashes {
                                 SourceFileReadOnlyGuard.openReadOnlyFileStream(file)
@@ -164,10 +168,69 @@ class AndroidStorageScanner(
         }
     }
 
+    /**
+     * Section 5B: Interactive Local Phone Storage Explorer.
+     * Lists folders and files in [relativeSubPath] while preventing path traversal and
+     * never attempting to read restricted Android/data or Android/obb directories.
+     */
+    override fun browseLocalDirectory(relativeSubPath: String): List<LocalBrowseItem> {
+        if (!hasStoragePermission) return emptyList()
+        val roots = resolveStorageRoots()
+        val primaryRoot = roots.firstOrNull() ?: return emptyList()
+
+        val cleanSub = relativeSubPath
+            .replace('\\', '/')
+            .split('/')
+            .filter { it.isNotBlank() && it != "." && it != ".." }
+            .joinToString("/")
+
+        if (isRestrictedAndroidPath(cleanSub)) {
+            return emptyList()
+        }
+
+        val targetDir = if (cleanSub.isBlank()) primaryRoot else File(primaryRoot, cleanSub)
+        if (!targetDir.exists() || !targetDir.isDirectory || !targetDir.canRead()) {
+            return emptyList()
+        }
+
+        val rootCanonical = primaryRoot.canonicalPath
+        val targetCanonical = targetDir.canonicalPath
+        if (!targetCanonical.startsWith(rootCanonical)) {
+            return emptyList()
+        }
+
+        val children = targetDir.listFiles() ?: return emptyList()
+        return children
+            .sortedWith(compareByDescending<File> { it.isDirectory }.thenBy { it.name.lowercase() })
+            .map { child ->
+                val rel = child.canonicalPath.removePrefix(rootCanonical).trimStart('/', '\\').replace('\\', '/')
+                val restricted = isRestrictedAndroidPath(rel)
+                val childCount = if (child.isDirectory && !restricted && child.canRead()) {
+                    child.list()?.size ?: 0
+                } else {
+                    0
+                }
+                LocalBrowseItem(
+                    absolutePath = child.absolutePath,
+                    relativePath = rel,
+                    name = child.name,
+                    isDirectory = child.isDirectory,
+                    sizeBytes = if (child.isFile) child.length() else 0L,
+                    lastModifiedMs = child.lastModified(),
+                    mimeType = if (child.isDirectory) "inode/directory" else guessMimeType(child.name),
+                    folderCategory = classifyFolderCategory(rel, false),
+                    isRestrictedByOs = restricted,
+                    backupEnabled = !restricted,
+                    childCount = childCount
+                )
+            }
+    }
+
     override fun getFolderCoverageReport(backedUpCountsByCategory: Map<String, Int>): List<FolderCoverageItem> {
         val items = mutableListOf<FolderCoverageItem>()
         val roots = resolveStorageRoots()
         val primaryRoot = roots.firstOrNull()
+        val nowMs = System.currentTimeMillis()
 
         val seenCategories = mutableSetOf<String>()
         for ((subPath, category) in TARGET_STANDARD_FOLDERS) {
@@ -195,7 +258,9 @@ class AndroidStorageScanner(
                         FolderAccessStatus.PERMISSION_REQUIRED -> "Requires User Storage Permission (MANAGE_EXTERNAL_STORAGE / Media Access)"
                         FolderAccessStatus.NOT_PRESENT_ON_DEVICE -> "Folder not yet created on device (Will be auto-detected when created)"
                         FolderAccessStatus.RESTRICTED_BY_ANDROID_OS -> "Restricted by Android OS"
-                    }
+                    },
+                    backupEnabled = status == FolderAccessStatus.ACCESSIBLE,
+                    lastScanTimeMs = nowMs
                 )
             )
         }
@@ -217,11 +282,37 @@ class AndroidStorageScanner(
                                 accessStatus = FolderAccessStatus.ACCESSIBLE,
                                 discoveredFileCount = count,
                                 backedUpFileCount = backedUpCountsByCategory[topDir.name] ?: 0,
-                                restrictionExplanation = "Dynamically discovered folder -> Android_Permanent_Backup/${topDir.name}"
+                                restrictionExplanation = "Dynamically discovered folder -> Android_Permanent_Backup/${topDir.name}",
+                                backupEnabled = true,
+                                lastScanTimeMs = nowMs
                             )
                         )
                     }
                 }
+        }
+
+        // Include external SD card roots if present
+        if (roots.size > 1) {
+            for (sdIdx in 1 until roots.size) {
+                val sdRoot = roots[sdIdx]
+                val count = if (hasStoragePermission && sdRoot.canRead()) {
+                    sdRoot.walkTopDown().count { it.isFile && it.canRead() }
+                } else {
+                    0
+                }
+                items.add(
+                    FolderCoverageItem(
+                        folderName = "External SD Card #$sdIdx",
+                        relativePath = "SDCard_$sdIdx",
+                        accessStatus = if (hasStoragePermission) FolderAccessStatus.ACCESSIBLE else FolderAccessStatus.PERMISSION_REQUIRED,
+                        discoveredFileCount = count,
+                        backedUpFileCount = backedUpCountsByCategory["SD Card"] ?: 0,
+                        restrictionExplanation = "External SD Card Storage -> Android_Permanent_Backup/SDCard_$sdIdx",
+                        backupEnabled = true,
+                        lastScanTimeMs = nowMs
+                    )
+                )
+            }
         }
 
         // Explicitly append Restricted Android OS Folders so user knows they are never falsely claimed as backed up
@@ -233,7 +324,9 @@ class AndroidStorageScanner(
                     accessStatus = FolderAccessStatus.RESTRICTED_BY_ANDROID_OS,
                     discoveredFileCount = 0,
                     backedUpFileCount = 0,
-                    restrictionExplanation = explanation
+                    restrictionExplanation = explanation,
+                    backupEnabled = false,
+                    lastScanTimeMs = nowMs
                 )
             )
         }
@@ -249,14 +342,23 @@ class AndroidStorageScanner(
         return File(sourceUri).exists()
     }
 
+    private fun isRestrictedAndroidPath(relativePath: String): Boolean {
+        val norm = relativePath.replace('\\', '/').trimStart('/')
+        return norm.equals("Android/data", ignoreCase = true) ||
+            norm.startsWith("Android/data/", ignoreCase = true) ||
+            norm.equals("Android/obb", ignoreCase = true) ||
+            norm.startsWith("Android/obb/", ignoreCase = true) ||
+            norm.startsWith("data/data", ignoreCase = true)
+    }
+
     private fun classifyFolderCategory(relativePath: String, isSdCard: Boolean): String {
         if (isSdCard) return "SD Card"
         val normalized = relativePath.replace('\\', '/')
         return when {
             normalized.startsWith("DCIM", ignoreCase = true) -> "DCIM"
             normalized.startsWith("Pictures", ignoreCase = true) -> "Pictures"
-            normalized.startsWith("Movies", ignoreCase = true) -> "Movies"
-            normalized.startsWith("Music", ignoreCase = true) -> "Music"
+            normalized.startsWith("Movies", ignoreCase = true) || normalized.startsWith("Video", ignoreCase = true) -> "Videos"
+            normalized.startsWith("Music", ignoreCase = true) -> "Audio"
             normalized.contains("WhatsApp/Media", ignoreCase = true) -> "WhatsApp Media"
             normalized.contains("Telegram", ignoreCase = true) -> "Telegram Downloads"
             normalized.startsWith("Download", ignoreCase = true) -> "Downloads"

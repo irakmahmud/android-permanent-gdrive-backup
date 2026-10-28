@@ -10,6 +10,7 @@ import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.layout.Arrangement
@@ -43,14 +44,18 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.permanentbackup.gdrive.domain.model.CloudBrowseItem
+import com.permanentbackup.gdrive.provider.DriveStreamingContentProvider
 import com.permanentbackup.gdrive.ui.screens.AppScreen
-import com.permanentbackup.gdrive.ui.screens.BackupActivityScreen
-import com.permanentbackup.gdrive.ui.screens.BackupHistoryScreen
-import com.permanentbackup.gdrive.ui.screens.DashboardScreen
-import com.permanentbackup.gdrive.ui.screens.FailedUploadsScreen
-import com.permanentbackup.gdrive.ui.screens.FolderCoverageScreen
+import com.permanentbackup.gdrive.ui.screens.BackupVersionHistoryScreen
 import com.permanentbackup.gdrive.ui.screens.GoogleAccountScreen
+import com.permanentbackup.gdrive.ui.screens.HomeDashboardScreen
+import com.permanentbackup.gdrive.ui.screens.MyDriveExplorerScreen
+import com.permanentbackup.gdrive.ui.screens.OfflineAccessScreen
+import com.permanentbackup.gdrive.ui.screens.PhoneStorageExplorerScreen
+import com.permanentbackup.gdrive.ui.screens.RecentActivityScreen
 import com.permanentbackup.gdrive.ui.screens.SettingsScreen
+import com.permanentbackup.gdrive.ui.screens.TransferManagerScreen
 import com.permanentbackup.gdrive.ui.theme.PermanentBackupTheme
 import com.permanentbackup.gdrive.ui.viewmodel.BackupViewModel
 
@@ -64,16 +69,32 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             PermanentBackupTheme {
-                var currentScreen by remember { mutableStateOf(AppScreen.DASHBOARD) }
+                var currentScreen by remember { mutableStateOf(AppScreen.HOME) }
                 var pendingSelectedEmail by remember { mutableStateOf("") }
+                var pendingFullReadScope by remember { mutableStateOf(false) }
 
                 val summary by viewModel.dashboardSummary.collectAsState()
                 val activeQueue by viewModel.activeQueue.collectAsState()
                 val verifiedHistory by viewModel.verifiedHistory.collectAsState()
+                val recentRecords by viewModel.recentRecords.collectAsState()
+                val recentSyncEvents by viewModel.recentSyncEvents.collectAsState()
                 val failedUploads by viewModel.failedUploads.collectAsState()
                 val folderCoverage by viewModel.folderCoverage.collectAsState()
+                val cloudDriveItems by viewModel.cloudDriveItems.collectAsState()
+                val driveFilter by viewModel.driveFilter.collectAsState()
+                val driveSortOrder by viewModel.driveSortOrder.collectAsState()
+                val driveBreadcrumbs by viewModel.driveFolderBreadcrumbs.collectAsState()
+                val driveSearchQuery by viewModel.driveSearchQuery.collectAsState()
+                val isDriveGridView by viewModel.isDriveGridView.collectAsState()
+                val localPhoneItems by viewModel.localPhoneItems.collectAsState()
+                val currentLocalPath by viewModel.currentLocalPath.collectAsState()
+                val pinnedOfflineFiles by viewModel.pinnedOfflineFiles.collectAsState()
+                val savedAccounts by viewModel.savedAccounts.collectAsState()
+                val oauthDiagnostics by viewModel.oauthDiagnostics.collectAsState()
                 val settings by viewModel.settings.collectAsState()
                 val signInFeedbackMessage by viewModel.signInStatusMessage.collectAsState()
+                val actionFeedbackMessage by viewModel.actionFeedbackMessage.collectAsState()
+                val previewSnippet by viewModel.previewSnippet.collectAsState()
 
                 val safTreeLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.OpenDocumentTree()
@@ -87,16 +108,33 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
-                // Native Play Services Consent Launcher (if Play Services requests Drive permission sheet)
+                // Official Google Identity Services AuthorizationClient PendingIntent resolution launcher
+                val identityAuthorizationLauncher = rememberLauncherForActivityResult(
+                    contract = ActivityResultContracts.StartIntentSenderForResult()
+                ) {
+                    if (pendingSelectedEmail.isNotBlank()) {
+                        viewModel.completeNativeConsentResult(
+                            context = this@MainActivity,
+                            selectedEmail = pendingSelectedEmail,
+                            requestFullDriveRead = pendingFullReadScope
+                        )
+                    }
+                }
+
+                // Fallback Play Services Consent Intent Launcher
                 val recoverableConsentLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.StartActivityForResult()
                 ) {
                     if (pendingSelectedEmail.isNotBlank()) {
-                        viewModel.completeNativeConsentResult(this@MainActivity, pendingSelectedEmail)
+                        viewModel.completeNativeConsentResult(
+                            context = this@MainActivity,
+                            selectedEmail = pendingSelectedEmail,
+                            requestFullDriveRead = pendingFullReadScope
+                        )
                     }
                 }
 
-                // 100% Native Android System Google Account Picker (Zero Browser, Zero Localhost, Zero Code-10!)
+                // Native Android System Account Picker -> Followed by Official Drive AuthorizationClient
                 val nativeAccountPickerLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.StartActivityForResult()
                 ) { result ->
@@ -109,6 +147,12 @@ class MainActivity : ComponentActivity() {
                             viewModel.onNativeGoogleAccountSelected(
                                 context = this@MainActivity,
                                 selectedEmail = selectedEmail,
+                                requestFullDriveRead = pendingFullReadScope,
+                                onResolutionPendingIntent = { pendingIntent ->
+                                    identityAuthorizationLauncher.launch(
+                                        IntentSenderRequest.Builder(pendingIntent).build()
+                                    )
+                                },
                                 onRecoverableConsentIntent = { consentIntent ->
                                     recoverableConsentLauncher.launch(consentIntent)
                                 }
@@ -117,7 +161,8 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
-                val launchNativeGoogleAccountPicker: () -> Unit = {
+                val launchNativeGoogleAccountPicker: (Boolean) -> Unit = { requestFullRead ->
+                    pendingFullReadScope = requestFullRead
                     try {
                         @Suppress("DEPRECATION")
                         val pickerIntent = AccountManager.newChooseAccountIntent(
@@ -135,6 +180,29 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
+                val authorizeAdditionalDriveReadScope: () -> Unit = {
+                    val activeEmail = summary.accountState.email
+                    if (activeEmail.isNotBlank()) {
+                        pendingSelectedEmail = activeEmail
+                        pendingFullReadScope = true
+                        viewModel.onNativeGoogleAccountSelected(
+                            context = this@MainActivity,
+                            selectedEmail = activeEmail,
+                            requestFullDriveRead = true,
+                            onResolutionPendingIntent = { pendingIntent ->
+                                identityAuthorizationLauncher.launch(
+                                    IntentSenderRequest.Builder(pendingIntent).build()
+                                )
+                            },
+                            onRecoverableConsentIntent = { consentIntent ->
+                                recoverableConsentLauncher.launch(consentIntent)
+                            }
+                        )
+                    } else {
+                        launchNativeGoogleAccountPicker(true)
+                    }
+                }
+
                 Scaffold(
                     modifier = Modifier
                         .fillMaxSize()
@@ -145,13 +213,12 @@ class MainActivity : ComponentActivity() {
                             TopAppBar(
                                 title = {
                                     Text(
-                                        text = "Permanent Backup — ${currentScreen.title}",
+                                        text = "Permanent Drive — ${currentScreen.title}",
                                         maxLines = 1,
                                         overflow = TextOverflow.Ellipsis
                                     )
                                 }
                             )
-                            // Always-visible 2-row Navigation Grid at top so NO button is ever hidden or cut off!
                             TwoRowNavigationHeader(
                                 currentScreen = currentScreen,
                                 onSelectScreen = { selected ->
@@ -169,64 +236,149 @@ class MainActivity : ComponentActivity() {
                             .padding(innerPadding)
                     ) {
                         when (currentScreen) {
-                            AppScreen.DASHBOARD -> DashboardScreen(
+                            AppScreen.HOME -> HomeDashboardScreen(
                                 summary = summary,
                                 settings = settings,
+                                actionFeedback = actionFeedbackMessage,
                                 onBackupNow = { viewModel.triggerManualBackupNow() },
-                                onOpenAccountScreen = {
-                                    currentScreen = AppScreen.ACCOUNT
-                                    launchNativeGoogleAccountPicker()
+                                onConnectOrManageAccount = {
+                                    currentScreen = AppScreen.ACCOUNTS
+                                    // Section 3: Never prompt Account Picker if already connected!
+                                    if (!summary.accountState.isConnected) {
+                                        launchNativeGoogleAccountPicker(false)
+                                    }
                                 },
-                                onOpenFoldersScreen = { currentScreen = AppScreen.FOLDERS },
+                                onOpenPhoneStorageScreen = {
+                                    currentScreen = AppScreen.PHONE_STORAGE
+                                    viewModel.refreshLocalPhoneBrowser("")
+                                },
+                                onOpenMyDriveScreen = {
+                                    currentScreen = AppScreen.MY_DRIVE
+                                    viewModel.refreshCloudDriveExplorer()
+                                },
                                 onEnableConsentAndPermissions = {
                                     viewModel.updateSettings(settings.copy(userBackupConsentGranted = true))
                                     requestManageAllFilesAccess()
                                 },
                                 onRefresh = { viewModel.refreshDashboardAndCoverage(fetchRemoteQuota = true) }
                             )
-                            AppScreen.ACCOUNT -> GoogleAccountScreen(
-                                summary = summary,
-                                signInFeedbackMessage = signInFeedbackMessage,
-                                onLaunchGoogleSignIn = launchNativeGoogleAccountPicker,
-                                onLaunchBrowserOAuth = { viewModel.verifyAndRefreshCloudConnection() },
-                                onConnectTokenManually = { email, name, token, refresh ->
-                                    viewModel.connectGoogleAccount(email, name, token, refresh)
-                                },
-                                onSwitchAccount = { email, name, token, refresh ->
-                                    viewModel.switchGoogleAccount(email, name, token, refresh)
-                                },
-                                onDisconnect = {
-                                    viewModel.disconnectGoogleAccount()
-                                }
+                            AppScreen.MY_DRIVE -> MyDriveExplorerScreen(
+                                accountConnected = summary.accountState.isConnected,
+                                hasFullDriveReadScope = summary.accountState.hasFullDriveReadScope,
+                                items = cloudDriveItems,
+                                currentFilter = driveFilter,
+                                currentSort = driveSortOrder,
+                                breadcrumbs = driveBreadcrumbs,
+                                searchQuery = driveSearchQuery,
+                                isGridView = isDriveGridView,
+                                previewSnippet = previewSnippet,
+                                onSelectFilter = { viewModel.setDriveFilter(it) },
+                                onSelectSort = { viewModel.setDriveSortOrder(it) },
+                                onSearchQueryChange = { viewModel.setDriveSearchQuery(it) },
+                                onToggleGridView = { viewModel.toggleDriveGridView() },
+                                onOpenFolder = { id, name -> viewModel.openDriveSubfolder(id, name) },
+                                onNavigateBreadcrumb = { idx -> viewModel.navigateUpDriveFolder(idx) },
+                                onPreviewFile = { viewModel.previewCloudFileStream(it) },
+                                onDismissPreview = { viewModel.dismissPreviewDialog() },
+                                onStreamOpenExternal = { openCloudStreamWithSupportedApp(it) },
+                                onDownloadRestoreFile = { viewModel.restoreCloudFile(it) },
+                                onTogglePinOffline = { viewModel.toggleCloudFileOfflinePin(it) },
+                                onShareFileLink = { shareCloudFileLink(it) },
+                                onRequestFullDriveReadScope = authorizeAdditionalDriveReadScope,
+                                onRefresh = { viewModel.refreshCloudDriveExplorer() }
                             )
-                            AppScreen.FOLDERS -> FolderCoverageScreen(
+                            AppScreen.PHONE_STORAGE -> PhoneStorageExplorerScreen(
+                                currentPath = currentLocalPath,
+                                localItems = localPhoneItems,
                                 coverageItems = folderCoverage,
+                                onNavigateFolder = { viewModel.refreshLocalPhoneBrowser(it) },
+                                onNavigateUp = { viewModel.navigateUpLocalFolder() },
                                 onGrantAllFilesAccess = {
                                     viewModel.updateSettings(settings.copy(userBackupConsentGranted = true))
                                     requestManageAllFilesAccess()
                                 },
                                 onSelectSafTree = { safTreeLauncher.launch(null) }
                             )
+                            AppScreen.BACKUPS -> BackupVersionHistoryScreen(
+                                verifiedHistory = verifiedHistory,
+                                actionFeedback = actionFeedbackMessage,
+                                onRestoreVersion = { viewModel.restoreBackupVersion(it) }
+                            )
+                            AppScreen.RECENT -> RecentActivityScreen(
+                                recentRecords = recentRecords,
+                                syncEvents = recentSyncEvents,
+                                onRestoreRecord = { viewModel.restoreBackupVersion(it) }
+                            )
+                            AppScreen.TRANSFERS -> TransferManagerScreen(
+                                summary = summary,
+                                settings = settings,
+                                activeQueue = activeQueue,
+                                failedList = failedUploads,
+                                onTriggerBackup = { viewModel.triggerManualBackupNow() },
+                                onTogglePauseAll = { viewModel.togglePauseAllTransfers() },
+                                onPauseResumeSingle = { id, pause -> viewModel.togglePauseSingleRecord(id, pause) },
+                                onRetryAll = { viewModel.retryFailedUploads() },
+                                onRetrySingle = { id -> viewModel.retrySingleRecord(id) }
+                            )
+                            AppScreen.OFFLINE -> OfflineAccessScreen(
+                                pinnedFiles = pinnedOfflineFiles,
+                                usedBytes = summary.offlineCacheUsedBytes,
+                                budgetBytes = summary.offlineCacheBudgetBytes,
+                                onUnpinFile = { viewModel.unpinOfflineEntity(it) }
+                            )
                             AppScreen.SETTINGS -> SettingsScreen(
                                 settings = settings,
                                 onUpdateSettings = { viewModel.updateSettings(it) }
                             )
-                            AppScreen.ACTIVITY -> BackupActivityScreen(
-                                activeQueue = activeQueue,
-                                onTriggerBackup = { viewModel.triggerManualBackupNow() }
-                            )
-                            AppScreen.HISTORY -> BackupHistoryScreen(
-                                verifiedHistory = verifiedHistory
-                            )
-                            AppScreen.FAILED -> FailedUploadsScreen(
-                                failedList = failedUploads,
-                                onRetryAll = { viewModel.retryFailedUploads() },
-                                onRetrySingle = { id -> viewModel.retrySingleRecord(id) }
+                            AppScreen.ACCOUNTS -> GoogleAccountScreen(
+                                summary = summary,
+                                savedAccounts = savedAccounts,
+                                oauthDiagnostics = oauthDiagnostics,
+                                signInFeedbackMessage = signInFeedbackMessage,
+                                onLaunchGoogleSignIn = { launchNativeGoogleAccountPicker(false) },
+                                onGrantFullDriveReadScope = authorizeAdditionalDriveReadScope,
+                                onSwitchSavedAccount = { email ->
+                                    pendingSelectedEmail = email
+                                    viewModel.switchActiveSavedAccount(this@MainActivity, email)
+                                },
+                                onVerifyCloudConnection = { viewModel.verifyAndRefreshCloudConnection() },
+                                onDisconnect = { viewModel.disconnectGoogleAccount() }
                             )
                         }
                     }
                 }
             }
+        }
+    }
+
+    private fun openCloudStreamWithSupportedApp(item: CloudBrowseItem) {
+        try {
+            val streamUri = DriveStreamingContentProvider.buildStreamUri(
+                driveFileId = item.driveFileId,
+                displayName = item.name,
+                mimeType = item.mimeType,
+                sizeBytes = item.sizeBytes
+            )
+            val viewIntent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(streamUri, item.mimeType)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(Intent.createChooser(viewIntent, "Open Stream: ${item.name}"))
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun shareCloudFileLink(item: CloudBrowseItem) {
+        try {
+            val shareLink = item.webViewLink
+                ?: "https://drive.google.com/file/d/${item.driveFileId}/view"
+            val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_SUBJECT, item.name)
+                putExtra(Intent.EXTRA_TEXT, "${item.name}: $shareLink")
+            }
+            startActivity(Intent.createChooser(sendIntent, "Share Google Drive Link"))
+        } catch (_: Throwable) {
         }
     }
 
@@ -250,8 +402,19 @@ private fun TwoRowNavigationHeader(
     currentScreen: AppScreen,
     onSelectScreen: (AppScreen) -> Unit
 ) {
-    val row1 = listOf(AppScreen.DASHBOARD, AppScreen.ACCOUNT, AppScreen.FOLDERS, AppScreen.SETTINGS)
-    val row2 = listOf(AppScreen.ACTIVITY, AppScreen.HISTORY, AppScreen.FAILED)
+    val row1 = listOf(
+        AppScreen.HOME,
+        AppScreen.MY_DRIVE,
+        AppScreen.PHONE_STORAGE,
+        AppScreen.BACKUPS,
+        AppScreen.RECENT
+    )
+    val row2 = listOf(
+        AppScreen.TRANSFERS,
+        AppScreen.OFFLINE,
+        AppScreen.SETTINGS,
+        AppScreen.ACCOUNTS
+    )
 
     Surface(
         color = MaterialTheme.colorScheme.surface,
@@ -260,12 +423,12 @@ private fun TwoRowNavigationHeader(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 8.dp, vertical = 6.dp),
+                .padding(horizontal = 6.dp, vertical = 6.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
             ) {
                 row1.forEach { screen ->
                     NavChipButton(
@@ -278,7 +441,7 @@ private fun TwoRowNavigationHeader(
             }
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
             ) {
                 row2.forEach { screen ->
                     NavChipButton(
@@ -304,14 +467,14 @@ private fun NavChipButton(
         Button(
             onClick = onClick,
             modifier = modifier,
-            contentPadding = PaddingValues(horizontal = 4.dp, vertical = 6.dp),
+            contentPadding = PaddingValues(horizontal = 2.dp, vertical = 6.dp),
             colors = ButtonDefaults.buttonColors(
                 containerColor = MaterialTheme.colorScheme.primary
             )
         ) {
             Text(
                 text = screen.title,
-                fontSize = 12.sp,
+                fontSize = 11.sp,
                 fontWeight = FontWeight.Bold,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
@@ -321,11 +484,11 @@ private fun NavChipButton(
         OutlinedButton(
             onClick = onClick,
             modifier = modifier,
-            contentPadding = PaddingValues(horizontal = 4.dp, vertical = 6.dp)
+            contentPadding = PaddingValues(horizontal = 2.dp, vertical = 6.dp)
         ) {
             Text(
                 text = screen.title,
-                fontSize = 12.sp,
+                fontSize = 11.sp,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )

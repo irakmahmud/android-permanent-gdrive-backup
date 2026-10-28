@@ -55,6 +55,12 @@
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 
+        <provider
+            android:name=".provider.DriveStreamingContentProvider"
+            android:authorities="com.permanentbackup.gdrive.stream"
+            android:exported="false"
+            android:grantUriPermissions="true" />
+
         <receiver
             android:name=".worker.BootCompletedReceiver"
             android:enabled="true"
