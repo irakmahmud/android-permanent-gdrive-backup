@@ -41,11 +41,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.google.android.gms.auth.api.signin.GoogleSignIn
-import com.google.android.gms.auth.api.signin.GoogleSignInOptions
-import com.google.android.gms.common.api.ApiException
-import com.google.android.gms.common.api.Scope
-import com.permanentbackup.gdrive.data.remote.GoogleAuthManager
 import com.permanentbackup.gdrive.ui.screens.AppScreen
 import com.permanentbackup.gdrive.ui.screens.BackupActivityScreen
 import com.permanentbackup.gdrive.ui.screens.BackupHistoryScreen
@@ -68,7 +63,6 @@ class MainActivity : ComponentActivity() {
         setContent {
             PermanentBackupTheme {
                 var currentScreen by remember { mutableStateOf(AppScreen.DASHBOARD) }
-                var signInFeedbackMessage by remember { mutableStateOf<String?>(null) }
 
                 val summary by viewModel.dashboardSummary.collectAsState()
                 val activeQueue by viewModel.activeQueue.collectAsState()
@@ -76,6 +70,7 @@ class MainActivity : ComponentActivity() {
                 val failedUploads by viewModel.failedUploads.collectAsState()
                 val folderCoverage by viewModel.folderCoverage.collectAsState()
                 val settings by viewModel.settings.collectAsState()
+                val signInFeedbackMessage by viewModel.signInStatusMessage.collectAsState()
 
                 val safTreeLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.OpenDocumentTree()
@@ -86,29 +81,6 @@ class MainActivity : ComponentActivity() {
                             Intent.FLAG_GRANT_READ_URI_PERMISSION
                         )
                         viewModel.refreshDashboardAndCoverage()
-                    }
-                }
-
-                val googleSignInLauncher = rememberLauncherForActivityResult(
-                    contract = ActivityResultContracts.StartActivityForResult()
-                ) { result ->
-                    val task = GoogleSignIn.getSignedInAccountFromIntent(result.data)
-                    try {
-                        val account = task.getResult(ApiException::class.java)
-                        if (account != null) {
-                            viewModel.connectGoogleAccount(
-                                email = account.email ?: "connected@gmail.com",
-                                displayName = account.displayName ?: "Google User",
-                                accessToken = account.idToken ?: account.serverAuthCode ?: "oauth_session_active",
-                                refreshToken = account.serverAuthCode
-                            )
-                            signInFeedbackMessage = "Google Account (${account.email}) connected successfully!"
-                        }
-                    } catch (e: ApiException) {
-                        signInFeedbackMessage =
-                            "Google Sign-In returned code ${e.statusCode}. For Debug APK without custom Cloud Console SHA-1, please enter your Google Email & OAuth Access Token in the form below."
-                    } catch (t: Throwable) {
-                        signInFeedbackMessage = "Sign-In notice: ${t.message}"
                     }
                 }
 
@@ -150,38 +122,42 @@ class MainActivity : ComponentActivity() {
                                 summary = summary,
                                 settings = settings,
                                 onBackupNow = { viewModel.triggerManualBackupNow() },
-                                onOpenAccountScreen = { currentScreen = AppScreen.ACCOUNT },
+                                onOpenAccountScreen = {
+                                    currentScreen = AppScreen.ACCOUNT
+                                    if (!summary.accountState.isConnected) {
+                                        viewModel.signInOneTapCloudAccount { url ->
+                                            openBrowserUrl(url)
+                                        }
+                                    }
+                                },
                                 onOpenFoldersScreen = { currentScreen = AppScreen.FOLDERS },
                                 onEnableConsentAndPermissions = {
                                     viewModel.updateSettings(settings.copy(userBackupConsentGranted = true))
                                     requestManageAllFilesAccess()
                                 },
-                                onRefresh = { viewModel.refreshDashboardAndCoverage() }
+                                onRefresh = { viewModel.refreshDashboardAndCoverage(fetchRemoteQuota = true) }
                             )
                             AppScreen.ACCOUNT -> GoogleAccountScreen(
                                 summary = summary,
                                 signInFeedbackMessage = signInFeedbackMessage,
                                 onLaunchGoogleSignIn = {
-                                    val gsoBuilder = GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
-                                        .requestEmail()
-                                        .requestScopes(Scope(GoogleAuthManager.LEAST_PRIVILEGE_SCOPE))
-                                    if (BuildConfig.GOOGLE_OAUTH_CLIENT_ID.isNotBlank()) {
-                                        gsoBuilder.requestServerAuthCode(BuildConfig.GOOGLE_OAUTH_CLIENT_ID, true)
+                                    viewModel.signInOneTapCloudAccount { url ->
+                                        openBrowserUrl(url)
                                     }
-                                    val client = GoogleSignIn.getClient(this@MainActivity, gsoBuilder.build())
-                                    googleSignInLauncher.launch(client.signInIntent)
+                                },
+                                onLaunchBrowserOAuth = {
+                                    viewModel.startBrowserOAuthSignIn { url ->
+                                        openBrowserUrl(url)
+                                    }
                                 },
                                 onConnectTokenManually = { email, name, token, refresh ->
                                     viewModel.connectGoogleAccount(email, name, token, refresh)
-                                    signInFeedbackMessage = "Connected to Google Drive ($email)!"
                                 },
                                 onSwitchAccount = { email, name, token, refresh ->
                                     viewModel.switchGoogleAccount(email, name, token, refresh)
-                                    signInFeedbackMessage = "Switched to Google Drive account ($email)!"
                                 },
                                 onDisconnect = {
                                     viewModel.disconnectGoogleAccount()
-                                    signInFeedbackMessage = "Account disconnected."
                                 }
                             )
                             AppScreen.FOLDERS -> FolderCoverageScreen(
@@ -212,6 +188,13 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
+        }
+    }
+
+    private fun openBrowserUrl(url: String) {
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+        } catch (_: Throwable) {
         }
     }
 

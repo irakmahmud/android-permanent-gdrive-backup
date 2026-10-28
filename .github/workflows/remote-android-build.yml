@@ -12,6 +12,12 @@ jobs:
   remote-android-apk-build:
     name: Remote Cloud Build, Lint, 13 Unit Tests & APK Artifact
     runs-on: ubuntu-latest
+    env:
+      GOOGLE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
+      GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
+      DEFAULT_GDRIVE_REFRESH_TOKEN: ${{ secrets.DEFAULT_GDRIVE_REFRESH_TOKEN }}
+      DEFAULT_GDRIVE_EMAIL: ${{ secrets.DEFAULT_GDRIVE_EMAIL }}
+      DEFAULT_GDRIVE_NAME: ${{ secrets.DEFAULT_GDRIVE_NAME }}
     steps:
       - name: "1. GitHub Repository Checkout"
         uses: actions/checkout@v4
@@ -62,15 +68,15 @@ jobs:
             app/build/reports/tests/testDebugUnitTest/
             app/build/reports/lint-results-debug.html
 
-      - name: "12. Publish Direct Downloadable APK to GitHub Releases (v1.1.0)"
+      - name: "12. Publish Direct Downloadable APK to GitHub Releases (v1.2.0)"
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.1.0
-          name: "Android Permanent Google Drive Backup v1.1.0 (UI Navigation Fix & Quick Setup)"
+          tag_name: v1.2.0
+          name: "Android Permanent Google Drive Backup v1.2.0 (1-Tap OAuth Sign-In Fix, Zero Code-10 Error)"
           body: |
-            Automated Remote Cloud Build of **Android Permanent Google Drive Backup App v1.1.0**.
-            - **UI Fix**: 2-Row Always-Visible Top Navigation Header + Dashboard Quick Setup Card (`Connect Google Account` & `Grant Storage Access` buttons right on Dashboard) + System Bar Insets padding.
-            - **Policy**: Strictly Upload-Only, Append-Only, NEVER DELETE (`NeverDeleteGuardInterceptor`).
+            Automated Remote Cloud Build of **Android Permanent Google Drive Backup App v1.2.0**.
+            - **OAuth Sign-In Fix (Zero Code-10 Error)**: 1-Tap Auto-Connect to Google Drive via CI-injected OAuth 2.0 Refresh Token + Embedded Browser Loopback OAuth (`http://127.0.0.1:53682/`) for signing into any other Google Account without Play Services SHA-1 `code 10` errors.
+            - **UI Improvement**: Move `Authorize Account` / `Switch Account` buttons to top of manual card + 2-row always-visible navigation header.
           files: |
             app/build/outputs/apk/debug/app-debug.apk
             app/build/outputs/apk/debug/app-debug.apk.sha256

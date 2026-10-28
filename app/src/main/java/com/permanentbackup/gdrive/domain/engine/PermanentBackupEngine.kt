@@ -87,6 +87,35 @@ class PermanentBackupEngine(
     }
 
     /**
+     * Connects to Google Drive API v3, refreshes storage quota info, and ensures
+     * the root backup folder ("Android_Permanent_Backup") exists.
+     */
+    suspend fun refreshRemoteQuotaAndRootFolder(): Boolean {
+        if (!authManager.accountState.value.isConnected) return false
+        return try {
+            val token = authManager.getValidAccessToken()
+            val quota = driveApiClient.fetchDriveQuota(token)
+            _latestQuotaInfo.value = quota
+            _quotaFullState.value = quota.isQuotaFull
+
+            val currentRoot = authManager.accountState.value.rootDriveFolderId
+            if (currentRoot.isNullOrBlank()) {
+                val rootId = driveApiClient.ensureFolderExists(
+                    accessToken = token,
+                    folderName = ROOT_DRIVE_FOLDER_NAME,
+                    parentFolderId = null
+                )
+                authManager.setRootDriveFolderId(rootId)
+            }
+            _lastNetworkError.value = null
+            true
+        } catch (e: Exception) {
+            _lastNetworkError.value = e.message
+            false
+        }
+    }
+
+    /**
      * Executes a complete scan + deduplication + version detection + resumable upload cycle.
      */
     suspend fun runBackupCycle(settings: BackupSettings): BackupCycleSummary {

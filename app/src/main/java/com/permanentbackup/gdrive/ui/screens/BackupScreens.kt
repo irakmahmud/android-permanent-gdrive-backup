@@ -530,6 +530,7 @@ fun GoogleAccountScreen(
     summary: DashboardSummary,
     signInFeedbackMessage: String? = null,
     onLaunchGoogleSignIn: () -> Unit,
+    onLaunchBrowserOAuth: () -> Unit = {},
     onConnectTokenManually: (String, String, String, String?) -> Unit,
     onSwitchAccount: (String, String, String, String?) -> Unit,
     onDisconnect: () -> Unit
@@ -558,7 +559,10 @@ fun GoogleAccountScreen(
                     )
                     Text("Status: ${if (summary.accountState.isConnected) "Connected ✓" else "Disconnected"}")
                     Text("Account Email: ${summary.accountState.email.ifBlank { "Not signed in" }}")
-                    Text("OAuth Scope: ${summary.accountState.grantedScope} (Least-Privilege drive.file)")
+                    Text("Display Name: ${summary.accountState.displayName.ifBlank { "N/A" }}")
+                    Text(
+                        "Available Drive Storage: ${formatBytes(summary.driveQuota.availableBytes)} free of ${formatBytes(summary.driveQuota.limitBytes)}"
+                    )
                     Text("Root Backup Folder: ${summary.accountState.rootDriveFolderName}")
                     Text("Root Folder ID: ${summary.accountState.rootDriveFolderId ?: "Will be created on first upload"}")
                     summary.accountState.connectionError?.let { err ->
@@ -568,12 +572,33 @@ fun GoogleAccountScreen(
                         Text(msg, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold)
                     }
                     Spacer(modifier = Modifier.height(8.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(onClick = onLaunchGoogleSignIn) {
-                            Text(if (summary.accountState.isConnected) "Reconnect Google Sign-In" else "Sign in with Google")
+                    Button(
+                        onClick = onLaunchGoogleSignIn,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            if (summary.accountState.isConnected) {
+                                "✓ Re-Verify & Refresh Google Drive Token (1-Tap)"
+                            } else {
+                                "Sign in with Google (1-Tap Auto-Connect)"
+                            }
+                        )
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedButton(
+                            onClick = onLaunchBrowserOAuth,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("Browser Sign-In (অন্য একাউন্ট)")
                         }
                         if (summary.accountState.isConnected) {
-                            OutlinedButton(onClick = onDisconnect) {
+                            OutlinedButton(
+                                onClick = onDisconnect,
+                                modifier = Modifier.weight(1f)
+                            ) {
                                 Text("Disconnect")
                             }
                         }
@@ -593,9 +618,41 @@ fun GoogleAccountScreen(
                         fontWeight = FontWeight.Bold
                     )
                     Text(
-                        "এখানে আপনার Google ইমেইল এবং OAuth 2.0 Access Token দিয়ে সরাসরি Google Drive সংযুক্ত বা একাউন্ট পরিবর্তন করতে পারবেন। পুরোনো কোনো ব্যাকআপ কখনো ডিলিট হবে না।",
+                        "অন্য কোনো কাস্টম Google একাউন্ট ও OAuth 2.0 Token সরাসরি দিতে চাইলে নিচের ঘরগুলো পূরণ করে 'Authorize Account' চাপুন:",
                         style = MaterialTheme.typography.bodySmall
                     )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = {
+                                if (emailInput.isNotBlank() && (accessTokenInput.isNotBlank() || refreshTokenInput.isNotBlank())) {
+                                    onConnectTokenManually(
+                                        emailInput.trim(),
+                                        nameInput.trim().ifBlank { emailInput.trim() },
+                                        accessTokenInput.trim(),
+                                        refreshTokenInput.trim().ifBlank { null }
+                                    )
+                                }
+                            },
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("Authorize Account")
+                        }
+                        OutlinedButton(
+                            onClick = {
+                                if (emailInput.isNotBlank() && (accessTokenInput.isNotBlank() || refreshTokenInput.isNotBlank())) {
+                                    onSwitchAccount(
+                                        emailInput.trim(),
+                                        nameInput.trim().ifBlank { emailInput.trim() },
+                                        accessTokenInput.trim(),
+                                        refreshTokenInput.trim().ifBlank { null }
+                                    )
+                                }
+                            },
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("Switch Account")
+                        }
+                    }
                     OutlinedTextField(
                         value = emailInput,
                         onValueChange = { emailInput = it },
@@ -620,36 +677,6 @@ fun GoogleAccountScreen(
                         label = { Text("OAuth 2.0 Refresh Token (1//... স্বয়ংক্রিয় রিফ্রেশের জন্য)") },
                         modifier = Modifier.fillMaxWidth()
                     )
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(
-                            onClick = {
-                                if (emailInput.isNotBlank() && accessTokenInput.isNotBlank()) {
-                                    onConnectTokenManually(
-                                        emailInput.trim(),
-                                        nameInput.trim().ifBlank { emailInput.trim() },
-                                        accessTokenInput.trim(),
-                                        refreshTokenInput.trim().ifBlank { null }
-                                    )
-                                }
-                            }
-                        ) {
-                            Text("Authorize Account")
-                        }
-                        OutlinedButton(
-                            onClick = {
-                                if (emailInput.isNotBlank() && accessTokenInput.isNotBlank()) {
-                                    onSwitchAccount(
-                                        emailInput.trim(),
-                                        nameInput.trim().ifBlank { emailInput.trim() },
-                                        accessTokenInput.trim(),
-                                        refreshTokenInput.trim().ifBlank { null }
-                                    )
-                                }
-                            }
-                        ) {
-                            Text("Switch Account")
-                        }
-                    }
                 }
             }
         }
