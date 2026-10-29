@@ -1846,11 +1846,11 @@ class PermanentBackupEngineTest {
 
         val localEntity1 = dao.getLocalFileByIdentity("vol0:DCIM/fast_scan.jpg")
         assertNotNull(localEntity1)
-        assertTrue(localEntity1!!.latestSha256.isNotBlank())
+        assertTrue(!localEntity1!!.latestSha256.isNullOrBlank())
 
-        // Verify scanFilesSequence(computeHashes = false) returns blank hash without reading file bytes
+        // Verify scanFilesSequence(computeHashes = false) returns null hash without reading file bytes
         val metadataOnlyItem = scanner.scanFilesSequence(computeHashes = false).single()
-        assertEquals("", metadataOnlyItem.sha256Hash)
+        assertEquals(null, metadataOnlyItem.sha256Hash)
         assertEquals(photoFile.length(), metadataOnlyItem.fileSize)
 
         // Second cycle reuses cached SHA-256/MD5 from LocalFileEntity when fileSize and lastModifiedMs match
