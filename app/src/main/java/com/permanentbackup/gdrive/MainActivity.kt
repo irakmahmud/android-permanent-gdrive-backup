@@ -67,7 +67,9 @@ class MainActivity : ComponentActivity() {
     @OptIn(ExperimentalMaterial3Api::class)
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        handleIncomingShareIntent(intent)
+        if (savedInstanceState == null) {
+            handleIncomingShareIntent(intent)
+        }
 
         setContent {
             PermanentBackupTheme {
@@ -101,6 +103,7 @@ class MainActivity : ComponentActivity() {
                 val actionFeedbackMessage by viewModel.actionFeedbackMessage.collectAsState()
                 val previewSnippet by viewModel.previewSnippet.collectAsState()
                 val selectedFileVersions by viewModel.selectedFileVersions.collectAsState()
+                val accountBackupVersions by viewModel.accountBackupVersions.collectAsState()
 
                 val safTreeLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.OpenDocumentTree()
@@ -356,9 +359,11 @@ class MainActivity : ComponentActivity() {
                                 verifiedHistory = verifiedHistory,
                                 actionFeedback = actionFeedbackMessage,
                                 selectedFileVersions = selectedFileVersions,
+                                accountBackupVersions = accountBackupVersions,
                                 onInspectAllVersions = { viewModel.inspectAllVersionsForFile(it) },
                                 onDismissVersionsDialog = { viewModel.dismissVersionsDialog() },
-                                onRestoreVersion = { viewModel.restoreBackupVersion(it) }
+                                onRestoreVersion = { viewModel.restoreBackupVersion(it) },
+                                onRestoreAccountVersion = { viewModel.restoreAccountBackupVersionEntity(it) }
                             )
                             AppScreen.RECENT -> RecentActivityScreen(
                                 recentRecords = recentRecords,
@@ -419,6 +424,7 @@ class MainActivity : ComponentActivity() {
     @Suppress("DEPRECATION")
     private fun handleIncomingShareIntent(intent: Intent?) {
         val action = intent?.action ?: return
+        val collectedUris = mutableListOf<Uri>()
         if (action == Intent.ACTION_SEND) {
             val sharedUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
@@ -426,7 +432,7 @@ class MainActivity : ComponentActivity() {
                 intent.getParcelableExtra(Intent.EXTRA_STREAM)
             }
             if (sharedUri != null) {
-                viewModel.uploadDirectUrisToDrive(listOf(sharedUri), "Shared_To_Drive")
+                collectedUris.add(sharedUri)
             }
         } else if (action == Intent.ACTION_SEND_MULTIPLE) {
             val sharedUris = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -435,8 +441,29 @@ class MainActivity : ComponentActivity() {
                 intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM)
             }
             if (!sharedUris.isNullOrEmpty()) {
-                viewModel.uploadDirectUrisToDrive(sharedUris, "Shared_To_Drive")
+                collectedUris.addAll(sharedUris)
             }
+        }
+        if ((action == Intent.ACTION_SEND || action == Intent.ACTION_SEND_MULTIPLE) && collectedUris.isEmpty()) {
+            val clip = intent.clipData
+            if (clip != null) {
+                for (i in 0 until clip.itemCount) {
+                    clip.getItemAt(i)?.uri?.let { collectedUris.add(it) }
+                }
+            }
+        }
+        if (collectedUris.isNotEmpty()) {
+            collectedUris.forEach { u ->
+                try {
+                    contentResolver.takePersistableUriPermission(
+                        u,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    )
+                } catch (_: Throwable) {
+                }
+            }
+            intent.action = ""
+            viewModel.uploadDirectUrisToDrive(collectedUris.distinct(), "Shared_To_Drive")
         }
     }
 
@@ -448,7 +475,7 @@ class MainActivity : ComponentActivity() {
                 mimeType = item.mimeType,
                 sizeBytes = item.sizeBytes
             )
-            val resolvedMime = if (item.isGoogleWorkspaceDoc) "application/pdf" else item.mimeType
+            val resolvedMime = DriveStreamingContentProvider.resolveExportedMimeType(item.mimeType)
             val viewIntent = Intent(Intent.ACTION_VIEW).apply {
                 setDataAndType(streamUri, resolvedMime)
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
@@ -466,11 +493,7 @@ class MainActivity : ComponentActivity() {
                 mimeType = entity.mimeType,
                 sizeBytes = entity.offlineCachedBytes
             )
-            val resolvedMime = if (entity.mimeType.startsWith("application/vnd.google-apps.")) {
-                "application/pdf"
-            } else {
-                entity.mimeType
-            }
+            val resolvedMime = DriveStreamingContentProvider.resolveExportedMimeType(entity.mimeType)
             val viewIntent = Intent(Intent.ACTION_VIEW).apply {
                 setDataAndType(streamUri, resolvedMime)
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)

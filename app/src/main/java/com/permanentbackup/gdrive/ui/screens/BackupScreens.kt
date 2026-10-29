@@ -42,6 +42,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.permanentbackup.gdrive.data.local.BackupFileEntity
+import com.permanentbackup.gdrive.data.local.BackupVersionEntity
 import com.permanentbackup.gdrive.data.local.CloudFileEntity
 import com.permanentbackup.gdrive.data.local.FailedOperationEntity
 import com.permanentbackup.gdrive.data.local.GoogleAccountEntity
@@ -905,10 +906,13 @@ fun PhoneStorageExplorerScreen(
                                     }
                                 } else if (item.isDirectory && !item.isRestrictedByOs) {
                                     OutlinedButton(
-                                        onClick = { onToggleSubfolderAutoBackup(item, true) },
+                                        onClick = { onToggleSubfolderAutoBackup(item, !item.backupEnabled) },
                                         contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
                                     ) {
-                                        Text("Auto-Backup", fontSize = 11.sp)
+                                        Text(
+                                            if (item.backupEnabled) "Auto-Backup: ON" else "Auto-Backup: OFF",
+                                            fontSize = 11.sp
+                                        )
                                     }
                                 }
                             }
@@ -968,9 +972,11 @@ fun BackupVersionHistoryScreen(
     verifiedHistory: List<BackupFileEntity>,
     actionFeedback: String?,
     selectedFileVersions: List<BackupFileEntity> = emptyList(),
+    accountBackupVersions: List<BackupVersionEntity> = emptyList(),
     onInspectAllVersions: (String) -> Unit = {},
     onDismissVersionsDialog: () -> Unit = {},
-    onRestoreVersion: (BackupFileEntity) -> Unit
+    onRestoreVersion: (BackupFileEntity) -> Unit,
+    onRestoreAccountVersion: (BackupVersionEntity) -> Unit = {}
 ) {
     if (selectedFileVersions.isNotEmpty()) {
         val sample = selectedFileVersions.first()
@@ -1052,6 +1058,37 @@ fun BackupVersionHistoryScreen(
                             }
                             OutlinedButton(onClick = { onInspectAllVersions(item.sourceFileIdentity) }) {
                                 Text("All Versions")
+                            }
+                        }
+                    }
+                }
+            }
+            if (accountBackupVersions.isNotEmpty()) {
+                item {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "Account Version Ledger (${accountBackupVersions.size})",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+                items(accountBackupVersions, key = { "acct_ver_${it.versionId}" }) { ver ->
+                    Card(modifier = Modifier.fillMaxWidth()) {
+                        Column(modifier = Modifier.padding(10.dp)) {
+                            Text(
+                                text = "${ver.versionedFileName} (v${ver.versionNumber})",
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = "Path: ${ver.relativePath} • Account: ${ver.accountId} • Size: ${formatBytes(ver.sizeBytes)}",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                            Text(
+                                text = "SHA-256: ${ver.sha256Hash.take(20)}... • MD5: ${ver.md5Checksum ?: "Verified"}",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                            OutlinedButton(onClick = { onRestoreAccountVersion(ver) }) {
+                                Text("Restore Ledger v${ver.versionNumber}", fontSize = 11.sp)
                             }
                         }
                     }

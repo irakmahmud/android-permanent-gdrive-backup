@@ -98,15 +98,34 @@ class PermanentDriveDocumentsProvider : DocumentsProvider() {
                 includeDirectoryRow(result, DOC_ID_VERIFIED_BACKUPS, "Verified Cloud Backups (Read-Only)", System.currentTimeMillis())
             }
             else -> {
-                if (app != null) {
+                if (docId.startsWith("local_pinned:")) {
+                    val safeFileName = File(docId.removePrefix("local_pinned:")).name
+                    val found = findPinnedLocalFileByName(safeFileName)
+                    if (found != null) {
+                        includeFileRow(
+                            cursor = result,
+                            documentId = "local_pinned:${found.name}",
+                            displayName = found.name.substringAfter("_", found.name),
+                            mimeType = resolveMimeFromExtension(found.name),
+                            sizeBytes = found.length(),
+                            lastModifiedMs = found.lastModified()
+                        )
+                    }
+                } else if (app != null) {
                     runBlocking {
-                        val cloudId = docId.removePrefix("cloud:")
+                        val isFolderDoc = docId.startsWith("folder:")
+                        val cloudId = docId.removePrefix("folder:").removePrefix("cloud:")
                         val cached = app.database.backupDao().getCloudFileById(cloudId)
                         if (cached != null) {
-                            val mime = if (cached.isFolder) Document.MIME_TYPE_DIR else cached.mimeType
+                            val mime = if (cached.isFolder || isFolderDoc) Document.MIME_TYPE_DIR else cached.mimeType
+                            val resolvedDocId = if (cached.isFolder || isFolderDoc) {
+                                "folder:${cached.driveFileId}"
+                            } else {
+                                "cloud:${cached.driveFileId}"
+                            }
                             includeFileRow(
                                 cursor = result,
-                                documentId = "cloud:${cached.driveFileId}",
+                                documentId = resolvedDocId,
                                 displayName = cached.name,
                                 mimeType = mime,
                                 sizeBytes = cached.sizeBytes,
@@ -148,18 +167,20 @@ class PermanentDriveDocumentsProvider : DocumentsProvider() {
                 }
             }
             DOC_ID_PINNED_OFFLINE -> {
-                val cacheDir = File(context?.filesDir, "offline_pinned_drive_cache")
-                if (cacheDir.exists() && cacheDir.isDirectory) {
-                    cacheDir.listFiles()?.forEach { file ->
-                        if (file.isFile) {
-                            includeFileRow(
-                                cursor = result,
-                                documentId = "local_pinned:${file.name}",
-                                displayName = file.name.substringAfter("_", file.name),
-                                mimeType = resolveMimeFromExtension(file.name),
-                                sizeBytes = file.length(),
-                                lastModifiedMs = file.lastModified()
-                            )
+                val seenNames = HashSet<String>()
+                for (cacheDir in getCandidateOfflineCacheDirs()) {
+                    if (cacheDir.exists() && cacheDir.isDirectory) {
+                        cacheDir.walkTopDown().filter { it.isFile }.forEach { file ->
+                            if (seenNames.add(file.name)) {
+                                includeFileRow(
+                                    cursor = result,
+                                    documentId = "local_pinned:${file.name}",
+                                    displayName = file.name.substringAfter("_", file.name),
+                                    mimeType = resolveMimeFromExtension(file.name),
+                                    sizeBytes = file.length(),
+                                    lastModifiedMs = file.lastModified()
+                                )
+                            }
                         }
                     }
                 }
@@ -244,18 +265,17 @@ class PermanentDriveDocumentsProvider : DocumentsProvider() {
         val app = context?.applicationContext as? PermanentBackupApp
             ?: throw FileNotFoundException("Application context unavailable")
 
-        // 1. Direct local pinned file request -> return seekable ParcelFileDescriptor
+        // 1. Direct local pinned file request -> sanitize against path traversal & return seekable ParcelFileDescriptor
         if (docId.startsWith("local_pinned:")) {
-            val fileName = docId.removePrefix("local_pinned:")
-            val cacheDir = File(context?.filesDir, "offline_pinned_drive_cache")
-            val target = File(cacheDir, fileName)
-            if (target.exists() && target.isFile) {
+            val safeFileName = File(docId.removePrefix("local_pinned:")).name
+            val target = findPinnedLocalFileByName(safeFileName)
+            if (target != null && target.exists() && target.isFile) {
                 return ParcelFileDescriptor.open(target, ParcelFileDescriptor.MODE_READ_ONLY)
             }
-            throw FileNotFoundException("Pinned local file not found: $fileName")
+            throw FileNotFoundException("Pinned local file not found: $safeFileName")
         }
 
-        val driveFileId = docId.removePrefix("cloud:")
+        val driveFileId = docId.removePrefix("cloud:").removePrefix("folder:")
         val cachedEntity = runBlocking { app.database.backupDao().getCloudFileById(driveFileId) }
 
         // 2. If cloud file is already pinned offline, return seekable file descriptor for full random-access compatibility
@@ -266,13 +286,14 @@ class PermanentDriveDocumentsProvider : DocumentsProvider() {
                 return ParcelFileDescriptor.open(localFile, ParcelFileDescriptor.MODE_READ_ONLY)
             }
         }
-        val cacheDir = File(context?.filesDir, "offline_pinned_drive_cache")
-        if (cacheDir.exists()) {
-            val matchingPinned = cacheDir.listFiles()?.firstOrNull {
-                it.isFile && it.name.startsWith("${driveFileId.take(12)}_")
-            }
-            if (matchingPinned != null) {
-                return ParcelFileDescriptor.open(matchingPinned, ParcelFileDescriptor.MODE_READ_ONLY)
+        for (cacheDir in getCandidateOfflineCacheDirs()) {
+            if (cacheDir.exists()) {
+                val matchingPinned = cacheDir.walkTopDown().firstOrNull {
+                    it.isFile && (it.name.startsWith("${driveFileId}_") || it.name.startsWith("${driveFileId.take(12)}_"))
+                }
+                if (matchingPinned != null) {
+                    return ParcelFileDescriptor.open(matchingPinned, ParcelFileDescriptor.MODE_READ_ONLY)
+                }
             }
         }
 
@@ -339,6 +360,24 @@ class PermanentDriveDocumentsProvider : DocumentsProvider() {
         }
     }
 
+    private fun getCandidateOfflineCacheDirs(): List<File> {
+        return listOfNotNull(
+            context?.cacheDir?.resolve("offline_pinned_drive_cache"),
+            context?.filesDir?.resolve("offline_pinned_drive_cache")
+        )
+    }
+
+    private fun findPinnedLocalFileByName(safeFileName: String): File? {
+        if (safeFileName.isBlank()) return null
+        for (cacheDir in getCandidateOfflineCacheDirs()) {
+            if (cacheDir.exists() && cacheDir.isDirectory) {
+                val found = cacheDir.walkTopDown().firstOrNull { it.isFile && it.name == safeFileName }
+                if (found != null) return found
+            }
+        }
+        return null
+    }
+
     private fun includeFileRow(
         cursor: MatrixCursor,
         documentId: String,
@@ -347,18 +386,42 @@ class PermanentDriveDocumentsProvider : DocumentsProvider() {
         sizeBytes: Long,
         lastModifiedMs: Long
     ) {
-        val resolvedMime = if (mimeType.startsWith("application/vnd.google-apps.") && mimeType != "application/vnd.google-apps.folder") {
-            "application/pdf"
+        val isWorkspaceDoc = mimeType.startsWith("application/vnd.google-apps.") &&
+            mimeType != "application/vnd.google-apps.folder" &&
+            mimeType != Document.MIME_TYPE_DIR
+        val (resolvedMime, exportedExt) = if (isWorkspaceDoc) {
+            resolveWorkspaceExportMimeAndExtension(mimeType)
         } else {
-            mimeType
+            mimeType to ""
+        }
+        val resolvedDisplayName = if (exportedExt.isNotEmpty() && !displayName.endsWith(exportedExt, ignoreCase = true)) {
+            "$displayName$exportedExt"
+        } else {
+            displayName
         }
         cursor.newRow().apply {
             add(Document.COLUMN_DOCUMENT_ID, documentId)
             add(Document.COLUMN_MIME_TYPE, resolvedMime)
-            add(Document.COLUMN_DISPLAY_NAME, displayName)
+            add(Document.COLUMN_DISPLAY_NAME, resolvedDisplayName)
             add(Document.COLUMN_LAST_MODIFIED, lastModifiedMs)
             add(Document.COLUMN_FLAGS, 0) // Strictly read-only: no delete/write/move flags
-            add(Document.COLUMN_SIZE, sizeBytes)
+            add(Document.COLUMN_SIZE, if (mimeType == Document.MIME_TYPE_DIR) null else sizeBytes)
+        }
+    }
+
+    private fun resolveWorkspaceExportMimeAndExtension(workspaceMimeType: String): Pair<String, String> {
+        return when (workspaceMimeType) {
+            "application/vnd.google-apps.document" ->
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document" to ".docx"
+            "application/vnd.google-apps.spreadsheet" ->
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" to ".xlsx"
+            "application/vnd.google-apps.presentation" ->
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation" to ".pptx"
+            "application/vnd.google-apps.drawing" ->
+                "application/pdf" to ".pdf"
+            "application/vnd.google-apps.script" ->
+                "application/vnd.google-apps.script+json" to ".json"
+            else -> "application/pdf" to ".pdf"
         }
     }
 

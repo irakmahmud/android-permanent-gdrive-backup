@@ -154,9 +154,24 @@ class LocalStorageFileObserverManager(
     private val onNewOrModifiedFileDetected: (String) -> Unit
 ) {
     private val activeObservers = mutableListOf<FileObserver>()
+    private val watchedPaths = mutableSetOf<String>()
     private val lastTriggerTimeMs = AtomicLong(0L)
 
+    companion object {
+        private val EXCLUDED_DIR_NAMES = setOf("restored_from_drive", "drive_mirror")
+        private const val MAX_WATCH_DEPTH = 3
+
+        fun isExcludedRelativePath(relPath: String): Boolean {
+            val segments = relPath.replace('\\', '/').lowercase().split('/')
+            return segments.any { it.startsWith(".") || it in EXCLUDED_DIR_NAMES }
+        }
+    }
+
+    @Synchronized
+    fun getWatchedDirectoryPaths(): Set<String> = watchedPaths.toSet()
+
     @Suppress("DEPRECATION")
+    @Synchronized
     fun startWatching(customRootDirs: List<File>? = null) {
         stopWatching()
         val roots = customRootDirs ?: try {
@@ -170,27 +185,77 @@ class LocalStorageFileObserverManager(
             if (!root.exists() || !root.isDirectory) continue
             for ((folderName, _) in AndroidStorageScanner.TARGET_STANDARD_FOLDERS) {
                 val dir = File(root, folderName)
-                if (dir.exists() && dir.isDirectory && dir.canRead()) {
-                    val observer = object : FileObserver(dir.absolutePath, eventMask) {
-                        override fun onEvent(event: Int, path: String?) {
-                            if (path.isNullOrBlank() || path.startsWith(".")) return
-                            val now = System.currentTimeMillis()
-                            val prev = lastTriggerTimeMs.get()
-                            if (now - prev >= 3_000L && lastTriggerTimeMs.compareAndSet(prev, now)) {
-                                onNewOrModifiedFileDetected("$folderName/$path")
-                            }
-                        }
-                    }
-                    try {
-                        observer.startWatching()
-                        activeObservers.add(observer)
-                    } catch (_: Throwable) {
-                    }
+                if (dir.exists() && dir.isDirectory) {
+                    watchDirectoryTreeRecursive(
+                        dir = dir,
+                        relativePrefix = folderName.trim('/'),
+                        currentDepth = 0,
+                        eventMask = eventMask
+                    )
                 }
             }
         }
     }
 
+    @Suppress("DEPRECATION")
+    @Synchronized
+    private fun watchDirectoryTreeRecursive(
+        dir: File,
+        relativePrefix: String,
+        currentDepth: Int,
+        eventMask: Int
+    ) {
+        if (currentDepth > MAX_WATCH_DEPTH) return
+        if (!dir.exists() || !dir.isDirectory || !dir.canRead()) return
+        if (isExcludedRelativePath(relativePrefix)) return
+        if (!watchedPaths.add(relativePrefix)) return
+
+        val observer = object : FileObserver(dir.absolutePath, eventMask) {
+            override fun onEvent(event: Int, path: String?) {
+                if (path.isNullOrBlank() || path.startsWith(".")) return
+                val childRelPath = "$relativePrefix/$path"
+                if (isExcludedRelativePath(childRelPath)) return
+
+                val childFile = File(dir, path)
+                if ((event and FileObserver.CREATE) != 0 && childFile.isDirectory) {
+                    watchDirectoryTreeRecursive(
+                        dir = childFile,
+                        relativePrefix = childRelPath,
+                        currentDepth = currentDepth + 1,
+                        eventMask = eventMask
+                    )
+                    return
+                }
+
+                val now = System.currentTimeMillis()
+                val prev = lastTriggerTimeMs.get()
+                if (now - prev >= 3_000L && lastTriggerTimeMs.compareAndSet(prev, now)) {
+                    onNewOrModifiedFileDetected(childRelPath)
+                }
+            }
+        }
+        try {
+            observer.startWatching()
+            activeObservers.add(observer)
+        } catch (_: Throwable) {
+        }
+
+        if (currentDepth < MAX_WATCH_DEPTH) {
+            val subDirs = dir.listFiles { f ->
+                f.isDirectory && !f.name.startsWith(".") && f.name.lowercase() !in EXCLUDED_DIR_NAMES
+            }.orEmpty()
+            for (sub in subDirs) {
+                watchDirectoryTreeRecursive(
+                    dir = sub,
+                    relativePrefix = "$relativePrefix/${sub.name}",
+                    currentDepth = currentDepth + 1,
+                    eventMask = eventMask
+                )
+            }
+        }
+    }
+
+    @Synchronized
     fun stopWatching() {
         for (obs in activeObservers) {
             try {
@@ -199,6 +264,7 @@ class LocalStorageFileObserverManager(
             }
         }
         activeObservers.clear()
+        watchedPaths.clear()
     }
 }
 

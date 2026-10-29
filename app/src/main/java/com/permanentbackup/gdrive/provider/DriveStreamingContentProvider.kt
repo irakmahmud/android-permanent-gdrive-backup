@@ -48,17 +48,44 @@ class DriveStreamingContentProvider : ContentProvider() {
                 .appendQueryParameter("size", sizeBytes.toString())
                 .build()
         }
+
+        fun resolveExportedMimeType(rawMime: String): String {
+            if (!rawMime.startsWith("application/vnd.google-apps.") || rawMime == "application/vnd.google-apps.folder") {
+                return rawMime
+            }
+            return when (rawMime) {
+                "application/vnd.google-apps.document" ->
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                "application/vnd.google-apps.spreadsheet" ->
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                "application/vnd.google-apps.presentation" ->
+                    "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                "application/vnd.google-apps.script" ->
+                    "application/vnd.google-apps.script+json"
+                else -> "application/pdf"
+            }
+        }
+
+        fun resolveExportedDisplayName(displayName: String, rawMime: String): String {
+            if (!rawMime.startsWith("application/vnd.google-apps.") || rawMime == "application/vnd.google-apps.folder") {
+                return displayName
+            }
+            val ext = when (rawMime) {
+                "application/vnd.google-apps.document" -> ".docx"
+                "application/vnd.google-apps.spreadsheet" -> ".xlsx"
+                "application/vnd.google-apps.presentation" -> ".pptx"
+                "application/vnd.google-apps.script" -> ".json"
+                else -> ".pdf"
+            }
+            return if (displayName.endsWith(ext, ignoreCase = true)) displayName else "$displayName$ext"
+        }
     }
 
     override fun onCreate(): Boolean = true
 
     override fun getType(uri: Uri): String {
         val rawMime = uri.getQueryParameter("mime") ?: "application/octet-stream"
-        return if (rawMime.startsWith("application/vnd.google-apps.") && rawMime != "application/vnd.google-apps.folder") {
-            "application/pdf"
-        } else {
-            rawMime
-        }
+        return resolveExportedMimeType(rawMime)
     }
 
     override fun query(
@@ -68,7 +95,9 @@ class DriveStreamingContentProvider : ContentProvider() {
         selectionArgs: Array<out String>?,
         sortOrder: String?
     ): Cursor {
-        val displayName = uri.getQueryParameter("name") ?: uri.lastPathSegment ?: "cloud_stream_file"
+        val rawName = uri.getQueryParameter("name") ?: uri.lastPathSegment ?: "cloud_stream_file"
+        val rawMime = uri.getQueryParameter("mime") ?: "application/octet-stream"
+        val displayName = resolveExportedDisplayName(rawName, rawMime)
         val sizeBytes = uri.getQueryParameter("size")?.toLongOrNull() ?: -1L
         val cols = projection ?: arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE)
         val cursor = MatrixCursor(cols, 1)

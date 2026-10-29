@@ -41,7 +41,9 @@ import com.permanentbackup.gdrive.domain.model.SourceFileModificationForbiddenEx
 import com.permanentbackup.gdrive.domain.model.SyncJobState
 import com.permanentbackup.gdrive.domain.model.UploadStatus
 import com.permanentbackup.gdrive.domain.model.VerificationStatus
+import com.permanentbackup.gdrive.provider.DriveStreamingContentProvider
 import com.permanentbackup.gdrive.worker.BackupWorkScheduler
+import com.permanentbackup.gdrive.worker.LocalStorageFileObserverManager
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.map
@@ -108,6 +110,16 @@ class InMemoryBackupDao : BackupDao {
     }
 
     override suspend fun insertRecord(record: BackupFileEntity): Long {
+        if (record.id == 0L && records.values.any {
+                it.accountId == record.accountId &&
+                    it.sourceFileIdentity == record.sourceFileIdentity &&
+                    it.backupVersion == record.backupVersion
+            }
+        ) {
+            throw IllegalStateException(
+                "UNIQUE constraint failed: backup_file_records (${record.accountId}, ${record.sourceFileIdentity}, v${record.backupVersion})"
+            )
+        }
         val id = if (record.id == 0L) idCounter.getAndIncrement().toLong() else record.id
         val saved = record.copy(id = id)
         records[id] = saved
@@ -2128,6 +2140,239 @@ class PermanentBackupEngineTest {
         // 3. Create Cloud Folder in My Drive
         val createdFolderId = repository.createCloudFolder("New_Cloud_Folder", "root")
         assertEquals("created_folder_777", createdFolderId)
+    }
+
+    // 29. Multi-Account Nested Folder Isolation + Double Offline Scan Deduplication (Feature 9 & Rule 2)
+    @Test
+    fun test29_multiAccountNestedFolderIsolation_andDoubleOfflineScanDeduplication() = runTest {
+        val folderCounter = AtomicInteger(1)
+        val uploadCounter = AtomicInteger(1)
+
+        mockWebServer.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                val path = request.path ?: ""
+                val method = request.method ?: "GET"
+                val authHeader = request.getHeader("Authorization") ?: ""
+                val who = if (authHeader.contains("alice_token")) "alice" else "bob"
+
+                if (path.startsWith("/drive/v3/about")) {
+                    return MockResponse().setResponseCode(200)
+                        .setBody("""{"storageQuota":{"limit":15000000000,"usage":1000}}""")
+                }
+                if (method == "GET" && path.startsWith("/drive/v3/files?")) {
+                    return MockResponse().setResponseCode(200).setBody("""{"files":[]}""")
+                }
+                if (method == "POST" && path.startsWith("/drive/v3/files")) {
+                    val fId = "${who}_folder_${folderCounter.getAndIncrement()}"
+                    return MockResponse().setResponseCode(200).setBody("""{"id":"$fId"}""")
+                }
+                if (method == "POST" && path.startsWith("/upload/drive/v3/files?uploadType=resumable")) {
+                    val uId = "${who}_up_${uploadCounter.getAndIncrement()}"
+                    val sessionUrl = mockWebServer.url("/upload/drive/v3/files?uploadType=resumable&upload_id=$uId").toString()
+                    return MockResponse().setResponseCode(200).addHeader("Location", sessionUrl)
+                }
+                if (method == "PUT" && path.contains("upload_id=")) {
+                    val uId = path.substringAfter("upload_id=")
+                    return MockResponse().setResponseCode(200)
+                        .setBody("""{"id":"file_$uId","name":"img01.jpg","size":24}""")
+                }
+                if (method == "GET" && path.startsWith("/drive/v3/files/file_")) {
+                    val fileId = path.substringAfter("/drive/v3/files/").substringBefore("?")
+                    return MockResponse().setResponseCode(200)
+                        .setBody("""{"id":"$fileId","name":"img01.jpg","size":24,"trashed":false}""")
+                }
+                return MockResponse().setResponseCode(404)
+            }
+        }
+
+        val nestedDir = File(tempStorageDir, "DCIM/Camera/Vacation").apply { mkdirs() }
+        File(nestedDir, "img01.jpg").writeText("NESTED_VACATION_IMAGE_24")
+
+        val scanner = AndroidStorageScanner(null, listOf(tempStorageDir), true)
+        val engine = PermanentBackupEngine(dao, scanner, driveApiClient, authManager)
+
+        // 1. Alice backs up DCIM/Camera/Vacation/img01.jpg
+        authManager.onAccountAuthorized(
+            email = "alice@example.com",
+            displayName = "Alice",
+            accessToken = "alice_token",
+            refreshToken = "alice_refresh",
+            expiresInSeconds = 3600L
+        )
+        val aliceSummary = engine.runBackupCycle(BackupSettings(userBackupConsentGranted = true))
+        assertEquals(1, aliceSummary.uploadedAndVerifiedFiles)
+        val aliceRec = dao.getLatestVersionForAccountAndIdentity("alice@example.com", "vol0:DCIM/Camera/Vacation/img01.jpg")!!
+        assertNotNull(aliceRec.driveFolderId)
+        assertTrue("Alice folder ID must belong to Alice", aliceRec.driveFolderId!!.startsWith("alice_folder_"))
+
+        // 2. Switch to Bob -> Bob backs up the exact same nested path DCIM/Camera/Vacation/img01.jpg
+        authManager.switchGoogleAccount(
+            newEmail = "bob@example.com",
+            newDisplayName = "Bob",
+            newAccessToken = "bob_token",
+            newRefreshToken = "bob_refresh"
+        )
+        val bobSummary = engine.runBackupCycle(BackupSettings(userBackupConsentGranted = true))
+        assertEquals(1, bobSummary.uploadedAndVerifiedFiles)
+        val bobRec = dao.getLatestVersionForAccountAndIdentity("bob@example.com", "vol0:DCIM/Camera/Vacation/img01.jpg")!!
+        assertNotNull(bobRec.driveFolderId)
+        assertTrue(
+            "Bob must NOT reuse Alice's nested folder ID (${aliceRec.driveFolderId}); got ${bobRec.driveFolderId}",
+            bobRec.driveFolderId!!.startsWith("bob_folder_")
+        )
+        assertTrue(aliceRec.driveFolderId != bobRec.driveFolderId)
+
+        // 3. Double offline scan on Bob before upload completes -> must NOT throw duplicate v1 constraint violation
+        val offlineFile = DiscoveredSourceFile(
+            sourceUri = File(nestedDir, "offline_new.jpg").apply { writeText("OFFLINE_NEW_IMAGE_BYTES!") }.absolutePath,
+            sourceFileIdentity = "vol0:DCIM/Camera/Vacation/offline_new.jpg",
+            relativePath = "DCIM/Camera/Vacation/offline_new.jpg",
+            displayName = "offline_new.jpg",
+            folderCategory = "DCIM",
+            fileSize = 24L,
+            lastModifiedMs = 1700009999000L,
+            mimeType = "image/jpeg",
+            sha256Hash = "sha256_offline_new",
+            md5Hash = "md5_offline_new"
+        )
+        val queuedFirst = engine.evaluateAndQueueDiscoveredFile(offlineFile)
+        val queuedSecond = engine.evaluateAndQueueDiscoveredFile(offlineFile)
+        assertTrue(queuedFirst)
+        assertFalse("Second scan of unchanged pending v1 on same account must be skipped", queuedSecond)
+    }
+
+    // 30. Workspace Office Export MIME Mapping + Custom Subfolder Auto-Backup Persistence + Account Version Ledger (Features 1, 3, 8, 9)
+    @Test
+    fun test30_workspaceMimeTypeResolution_andSubfolderAutoBackupPersistenceAndVersionLedger() = runTest {
+        installStandardDriveMockDispatcher()
+
+        // 1. Verify DriveStreamingContentProvider MIME & filename export mapping matches DriveApiClient
+        assertEquals(
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            DriveStreamingContentProvider.resolveExportedMimeType("application/vnd.google-apps.document")
+        )
+        assertEquals(
+            "Spec.docx",
+            DriveStreamingContentProvider.resolveExportedDisplayName("Spec", "application/vnd.google-apps.document")
+        )
+        assertEquals(
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            DriveStreamingContentProvider.resolveExportedMimeType("application/vnd.google-apps.spreadsheet")
+        )
+        assertEquals(
+            "Budget.xlsx",
+            DriveStreamingContentProvider.resolveExportedDisplayName("Budget", "application/vnd.google-apps.spreadsheet")
+        )
+        assertEquals(
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            DriveStreamingContentProvider.resolveExportedMimeType("application/vnd.google-apps.presentation")
+        )
+        assertEquals(
+            "Deck.pptx",
+            DriveStreamingContentProvider.resolveExportedDisplayName("Deck", "application/vnd.google-apps.presentation")
+        )
+        assertEquals(
+            "application/pdf",
+            DriveStreamingContentProvider.resolveExportedMimeType("application/vnd.google-apps.drawing")
+        )
+
+        // 2. Verify Subfolder Auto-Backup toggle persistence in browseLocalPhoneStorage() & getFolderCoverageItems()
+        val subDir = File(tempStorageDir, "DCIM/Trip2026").apply { mkdirs() }
+        File(subDir, "beach.jpg").writeText("BEACH_PHOTO_2026")
+
+        val scanner = AndroidStorageScanner(null, listOf(tempStorageDir), true)
+        val repository = BackupRepository(
+            context = null,
+            backupDao = dao,
+            storageSource = scanner,
+            driveApiClient = driveApiClient,
+            authManager = authManager,
+            customSettingsPrefs = TestInMemorySharedPreferences()
+        )
+
+        val initialItems = repository.browseLocalPhoneStorage("DCIM")
+        val tripItemBefore = initialItems.single { it.name == "Trip2026" }
+        assertTrue(tripItemBefore.backupEnabled)
+
+        // Disable auto-backup for DCIM/Trip2026
+        repository.toggleCustomLocalFolderAutoBackup(tripItemBefore, enabled = false)
+        val afterDisableItems = repository.browseLocalPhoneStorage("DCIM")
+        val tripItemAfterDisable = afterDisableItems.single { it.name == "Trip2026" }
+        assertFalse("Subfolder toggle state must persist as false in browseLocalPhoneStorage", tripItemAfterDisable.backupEnabled)
+
+        // Re-enable auto-backup for DCIM/Trip2026 and verify coverage items include it
+        repository.toggleCustomLocalFolderAutoBackup(tripItemAfterDisable, enabled = true)
+        val afterEnableItems = repository.browseLocalPhoneStorage("DCIM")
+        assertTrue(afterEnableItems.single { it.name == "Trip2026" }.backupEnabled)
+        val coverage = repository.getFolderCoverageItems()
+        assertTrue(coverage.any { it.relativePath == "DCIM/Trip2026" && it.backupEnabled })
+
+        // 3. Verify getAccountBackupVersionsPaged() returns uploaded BackupVersionEntity ledger
+        repository.saveSettingsToDatabase(BackupSettings(userBackupConsentGranted = true))
+        val summary = repository.runBackupNow()
+        assertEquals(1, summary.uploadedAndVerifiedFiles)
+        val ledgerVersions = repository.getAccountBackupVersionsPaged(limit = 50)
+        assertEquals(1, ledgerVersions.size)
+        assertEquals("beach.jpg", ledgerVersions.single().versionedFileName)
+        assertEquals(1, ledgerVersions.single().versionNumber)
+    }
+
+    // 31. Direct/Share Sheet Upload Without Full Storage Permission + Recursive FileObserver Exclusion (Features 2, 4, 5 & Rule 3)
+    @Test
+    fun test31_directUriUploadWithoutFullStoragePermission_andRecursiveFileObserverExclusion() = runTest {
+        installStandardDriveMockDispatcher()
+
+        // Create a shared file outside standard folders (simulating ACTION_SEND / direct document picker)
+        val sharedTempFile = File(tempStorageDir, "shared_invoice.pdf").apply {
+            writeText("SHARED_INVOICE_PDF_BYTES_2026")
+        }
+
+        // Scanner has permissionOverride = false (user has NOT granted MANAGE_EXTERNAL_STORAGE)
+        val scannerNoPerm = AndroidStorageScanner(null, listOf(tempStorageDir), permissionOverride = false)
+        val repository = BackupRepository(
+            context = null,
+            backupDao = dao,
+            storageSource = scannerNoPerm,
+            driveApiClient = driveApiClient,
+            authManager = authManager,
+            customSettingsPrefs = TestInMemorySharedPreferences()
+        )
+        repository.saveSettingsToDatabase(BackupSettings(userBackupConsentGranted = true))
+
+        val queued = repository.uploadDirectUriToDrive(
+            uriString = sharedTempFile.absolutePath,
+            displayName = "shared_invoice.pdf",
+            mimeType = "application/pdf",
+            sizeBytes = sharedTempFile.length(),
+            targetSubfolder = "Shared_To_Drive"
+        )
+        assertTrue(queued)
+
+        // Run backup cycle even though scannerNoPerm.hasRequiredPermissions() == false
+        val summary = repository.runBackupNow()
+        assertFalse("Shared URI upload must succeed even without full storage permission", summary.permissionDenied)
+        assertEquals(1, summary.uploadedAndVerifiedFiles)
+
+        val verifiedShared = dao.getAllRecordsSnapshot().single()
+        assertEquals(UploadStatus.VERIFIED, verifiedShared.uploadStatus)
+        assertTrue("Shared URI record must not be marked deleted by directory tree reconciliation", verifiedShared.localExists)
+
+        // Verify LocalStorageFileObserverManager watches nested subdirectories while excluding Restored_From_Drive & Drive_Mirror
+        File(tempStorageDir, "DCIM/Camera/2026").mkdirs()
+        File(tempStorageDir, "Download/Restored_From_Drive/Sub").mkdirs()
+        File(tempStorageDir, "Download/Drive_Mirror/Sub").mkdirs()
+
+        val observerManager = LocalStorageFileObserverManager {}
+        observerManager.startWatching(listOf(tempStorageDir))
+        val watched = observerManager.getWatchedDirectoryPaths()
+        observerManager.stopWatching()
+
+        assertTrue(watched.contains("DCIM"))
+        assertTrue(watched.contains("DCIM/Camera"))
+        assertTrue(watched.contains("DCIM/Camera/2026"))
+        assertTrue(watched.contains("Download"))
+        assertFalse("Restored_From_Drive must never be watched by local backup FileObserver", watched.any { it.contains("Restored_From_Drive", ignoreCase = true) })
+        assertFalse("Drive_Mirror must never be watched by local backup FileObserver", watched.any { it.contains("Drive_Mirror", ignoreCase = true) })
     }
 }
 

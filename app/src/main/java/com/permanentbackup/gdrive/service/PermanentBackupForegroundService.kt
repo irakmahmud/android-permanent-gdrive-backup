@@ -100,11 +100,15 @@ class PermanentBackupForegroundService : Service() {
                     app.repository.runBackupNow()
                 } finally {
                     progressObserverJob?.cancel()
-                    stopSelf(startId)
+                    if (app.repository.backupEngine.isPaused.value) {
+                        updateNotification(null, isPaused = true)
+                    } else {
+                        stopSelf()
+                    }
                 }
             }
         } else {
-            stopSelf(startId)
+            stopSelf()
         }
 
         return START_REDELIVER_INTENT

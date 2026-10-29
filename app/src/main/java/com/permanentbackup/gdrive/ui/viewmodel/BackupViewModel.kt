@@ -10,6 +10,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.permanentbackup.gdrive.PermanentBackupApp
 import com.permanentbackup.gdrive.data.local.BackupFileEntity
+import com.permanentbackup.gdrive.data.local.BackupVersionEntity
 import com.permanentbackup.gdrive.data.local.CloudFileEntity
 import com.permanentbackup.gdrive.data.local.FailedOperationEntity
 import com.permanentbackup.gdrive.data.local.GoogleAccountEntity
@@ -83,6 +84,9 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
     private val _selectedFileVersions = MutableStateFlow<List<BackupFileEntity>>(emptyList())
     val selectedFileVersions: StateFlow<List<BackupFileEntity>> = _selectedFileVersions.asStateFlow()
 
+    private val _accountBackupVersions = MutableStateFlow<List<BackupVersionEntity>>(emptyList())
+    val accountBackupVersions: StateFlow<List<BackupVersionEntity>> = _accountBackupVersions.asStateFlow()
+
     private val _oauthDiagnostics = MutableStateFlow(repository.getOAuthDiagnostics())
     val oauthDiagnostics: StateFlow<OAuthDiagnosticReport> = _oauthDiagnostics.asStateFlow()
 
@@ -155,6 +159,7 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
             }
             _dashboardSummary.value = repository.buildDashboardSummary().copy(dbIntegrityOk = dbOk)
             _folderCoverage.value = repository.getFolderCoverageItems()
+            _accountBackupVersions.value = repository.getAccountBackupVersionsPaged(limit = 200)
             _oauthDiagnostics.value = repository.getOAuthDiagnostics()
             refreshCloudDriveExplorer()
         }
@@ -207,6 +212,9 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
     fun uploadDirectUrisToDrive(uris: List<Uri>, targetSubfolder: String = "Direct_Uploads") {
         if (uris.isEmpty()) return
         viewModelScope.launch(Dispatchers.IO) {
+            if (!settings.value.userBackupConsentGranted) {
+                repository.saveSettingsToDatabase(settings.value.copy(userBackupConsentGranted = true))
+            }
             val resolver = getApplication<Application>().contentResolver
             var queuedCount = 0
             for (uri in uris) {
@@ -266,6 +274,7 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
             } else {
                 "Excluded subfolder '${item.relativePath}' from new backups (cloud files untouched)."
             }
+            refreshLocalPhoneBrowser(_currentLocalPath.value)
             refreshDashboardAndCoverage()
         }
     }
@@ -332,6 +341,9 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
 
     fun backupSingleLocalFile(item: LocalBrowseItem) {
         viewModelScope.launch(Dispatchers.IO) {
+            if (!settings.value.userBackupConsentGranted) {
+                repository.saveSettingsToDatabase(settings.value.copy(userBackupConsentGranted = true))
+            }
             val queued = repository.queueSingleLocalFile(item)
             if (queued) {
                 _actionFeedbackMessage.value = "Queued '${item.name}' for permanent Google Drive backup."
@@ -383,6 +395,15 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch(Dispatchers.IO) {
             _actionFeedbackMessage.value = "Restoring '${record.driveStoredName}' (v${record.backupVersion})..."
             val outcome = repository.restoreBackupRecord(record)
+            _actionFeedbackMessage.value = outcome.message
+            refreshDashboardAndCoverage()
+        }
+    }
+
+    fun restoreAccountBackupVersionEntity(ver: BackupVersionEntity) {
+        viewModelScope.launch(Dispatchers.IO) {
+            _actionFeedbackMessage.value = "Restoring '${ver.versionedFileName}' (v${ver.versionNumber})..."
+            val outcome = repository.restoreBackupVersionEntity(ver)
             _actionFeedbackMessage.value = outcome.message
             refreshDashboardAndCoverage()
         }

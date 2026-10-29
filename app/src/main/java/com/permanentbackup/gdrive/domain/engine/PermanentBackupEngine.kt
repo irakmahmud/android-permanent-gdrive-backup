@@ -334,9 +334,14 @@ class PermanentBackupEngine(
         }
 
         if (!storageSource.hasStoragePermission) {
-            val msg = "Storage access permission was revoked or denied. Please grant storage access."
-            _lastPermissionError.value = msg
-            return BackupCycleSummary(0, 0, 0, 0, 0, 0, permissionDenied = true, errorMessage = msg)
+            val hasPendingDirectShares = backupDao
+                .getPendingRecordsForAccountPaged(currentAccountId(), limit = 20, offset = 0)
+                .any { it.sourceFileIdentity.startsWith("shared:") }
+            if (!hasPendingDirectShares) {
+                val msg = "Storage access permission was revoked or denied. Please grant storage access."
+                _lastPermissionError.value = msg
+                return BackupCycleSummary(0, 0, 0, 0, 0, 0, permissionDenied = true, errorMessage = msg)
+            }
         }
 
         if (settings.backgroundSyncPaused || _isPaused.value) {
@@ -397,7 +402,11 @@ class PermanentBackupEngine(
             }
 
             // Step 3: Reconcile locally deleted files — NEVER delete from Google Drive!
-            val preservedDeletedCount = reconcileLocallyDeletedFiles(discoveredIdentities)
+            val preservedDeletedCount = if (storageSource.hasStoragePermission) {
+                reconcileLocallyDeletedFiles(discoveredIdentities)
+            } else {
+                backupDao.countPreservedAfterLocalDelete()
+            }
 
             // Step 4: Execute pending uploads & incremental cloud changes sync if Google Account is connected
             if (!authManager.accountState.value.isConnected) {
@@ -532,18 +541,19 @@ class PermanentBackupEngine(
 
         val isSameContent = isUnchangedFile(latestForAccount, discovered)
         val existingVersions = backupDao.getBackupVersionsForIdentity(discovered.sourceFileIdentity)
-        val accountHasVerifiedBackup = existingVersions.isEmpty() ||
+        val accountHasRecord = (latestForAccount.accountId == accountId && accountId != "default_account") ||
+            existingVersions.isEmpty() ||
             existingVersions.any { it.accountId == accountId }
 
-        if (isSameContent && accountHasVerifiedBackup) {
+        if (isSameContent && accountHasRecord) {
             if (!latestForAccount.localExists || latestForAccount.accountId != accountId) {
                 backupDao.updateRecord(latestForAccount.copy(localExists = true, accountId = accountId))
             }
             return latestForAccount.uploadStatus != UploadStatus.VERIFIED
         }
 
-        val nextVersion = if (isSameContent && !accountHasVerifiedBackup) 1 else latestForAccount.backupVersion + 1
-        val isFirstBackupForThisAccount = isSameContent && !accountHasVerifiedBackup
+        val nextVersion = if (isSameContent && !accountHasRecord) 1 else latestForAccount.backupVersion + 1
+        val isFirstBackupForThisAccount = isSameContent && !accountHasRecord
         val versionedDriveName = if (isFirstBackupForThisAccount) {
             discovered.displayName
         } else {
@@ -645,7 +655,7 @@ class PermanentBackupEngine(
             val page = backupDao.getActiveIdentitiesPaged(PAGINATION_BATCH_SIZE, offset)
             if (page.isEmpty()) break
             for (identity in page) {
-                if (identity !in presentIdentities) {
+                if (!identity.startsWith("shared:") && identity !in presentIdentities) {
                     missingIdentities.add(identity)
                 }
             }
@@ -1492,12 +1502,6 @@ class PermanentBackupEngine(
             val accountPrefix = currentAccountId()
             val scopedParentKey = "$accountPrefix:$parentPath"
             backupDao.getCachedDriveFolder(scopedParentKey)?.let { return@withLock it.driveFolderId }
-            // Fallback check for legacy unscoped key when on default account
-            backupDao.getCachedDriveFolder(parentPath)?.let {
-                if (it.parentDriveFolderId == rootFolderId || parentPath.contains('/')) {
-                    return@withLock it.driveFolderId
-                }
-            }
 
             val segments = parentPath.split('/').filter { it.isNotBlank() }
             var currentParentId = rootFolderId

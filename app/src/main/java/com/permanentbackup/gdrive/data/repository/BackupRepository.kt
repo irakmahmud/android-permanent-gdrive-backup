@@ -6,6 +6,7 @@ import com.permanentbackup.gdrive.data.local.AppSettingsEntity
 import com.permanentbackup.gdrive.data.local.BackupDao
 import com.permanentbackup.gdrive.data.local.BackupFileEntity
 import com.permanentbackup.gdrive.data.local.BackupFolderEntity
+import com.permanentbackup.gdrive.data.local.BackupVersionEntity
 import com.permanentbackup.gdrive.data.local.CloudFileEntity
 import com.permanentbackup.gdrive.data.local.FailedOperationEntity
 import com.permanentbackup.gdrive.data.local.GoogleAccountEntity
@@ -458,8 +459,11 @@ class BackupRepository(
         targetSubfolder: String = "Shared_To_Drive"
     ): Boolean {
         if (uriString.isBlank()) return false
-        val safeDisplay = displayName.ifBlank { "shared_file_${System.currentTimeMillis()}" }
-        val relPath = "$targetSubfolder/$safeDisplay"
+        val safeDisplay = cloudFileOps.sanitizeSafeLocalFileName(
+            displayName.ifBlank { "shared_file_${System.currentTimeMillis()}" }
+        )
+        val cleanFolder = targetSubfolder.replace('\\', '/').trim('/').ifBlank { "Shared_To_Drive" }
+        val relPath = "$cleanFolder/$safeDisplay"
         val identity = "shared:$relPath"
         val now = System.currentTimeMillis()
 
@@ -479,7 +483,7 @@ class BackupRepository(
             sourceFileIdentity = identity,
             relativePath = relPath,
             displayName = safeDisplay,
-            folderCategory = targetSubfolder,
+            folderCategory = cleanFolder,
             fileSize = resolvedSize,
             lastModifiedMs = now,
             mimeType = mimeType.ifBlank { "application/octet-stream" },
@@ -490,10 +494,22 @@ class BackupRepository(
     }
 
     /**
-     * Section 5B: Browses local phone storage directories.
+     * Section 5B: Browses local phone storage directories while overlaying saved per-folder auto-backup toggles.
      */
-    fun browseLocalPhoneStorage(relativeSubPath: String = ""): List<LocalBrowseItem> {
-        return storageSource.browseLocalDirectory(relativeSubPath)
+    suspend fun browseLocalPhoneStorage(relativeSubPath: String = ""): List<LocalBrowseItem> {
+        val rawItems = storageSource.browseLocalDirectory(relativeSubPath)
+        val accountId = currentAccountId()
+        val savedByPath = backupDao.getBackupFoldersForAccount(accountId)
+            .associateBy { it.relativePath.replace('\\', '/').trim('/') }
+        return rawItems.map { item ->
+            val normRel = item.relativePath.replace('\\', '/').trim('/')
+            val saved = savedByPath[normRel]
+            if (item.isDirectory && !item.isRestrictedByOs && saved != null) {
+                item.copy(backupEnabled = saved.backupEnabled)
+            } else {
+                item
+            }
+        }
     }
 
     /**
@@ -518,6 +534,20 @@ class BackupRepository(
             versionNumber = record.backupVersion,
             targetSubfolder = parentFolder,
             mimeType = record.mimeType
+        )
+    }
+
+    suspend fun restoreBackupVersionEntity(version: BackupVersionEntity): RestoreOutcome {
+        if (version.driveFileId.isBlank()) {
+            return RestoreOutcome(false, null, 0L, "Version does not have a verified Google Drive File ID.")
+        }
+        val parentFolder = version.relativePath.substringBeforeLast('/', "")
+        val originalName = version.relativePath.substringAfterLast('/').ifBlank { version.driveStoredName }
+        return cloudFileOps.restoreCloudFileToLocal(
+            driveFileId = version.driveFileId,
+            originalFileName = originalName,
+            versionNumber = version.versionNumber,
+            targetSubfolder = parentFolder
         )
     }
 
@@ -554,6 +584,10 @@ class BackupRepository(
 
     suspend fun getAllVersionsForFile(sourceFileIdentity: String): List<BackupFileEntity> {
         return backupDao.getAllVersionsForIdentity(sourceFileIdentity)
+    }
+
+    suspend fun getAccountBackupVersionsPaged(limit: Int = 200, offset: Int = 0): List<BackupVersionEntity> {
+        return backupDao.getBackupVersionsForAccountPaged(currentAccountId(), limit, offset)
     }
 
     fun getOAuthDiagnostics(): OAuthDiagnosticReport {
@@ -673,7 +707,7 @@ class BackupRepository(
         val savedByPath = savedFolders.associateBy { it.relativePath }
         val savedByName = savedFolders.associateBy { it.folderName }
 
-        return storageSource.getFolderCoverageReport(backedUpMap).map { item ->
+        val standardMerged = storageSource.getFolderCoverageReport(backedUpMap).map { item ->
             val saved = savedByPath[item.relativePath] ?: savedByName[item.folderName]
             if (saved != null && item.accessStatus != FolderAccessStatus.RESTRICTED_BY_ANDROID_OS) {
                 item.copy(backupEnabled = saved.backupEnabled)
@@ -681,6 +715,24 @@ class BackupRepository(
                 item
             }
         }
+        val existingPaths = standardMerged.map { it.relativePath.lowercase() }.toSet()
+        val existingNames = standardMerged.map { it.folderName.lowercase() }.toSet()
+        val customExtras = savedFolders.filter { sf ->
+            sf.relativePath.lowercase() !in existingPaths && sf.folderName.lowercase() !in existingNames
+        }.map { sf ->
+            FolderCoverageItem(
+                folderName = "Custom: ${sf.folderName}",
+                relativePath = sf.relativePath,
+                accessStatus = runCatching { FolderAccessStatus.valueOf(sf.accessStatus) }
+                    .getOrDefault(FolderAccessStatus.ACCESSIBLE),
+                discoveredFileCount = sf.discoveredFileCount,
+                backedUpFileCount = sf.backedUpFileCount,
+                restrictionExplanation = "Custom subfolder rule -> Android_Permanent_Backup/${sf.relativePath}",
+                backupEnabled = sf.backupEnabled,
+                lastScanTimeMs = sf.lastScanTimeMs
+            )
+        }
+        return standardMerged + customExtras
     }
 
     suspend fun requeueFailedRecord(recordId: Long) {
