@@ -1969,19 +1969,19 @@ class PermanentBackupEngineTest {
             offlineLocalPath = null
         )
 
-        // 1. Recursive Folder Restore (including Google Doc exported to .pdf)
+        // 1. Recursive Folder Restore (including Google Doc exported to .docx)
         val restoredOutcome = opsManager.restoreCloudFolderRecursively(folderItem)
         assertTrue(restoredOutcome.success)
         val restoredDir = File(restoreRoot, "Engineering_Docs")
-        assertTrue(File(restoredDir, "Architecture Spec.pdf").exists())
-        assertEquals("EXPORTED_GOOGLE_DOC_PDF_CONTENT_2026", File(restoredDir, "Architecture Spec.pdf").readText())
+        assertTrue(File(restoredDir, "Architecture Spec.docx").exists())
+        assertEquals("EXPORTED_GOOGLE_DOC_PDF_CONTENT_2026", File(restoredDir, "Architecture Spec.docx").readText())
         assertTrue(File(restoredDir, "diagram.png").exists())
 
         // 2. One-Way Cloud-to-Local Folder Mirror into Download/Restored_From_Drive/Drive_Mirror/Engineering_Docs
         val mirroredOutcome = opsManager.mirrorCloudFolderToLocal(folderItem)
         assertTrue(mirroredOutcome.success)
         val mirrorDir = File(restoreRoot, "Drive_Mirror/Engineering_Docs")
-        assertTrue(File(mirrorDir, "Architecture Spec.pdf").exists())
+        assertTrue(File(mirrorDir, "Architecture Spec.docx").exists())
         assertTrue(File(mirrorDir, "diagram.png").exists())
 
         // 3. Rule 3 (Separation of Backup & Mirroring): Verify scanner strictly excludes Restored_From_Drive & Drive_Mirror
@@ -2052,6 +2052,10 @@ class PermanentBackupEngineTest {
                 val method = request.method ?: "GET"
 
                 if (method == "GET" && path.startsWith("/drive/v3/files?")) {
+                    val q = request.requestUrl?.queryParameter("q") ?: ""
+                    if (q.contains("New_Cloud_Folder")) {
+                        return MockResponse().setResponseCode(200).setBody("""{"files":[]}""")
+                    }
                     val pageToken = request.requestUrl?.queryParameter("pageToken")
                     if (pageToken == null) {
                         return MockResponse().setResponseCode(200).setBody(
