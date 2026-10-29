@@ -402,7 +402,7 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
 
     fun restoreAccountBackupVersionEntity(ver: BackupVersionEntity) {
         viewModelScope.launch(Dispatchers.IO) {
-            _actionFeedbackMessage.value = "Restoring '${ver.versionedFileName}' (v${ver.versionNumber})..."
+            _actionFeedbackMessage.value = "Restoring '${ver.driveStoredName}' (v${ver.versionNumber})..."
             val outcome = repository.restoreBackupVersionEntity(ver)
             _actionFeedbackMessage.value = outcome.message
             refreshDashboardAndCoverage()

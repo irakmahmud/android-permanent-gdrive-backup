@@ -2313,7 +2313,7 @@ class PermanentBackupEngineTest {
         assertEquals(1, summary.uploadedAndVerifiedFiles)
         val ledgerVersions = repository.getAccountBackupVersionsPaged(limit = 50)
         assertEquals(1, ledgerVersions.size)
-        assertEquals("beach.jpg", ledgerVersions.single().versionedFileName)
+        assertEquals("beach.jpg", ledgerVersions.single().driveStoredName)
         assertEquals(1, ledgerVersions.single().versionNumber)
     }
 

@@ -1076,15 +1076,15 @@ fun BackupVersionHistoryScreen(
                     Card(modifier = Modifier.fillMaxWidth()) {
                         Column(modifier = Modifier.padding(10.dp)) {
                             Text(
-                                text = "${ver.versionedFileName} (v${ver.versionNumber})",
+                                text = "${ver.driveStoredName} (v${ver.versionNumber})",
                                 fontWeight = FontWeight.Bold
                             )
                             Text(
-                                text = "Path: ${ver.relativePath} • Account: ${ver.accountId} • Size: ${formatBytes(ver.sizeBytes)}",
+                                text = "Path: ${ver.relativePath} • Account: ${ver.accountId} • Size: ${formatBytes(ver.fileSize)}",
                                 style = MaterialTheme.typography.bodySmall
                             )
                             Text(
-                                text = "SHA-256: ${ver.sha256Hash.take(20)}... • MD5: ${ver.md5Checksum ?: "Verified"}",
+                                text = "SHA-256: ${ver.sha256Hash?.take(20) ?: "Verified"}... • MD5: ${ver.md5Hash ?: "Verified"}",
                                 style = MaterialTheme.typography.bodySmall
                             )
                             OutlinedButton(onClick = { onRestoreAccountVersion(ver) }) {
