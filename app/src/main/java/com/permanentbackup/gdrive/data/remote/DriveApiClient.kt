@@ -490,7 +490,8 @@ class DriveApiClient(
         chunkStartByte: Long,
         chunkLength: Int,
         totalBytes: Long,
-        mimeType: String
+        mimeType: String,
+        maxUploadSpeedKbps: Int = 0
     ): ChunkUploadResult {
         val chunkEndByte = chunkStartByte + chunkLength - 1L
         val contentRange = if (totalBytes == 0L) {
@@ -506,6 +507,10 @@ class DriveApiClient(
             override fun writeTo(sink: BufferedSink) {
                 val buffer = ByteArray(STREAM_BUFFER_SIZE_BYTES)
                 var remaining = chunkLength
+                val startNs = System.nanoTime()
+                var writtenInChunk = 0L
+                val maxBytesPerSec = if (maxUploadSpeedKbps > 0) maxUploadSpeedKbps.toLong() * 1024L else 0L
+
                 while (remaining > 0) {
                     val toRead = minOf(buffer.size, remaining)
                     val read = inputStream.read(buffer, 0, toRead)
@@ -514,6 +519,20 @@ class DriveApiClient(
                     }
                     sink.write(buffer, 0, read)
                     remaining -= read
+                    writtenInChunk += read
+
+                    if (maxBytesPerSec > 0L) {
+                        val expectedMs = (writtenInChunk * 1000L) / maxBytesPerSec
+                        val elapsedMs = (System.nanoTime() - startNs) / 1_000_000L
+                        val sleepMs = (expectedMs - elapsedMs).coerceAtMost(250L)
+                        if (sleepMs > 5L) {
+                            try {
+                                Thread.sleep(sleepMs)
+                            } catch (_: InterruptedException) {
+                                Thread.currentThread().interrupt()
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -619,6 +638,84 @@ class DriveApiClient(
     }
 
     /**
+     * Returns true if [mimeType] is a Google Workspace native document (Docs, Sheets, Slides, Drawings, Scripts)
+     * that must be downloaded via the `/drive/v3/files/{fileId}/export` endpoint rather than `?alt=media`.
+     */
+    fun isGoogleWorkspaceDocument(mimeType: String): Boolean {
+        return mimeType.startsWith("application/vnd.google-apps.") &&
+            mimeType != FOLDER_MIME_TYPE &&
+            mimeType != "application/vnd.google-apps.shortcut" &&
+            mimeType != "application/vnd.google-apps.form" &&
+            mimeType != "application/vnd.google-apps.map"
+    }
+
+    /**
+     * Maps a Google Workspace native MIME type to its standard Office/PDF export MIME type and file extension.
+     */
+    fun resolveWorkspaceExportFormat(workspaceMimeType: String): Pair<String, String> {
+        return when (workspaceMimeType) {
+            "application/vnd.google-apps.document" ->
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document" to ".docx"
+            "application/vnd.google-apps.spreadsheet" ->
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" to ".xlsx"
+            "application/vnd.google-apps.presentation" ->
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation" to ".pptx"
+            "application/vnd.google-apps.drawing" ->
+                "application/pdf" to ".pdf"
+            "application/vnd.google-apps.script" ->
+                "application/vnd.google-apps.script+json" to ".json"
+            else -> "application/pdf" to ".pdf"
+        }
+    }
+
+    /**
+     * Exports a Google Workspace document (Docs, Sheets, Slides, Drawings) via `/drive/v3/files/{fileId}/export`
+     * using a bounded 64 KiB streaming buffer.
+     */
+    fun exportWorkspaceFileStreaming(
+        accessToken: String,
+        driveFileId: String,
+        exportMimeType: String,
+        outputStream: OutputStream,
+        onProgressBytes: (Long) -> Unit = {}
+    ): Long {
+        val url = "$driveBaseUrl/drive/v3/files/$driveFileId/export".toHttpUrl().newBuilder()
+            .addQueryParameter("mimeType", exportMimeType)
+            .build()
+        val request = Request.Builder()
+            .url(url)
+            .header("Authorization", "Bearer $accessToken")
+            .get()
+            .build()
+
+        httpClient.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) {
+                val errBody = response.body?.string() ?: "{}"
+                handleDriveHttpResponse(request, response.code, errBody) {
+                    throw IOException("Workspace export failed with HTTP ${response.code}")
+                }
+            }
+            val bodyStream = response.body?.byteStream()
+                ?: throw IOException("Google Drive export response had empty body stream")
+            val buffer = ByteArray(STREAM_BUFFER_SIZE_BYTES)
+            var totalWritten = 0L
+            bodyStream.use { input ->
+                outputStream.use { out ->
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read == -1) break
+                        out.write(buffer, 0, read)
+                        totalWritten += read
+                        onProgressBytes(totalWritten)
+                    }
+                    out.flush()
+                }
+            }
+            return totalWritten
+        }
+    }
+
+    /**
      * Streams a cloud file download directly to [outputStream] using a 64 KiB bounded buffer (Section 5F & 9).
      */
     fun downloadFileStreaming(
@@ -663,21 +760,30 @@ class DriveApiClient(
 
     /**
      * Opens a live streaming [InputStream] to a Google Drive file without downloading the whole file first
-     * (Section 5D: Cloud Streaming & File Preview). Supports optional byte range requests.
+     * (Section 5D: Cloud Streaming & File Preview). Supports optional byte range requests and Workspace export.
      */
     fun openCloudStream(
         accessToken: String,
         driveFileId: String,
         rangeStartByte: Long? = null,
-        rangeEndByteInclusive: Long? = null
+        rangeEndByteInclusive: Long? = null,
+        workspaceMimeType: String? = null
     ): InputStream {
-        val url = "$driveBaseUrl/drive/v3/files/$driveFileId?alt=media&supportsAllDrives=true"
+        val url = if (!workspaceMimeType.isNullOrBlank() && isGoogleWorkspaceDocument(workspaceMimeType)) {
+            val (exportMime, _) = resolveWorkspaceExportFormat(workspaceMimeType)
+            "$driveBaseUrl/drive/v3/files/$driveFileId/export".toHttpUrl().newBuilder()
+                .addQueryParameter("mimeType", exportMime)
+                .build()
+                .toString()
+        } else {
+            "$driveBaseUrl/drive/v3/files/$driveFileId?alt=media&supportsAllDrives=true"
+        }
         val builder = Request.Builder()
             .url(url)
             .header("Authorization", "Bearer $accessToken")
             .get()
 
-        if (rangeStartByte != null && rangeStartByte >= 0L) {
+        if (rangeStartByte != null && rangeStartByte >= 0L && (workspaceMimeType == null || !isGoogleWorkspaceDocument(workspaceMimeType))) {
             val rangeVal = if (rangeEndByteInclusive != null && rangeEndByteInclusive >= rangeStartByte) {
                 "bytes=$rangeStartByte-$rangeEndByteInclusive"
             } else {

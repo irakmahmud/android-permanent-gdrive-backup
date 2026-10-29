@@ -43,8 +43,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.permanentbackup.gdrive.data.local.BackupFileEntity
 import com.permanentbackup.gdrive.data.local.CloudFileEntity
+import com.permanentbackup.gdrive.data.local.FailedOperationEntity
 import com.permanentbackup.gdrive.data.local.GoogleAccountEntity
 import com.permanentbackup.gdrive.data.local.SyncEventEntity
+import com.permanentbackup.gdrive.data.local.SyncJobEntity
 import com.permanentbackup.gdrive.domain.model.BackupSettings
 import com.permanentbackup.gdrive.domain.model.CloudBrowseItem
 import com.permanentbackup.gdrive.domain.model.DashboardSummary
@@ -344,6 +346,7 @@ fun MyDriveExplorerScreen(
     searchQuery: String,
     isGridView: Boolean,
     previewSnippet: Pair<String, String>?,
+    hasNextPage: Boolean = false,
     onSelectFilter: (DriveViewFilter) -> Unit,
     onSelectSort: (DriveSortOrder) -> Unit,
     onSearchQueryChange: (String) -> Unit,
@@ -354,12 +357,52 @@ fun MyDriveExplorerScreen(
     onDismissPreview: () -> Unit,
     onStreamOpenExternal: (CloudBrowseItem) -> Unit,
     onDownloadRestoreFile: (CloudBrowseItem) -> Unit,
+    onMirrorFolderToPhone: (CloudBrowseItem) -> Unit = {},
     onTogglePinOffline: (CloudBrowseItem) -> Unit,
     onShareFileLink: (CloudBrowseItem) -> Unit,
+    onCreateFolder: (String) -> Unit = {},
+    onUploadDirectFiles: () -> Unit = {},
+    onLoadMore: () -> Unit = {},
     onRequestFullDriveReadScope: () -> Unit,
     onRefresh: () -> Unit
 ) {
     var selectedMetadataItem by remember { mutableStateOf<CloudBrowseItem?>(null) }
+    var showCreateFolderDialog by remember { mutableStateOf(false) }
+    var newFolderNameText by remember { mutableStateOf("") }
+
+    if (showCreateFolderDialog) {
+        AlertDialog(
+            onDismissRequest = { showCreateFolderDialog = false },
+            title = { Text("Create New Google Drive Folder") },
+            text = {
+                OutlinedTextField(
+                    value = newFolderNameText,
+                    onValueChange = { newFolderNameText = it },
+                    label = { Text("Folder Name") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        if (newFolderNameText.isNotBlank()) {
+                            onCreateFolder(newFolderNameText.trim())
+                            newFolderNameText = ""
+                            showCreateFolderDialog = false
+                        }
+                    }
+                ) {
+                    Text("Create")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showCreateFolderDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
 
     if (previewSnippet != null) {
         AlertDialog(
@@ -463,6 +506,25 @@ fun MyDriveExplorerScreen(
             }
         }
 
+        // Direct Cloud Actions: + New Folder & Upload File
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            OutlinedButton(
+                onClick = { showCreateFolderDialog = true },
+                modifier = Modifier.weight(1f)
+            ) {
+                Text("+ New Folder", fontSize = 12.sp)
+            }
+            Button(
+                onClick = onUploadDirectFiles,
+                modifier = Modifier.weight(1f)
+            ) {
+                Text("Upload File to Drive", fontSize = 12.sp)
+            }
+        }
+
         // Filter Chips (Backup Root, My Drive, Recent, Starred, Shared, Shared Drives)
         LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             items(DriveViewFilter.entries) { filter ->
@@ -529,9 +591,17 @@ fun MyDriveExplorerScreen(
                         onPreview = { onPreviewFile(item) },
                         onStreamExternal = { onStreamOpenExternal(item) },
                         onDownloadRestore = { onDownloadRestoreFile(item) },
+                        onMirrorFolder = { onMirrorFolderToPhone(item) },
                         onTogglePin = { onTogglePinOffline(item) },
                         onShareLink = { onShareFileLink(item) }
                     )
+                }
+                if (hasNextPage) {
+                    item {
+                        OutlinedButton(onClick = onLoadMore, modifier = Modifier.fillMaxWidth()) {
+                            Text("Load More...")
+                        }
+                    }
                 }
             }
         } else {
@@ -547,9 +617,17 @@ fun MyDriveExplorerScreen(
                         onPreview = { onPreviewFile(item) },
                         onStreamExternal = { onStreamOpenExternal(item) },
                         onDownloadRestore = { onDownloadRestoreFile(item) },
+                        onMirrorFolder = { onMirrorFolderToPhone(item) },
                         onTogglePin = { onTogglePinOffline(item) },
                         onShareLink = { onShareFileLink(item) }
                     )
+                }
+                if (hasNextPage) {
+                    item {
+                        OutlinedButton(onClick = onLoadMore, modifier = Modifier.fillMaxWidth()) {
+                            Text("Load More Cloud Files...")
+                        }
+                    }
                 }
             }
         }
@@ -564,6 +642,7 @@ private fun DriveFileCard(
     onPreview: () -> Unit,
     onStreamExternal: () -> Unit,
     onDownloadRestore: () -> Unit,
+    onMirrorFolder: () -> Unit = {},
     onTogglePin: () -> Unit,
     onShareLink: () -> Unit
 ) {
@@ -590,6 +669,13 @@ private fun DriveFileCard(
                     text = "${formatBytes(item.sizeBytes)} • ${item.mimeType} • Modified ${formatTimestamp(item.modifiedTimeMs)}",
                     style = MaterialTheme.typography.bodySmall
                 )
+                if (item.isGoogleWorkspaceDoc) {
+                    Text(
+                        text = "Google Workspace Document (Auto-exports to Office/PDF on Download/Offline Pin)",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.tertiary
+                    )
+                }
                 if (item.isProtectedBackupFile) {
                     Text(
                         text = "Protected Backup Resource (Never-Delete Guard Active)",
@@ -650,9 +736,52 @@ private fun DriveFileCard(
                 }
             } else {
                 Text(
-                    text = "Tap to open folder",
+                    text = "Cloud Folder • Tap to browse or use recursive actions below",
                     style = MaterialTheme.typography.bodySmall
                 )
+                Spacer(modifier = Modifier.height(6.dp))
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    item {
+                        OutlinedButton(
+                            onClick = { onOpenFolder(item.driveFileId, item.name) },
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                        ) {
+                            Text("Open Folder", fontSize = 11.sp)
+                        }
+                    }
+                    item {
+                        OutlinedButton(
+                            onClick = onDownloadRestore,
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                        ) {
+                            Text("Download Folder", fontSize = 11.sp)
+                        }
+                    }
+                    item {
+                        OutlinedButton(
+                            onClick = onMirrorFolder,
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                        ) {
+                            Text("Mirror to Phone (One-Way)", fontSize = 11.sp)
+                        }
+                    }
+                    item {
+                        OutlinedButton(
+                            onClick = onTogglePin,
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                        ) {
+                            Text("Keep Folder Offline", fontSize = 11.sp)
+                        }
+                    }
+                    item {
+                        OutlinedButton(
+                            onClick = onShareLink,
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                        ) {
+                            Text("Share Link", fontSize = 11.sp)
+                        }
+                    }
+                }
             }
         }
     }
@@ -671,6 +800,7 @@ fun PhoneStorageExplorerScreen(
     onGrantAllFilesAccess: () -> Unit,
     onSelectSafTree: () -> Unit,
     onToggleFolderBackup: (FolderCoverageItem, Boolean) -> Unit = { _, _ -> },
+    onToggleSubfolderAutoBackup: (LocalBrowseItem, Boolean) -> Unit = { _, _ -> },
     onBackupSingleFile: (LocalBrowseItem) -> Unit = {}
 ) {
     var showCoverageTab by remember { mutableStateOf(false) }
@@ -712,7 +842,7 @@ fun PhoneStorageExplorerScreen(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "Path: /${currentPath.ifBlank { "Internal Shared Storage" }}",
+                    text = "Path: /${currentPath.ifBlank { "Internal Shared Storage & SD Card" }}",
                     fontWeight = FontWeight.Bold,
                     style = MaterialTheme.typography.bodyMedium,
                     modifier = Modifier.weight(1f)
@@ -773,6 +903,13 @@ fun PhoneStorageExplorerScreen(
                                     ) {
                                         Text("Backup File", fontSize = 11.sp)
                                     }
+                                } else if (item.isDirectory && !item.isRestrictedByOs) {
+                                    OutlinedButton(
+                                        onClick = { onToggleSubfolderAutoBackup(item, true) },
+                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                                    ) {
+                                        Text("Auto-Backup", fontSize = 11.sp)
+                                    }
                                 }
                             }
                         }
@@ -830,8 +967,40 @@ fun PhoneStorageExplorerScreen(
 fun BackupVersionHistoryScreen(
     verifiedHistory: List<BackupFileEntity>,
     actionFeedback: String?,
+    selectedFileVersions: List<BackupFileEntity> = emptyList(),
+    onInspectAllVersions: (String) -> Unit = {},
+    onDismissVersionsDialog: () -> Unit = {},
     onRestoreVersion: (BackupFileEntity) -> Unit
 ) {
+    if (selectedFileVersions.isNotEmpty()) {
+        val sample = selectedFileVersions.first()
+        AlertDialog(
+            onDismissRequest = onDismissVersionsDialog,
+            title = { Text("Immutable Versions: ${sample.displayName}") },
+            text = {
+                LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    items(selectedFileVersions, key = { it.id }) { ver ->
+                        Card(modifier = Modifier.fillMaxWidth()) {
+                            Column(modifier = Modifier.padding(10.dp)) {
+                                Text("Version v${ver.backupVersion}: ${ver.driveStoredName}", fontWeight = FontWeight.Bold)
+                                Text("Account: ${ver.accountId} • Size: ${formatBytes(ver.fileSize)}", style = MaterialTheme.typography.bodySmall)
+                                Text("SHA-256: ${ver.sha256Hash?.take(20) ?: "Verified"}...", style = MaterialTheme.typography.bodySmall)
+                                OutlinedButton(onClick = { onRestoreVersion(ver) }) {
+                                    Text("Restore v${ver.backupVersion}", fontSize = 11.sp)
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = onDismissVersionsDialog) {
+                    Text("Close")
+                }
+            }
+        )
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -863,7 +1032,7 @@ fun BackupVersionHistoryScreen(
                             text = "${item.driveStoredName} (Version ${item.backupVersion})",
                             fontWeight = FontWeight.Bold
                         )
-                        Text("Original File: ${item.relativePath}")
+                        Text("Original File: ${item.relativePath} • Account: ${item.accountId}")
                         Text("Drive File ID: ${item.driveFileId ?: "N/A"}")
                         Text("Size: ${formatBytes(item.fileSize)} | Integrity: ${item.verificationStatus}")
                         Text("SHA-256: ${item.sha256Hash?.take(24) ?: "Stream Verified"}...")
@@ -877,8 +1046,13 @@ fun BackupVersionHistoryScreen(
                             color = if (item.localExists) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.primary
                         )
                         Spacer(modifier = Modifier.height(6.dp))
-                        OutlinedButton(onClick = { onRestoreVersion(item) }) {
-                            Text("Restore Version ${item.backupVersion} (Non-Overwriting)")
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedButton(onClick = { onRestoreVersion(item) }) {
+                                Text("Restore v${item.backupVersion}")
+                            }
+                            OutlinedButton(onClick = { onInspectAllVersions(item.sourceFileIdentity) }) {
+                                Text("All Versions")
+                            }
                         }
                     }
                 }
@@ -953,6 +1127,7 @@ fun RecentActivityScreen(
 /**
  * Section 12: Transfer Manager Screen ("Transfers")
  * Shows File Name, File Size, Uploaded Bytes, Percentage, Transfer Speed, Estimated Remaining Time,
+ * Transactional SyncJobEntity state machine rows, FailedOperationEntity HTTP diagnostics,
  * Pause, Resume, and Retry controls.
  */
 @Composable
@@ -961,6 +1136,8 @@ fun TransferManagerScreen(
     settings: BackupSettings,
     activeQueue: List<BackupFileEntity>,
     failedList: List<BackupFileEntity>,
+    syncJobs: List<SyncJobEntity> = emptyList(),
+    unresolvedFailures: List<FailedOperationEntity> = emptyList(),
     onTriggerBackup: () -> Unit,
     onTogglePauseAll: () -> Unit,
     onPauseResumeSingle: (Long, Boolean) -> Unit,
@@ -1093,6 +1270,61 @@ fun TransferManagerScreen(
                 }
             }
         }
+
+        if (unresolvedFailures.isNotEmpty()) {
+            item {
+                HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                Text(
+                    text = "Unresolved HTTP & Engine Failure Diagnostics (${unresolvedFailures.size})",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+            items(unresolvedFailures.take(25), key = { "uf_${it.failureId}" }) { fail ->
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.padding(10.dp)) {
+                        Text(
+                            text = "${fail.operationType} • ${fail.failureReason} ${fail.httpStatusCode?.let { "(HTTP $it)" }.orEmpty()}",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 12.sp
+                        )
+                        Text(fail.errorDetail, style = MaterialTheme.typography.bodySmall)
+                        Text(
+                            "Retryable: ${fail.retryable} • Attempts: ${fail.retryCount} • Offset: ${formatBytes(fail.uploadedBytes)}",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+            }
+        }
+
+        if (syncJobs.isNotEmpty()) {
+            item {
+                HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                Text(
+                    text = "Transactional Sync Job States (${syncJobs.size})",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+            items(syncJobs.take(30), key = { "sj_${it.jobId}" }) { job ->
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Column(modifier = Modifier.padding(10.dp)) {
+                        Text("${job.fileName} (v${job.backupVersion}) — ${job.syncState}", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                        Text(
+                            "Progress: ${formatBytes(job.uploadedBytes)} / ${formatBytes(job.totalBytes)} • Account: ${job.accountId}",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        job.lastErrorMessage?.let {
+                            Text("Last Notice: $it", style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1104,6 +1336,7 @@ fun OfflineAccessScreen(
     pinnedFiles: List<CloudFileEntity>,
     usedBytes: Long,
     budgetBytes: Long,
+    onOpenOfflineFile: (CloudFileEntity) -> Unit = {},
     onUnpinFile: (CloudFileEntity) -> Unit
 ) {
     Column(
@@ -1127,6 +1360,11 @@ fun OfflineAccessScreen(
                     "Default mode is Cloud-First with zero unnecessary cache. Unpinning a file only frees local phone cache and NEVER deletes the cloud file on Google Drive.",
                     style = MaterialTheme.typography.bodySmall
                 )
+                Text(
+                    "Android SAF DocumentsProvider Active: You can also open pinned offline files (seekable random-access) or stream cloud files from any app's system file picker ('Permanent Drive').",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary
+                )
             }
         }
 
@@ -1144,8 +1382,13 @@ fun OfflineAccessScreen(
                             Text("Cached Size: ${formatBytes(file.offlineCachedBytes)} • ${file.mimeType}")
                             Text("Local Cache Path: ${file.offlineLocalPath ?: "N/A"}", style = MaterialTheme.typography.bodySmall)
                             Spacer(modifier = Modifier.height(6.dp))
-                            OutlinedButton(onClick = { onUnpinFile(file) }) {
-                                Text("Remove from Offline Cache (Keep on Drive)")
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Button(onClick = { onOpenOfflineFile(file) }) {
+                                    Text("Open File", fontSize = 12.sp)
+                                }
+                                OutlinedButton(onClick = { onUnpinFile(file) }) {
+                                    Text("Unpin Offline", fontSize = 12.sp)
+                                }
                             }
                         }
                     }
@@ -1213,6 +1456,108 @@ fun SettingsScreen(
                 checked = settings.backgroundSyncPaused,
                 onCheckedChange = { onUpdateSettings(settings.copy(backgroundSyncPaused = it)) }
             )
+        }
+
+        // Parallel Upload Concurrency Selector (1..4 workers)
+        item {
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(
+                        "Parallel Upload Workers: ${settings.uploadConcurrency} Concurrent Stream(s)",
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        "Controls how many files upload in parallel via Semaphore worker pool.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        listOf(1, 2, 3, 4).forEach { workers ->
+                            FilterChip(
+                                selected = settings.uploadConcurrency == workers,
+                                onClick = { onUpdateSettings(settings.copy(uploadConcurrency = workers)) },
+                                label = { Text("${workers}x") }
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // Periodic Sync Interval Selector
+        item {
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(
+                        "Periodic Background Sync Interval: Every ${settings.periodicIntervalHours} hour(s)",
+                        fontWeight = FontWeight.Bold
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        listOf(1, 3, 6, 12, 24).forEach { hrs ->
+                            FilterChip(
+                                selected = settings.periodicIntervalHours == hrs,
+                                onClick = { onUpdateSettings(settings.copy(periodicIntervalHours = hrs)) },
+                                label = { Text("${hrs}h") }
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // Resumable Chunk Size Selector
+        item {
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(
+                        "Resumable Upload Chunk Size: ${formatBytes(settings.chunkSizeBytes.toLong())}",
+                        fontWeight = FontWeight.Bold
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        listOf(
+                            256 * 1024 to "256 KB",
+                            512 * 1024 to "512 KB",
+                            1024 * 1024 to "1 MB",
+                            2 * 1024 * 1024 to "2 MB"
+                        ).forEach { (bytes, label) ->
+                            FilterChip(
+                                selected = settings.chunkSizeBytes == bytes,
+                                onClick = { onUpdateSettings(settings.copy(chunkSizeBytes = bytes)) },
+                                label = { Text(label) }
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // Upload Bandwidth Rate Limit Selector
+        item {
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    val speedLabel = if (settings.maxUploadSpeedKbps <= 0) "Unlimited" else "${settings.maxUploadSpeedKbps} KB/s"
+                    Text(
+                        "Upload Bandwidth Limit: $speedLabel",
+                        fontWeight = FontWeight.Bold
+                    )
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        items(
+                            listOf(
+                                0 to "Unlimited",
+                                256 to "256 KB/s",
+                                512 to "512 KB/s",
+                                1024 to "1 MB/s",
+                                2048 to "2 MB/s"
+                            )
+                        ) { (kbps, label) ->
+                            FilterChip(
+                                selected = settings.maxUploadSpeedKbps == kbps,
+                                onClick = { onUpdateSettings(settings.copy(maxUploadSpeedKbps = kbps)) },
+                                label = { Text(label) }
+                            )
+                        }
+                    }
+                }
+            }
         }
 
         // Offline Cache Budget Selector (Section 10)

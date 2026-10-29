@@ -42,10 +42,22 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:launchMode="singleTop"
             android:theme="@style/Theme.PermanentBackup">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- System-wide "Save to Permanent Drive" Share Sheet Integration -->
+            <intent-filter android:label="Save to Permanent Drive">
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+            <intent-filter android:label="Save to Permanent Drive">
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
             </intent-filter>
         </activity>
 
@@ -60,6 +72,18 @@
             android:authorities="com.permanentbackup.gdrive.stream"
             android:exported="false"
             android:grantUriPermissions="true" />
+
+        <!-- Android SAF DocumentsProvider for System-Wide Read-Only Virtual Drive Access -->
+        <provider
+            android:name=".provider.PermanentDriveDocumentsProvider"
+            android:authorities="com.permanentbackup.gdrive.documents"
+            android:exported="true"
+            android:grantUriPermissions="true"
+            android:permission="android.permission.MANAGE_DOCUMENTS">
+            <intent-filter>
+                <action android:name="android.content.action.DOCUMENTS_PROVIDER" />
+            </intent-filter>
+        </provider>
 
         <receiver
             android:name=".worker.BootCompletedReceiver"

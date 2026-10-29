@@ -7,7 +7,9 @@ import com.permanentbackup.gdrive.data.local.BackupDao
 import com.permanentbackup.gdrive.data.local.BackupFileEntity
 import com.permanentbackup.gdrive.data.local.BackupFolderEntity
 import com.permanentbackup.gdrive.data.local.CloudFileEntity
+import com.permanentbackup.gdrive.data.local.FailedOperationEntity
 import com.permanentbackup.gdrive.data.local.GoogleAccountEntity
+import com.permanentbackup.gdrive.data.local.StoragePermissionEntity
 import com.permanentbackup.gdrive.data.local.SyncEventEntity
 import com.permanentbackup.gdrive.data.local.SyncJobEntity
 import com.permanentbackup.gdrive.data.remote.DriveApiClient
@@ -15,12 +17,14 @@ import com.permanentbackup.gdrive.data.remote.GoogleAuthManager
 import com.permanentbackup.gdrive.domain.engine.BackupCycleSummary
 import com.permanentbackup.gdrive.domain.engine.CloudFileOperationsManager
 import com.permanentbackup.gdrive.domain.engine.PermanentBackupEngine
+import com.permanentbackup.gdrive.domain.engine.SourceFileReadOnlyGuard
 import com.permanentbackup.gdrive.domain.engine.StorageFileSource
 import com.permanentbackup.gdrive.domain.model.AccountAuthState
 import com.permanentbackup.gdrive.domain.model.BackgroundSyncStatus
 import com.permanentbackup.gdrive.domain.model.BackupSettings
 import com.permanentbackup.gdrive.domain.model.CloudBrowseItem
 import com.permanentbackup.gdrive.domain.model.DashboardSummary
+import com.permanentbackup.gdrive.domain.model.DiscoveredSourceFile
 import com.permanentbackup.gdrive.domain.model.DriveSortOrder
 import com.permanentbackup.gdrive.domain.model.DriveViewFilter
 import com.permanentbackup.gdrive.domain.model.FolderAccessStatus
@@ -62,10 +66,20 @@ class BackupRepository(
     private val _settings = MutableStateFlow(loadSettings())
     val settings: StateFlow<BackupSettings> = _settings.asStateFlow()
 
+    private val _cloudNextPageToken = MutableStateFlow<String?>(null)
+    val cloudNextPageToken: StateFlow<String?> = _cloudNextPageToken.asStateFlow()
+
     private val _nextScheduledBackupMs = MutableStateFlow<Long?>(
         System.currentTimeMillis() + (6L * 3600L * 1000L)
     )
     val nextScheduledBackupMs: StateFlow<Long?> = _nextScheduledBackupMs.asStateFlow()
+
+    init {
+        // Automatically refresh any pinned offline file when Google Drive Changes API detects a remote edit
+        backupEngine.onPinnedCloudFileModified = { modifiedItem ->
+            cloudFileOps.pinCloudFileOffline(modifiedItem, _settings.value.offlineCacheBudgetBytes)
+        }
+    }
 
     fun observeActiveQueue(): Flow<List<BackupFileEntity>> = backupDao.observeActiveQueue()
     fun observeVerifiedHistory(): Flow<List<BackupFileEntity>> = backupDao.observeVerifiedHistory()
@@ -73,6 +87,7 @@ class BackupRepository(
     fun observeRecentRecords(): Flow<List<BackupFileEntity>> = backupDao.observeRecentRecords()
     fun observeSyncJobs(): Flow<List<SyncJobEntity>> = backupDao.observeSyncJobs()
     fun observeRecentSyncEvents(): Flow<List<SyncEventEntity>> = backupDao.observeRecentSyncEvents()
+    fun observeUnresolvedFailures(): Flow<List<FailedOperationEntity>> = backupDao.observeUnresolvedFailures()
     fun observeGoogleAccounts(): Flow<List<GoogleAccountEntity>> = backupDao.observeAllGoogleAccounts()
 
     fun observePinnedOfflineFiles(): Flow<List<CloudFileEntity>> {
@@ -81,6 +96,32 @@ class BackupRepository(
     }
 
     suspend fun syncPersistedAccountOnStartup() {
+        // 1. Restore persisted AppSettingsEntity from Room if present
+        backupDao.getAppSettingsEntity()?.let { dbSettings ->
+            val restored = BackupSettings(
+                userBackupConsentGranted = dbSettings.userBackupConsentGranted,
+                wifiOnly = dbSettings.wifiOnly,
+                chargingOnly = dbSettings.chargingOnly,
+                unmeteredNetworkOnly = dbSettings.unmeteredNetworkOnly,
+                uploadConcurrency = dbSettings.uploadConcurrency.coerceIn(1, 4),
+                periodicIntervalHours = dbSettings.periodicIntervalHours.coerceAtLeast(1),
+                chunkSizeBytes = dbSettings.chunkSizeBytes,
+                offlineCacheBudgetBytes = dbSettings.offlineCacheBudgetBytes,
+                backgroundSyncPaused = dbSettings.backgroundSyncPaused,
+                maxUploadSpeedKbps = dbSettings.maxUploadSpeedKbps.coerceAtLeast(0)
+            )
+            _settings.value = restored
+            backupEngine.setEnginePaused(restored.backgroundSyncPaused)
+        }
+
+        // 2. Restore persisted SAF Tree URIs into storageSource so custom SAF folders are scanned
+        val savedPerms = backupDao.getAllStoragePermissions()
+        for (perm in savedPerms) {
+            if (perm.isGranted && !perm.grantedUri.isNullOrBlank()) {
+                storageSource.registerPersistedSafTreeUri(perm.grantedUri)
+            }
+        }
+
         if (authManager.isUserExplicitlyDisconnected()) return
         val activeDbAccount = backupDao.getActiveGoogleAccount()
         if (activeDbAccount != null && !authManager.accountState.value.isConnected) {
@@ -129,6 +170,10 @@ class BackupRepository(
         }
     }
 
+    fun setBackupPaused(paused: Boolean) {
+        updateSettings(_settings.value.copy(backgroundSyncPaused = paused))
+    }
+
     fun updateSettings(newSettings: BackupSettings) {
         _settings.value = newSettings
         backupEngine.setEnginePaused(newSettings.backgroundSyncPaused)
@@ -142,6 +187,7 @@ class BackupRepository(
             putInt("chunk_size_bytes", newSettings.chunkSizeBytes)
             putLong("offline_cache_budget_bytes", newSettings.offlineCacheBudgetBytes)
             putBoolean("background_sync_paused", newSettings.backgroundSyncPaused)
+            putInt("max_upload_speed_kbps", newSettings.maxUploadSpeedKbps.coerceAtLeast(0))
             apply()
         }
         _nextScheduledBackupMs.value =
@@ -156,12 +202,69 @@ class BackupRepository(
                 wifiOnly = newSettings.wifiOnly,
                 chargingOnly = newSettings.chargingOnly,
                 unmeteredNetworkOnly = newSettings.unmeteredNetworkOnly,
-                uploadConcurrency = newSettings.uploadConcurrency,
-                periodicIntervalHours = newSettings.periodicIntervalHours,
+                uploadConcurrency = newSettings.uploadConcurrency.coerceIn(1, 4),
+                periodicIntervalHours = newSettings.periodicIntervalHours.coerceAtLeast(1),
                 chunkSizeBytes = newSettings.chunkSizeBytes,
                 offlineCacheBudgetBytes = newSettings.offlineCacheBudgetBytes,
                 backgroundSyncPaused = newSettings.backgroundSyncPaused,
+                maxUploadSpeedKbps = newSettings.maxUploadSpeedKbps.coerceAtLeast(0),
                 activeAccountId = currentAccountId()
+            )
+        )
+    }
+
+    /**
+     * Persists a user-granted SAF directory tree URI in Room and registers it with the scanner.
+     */
+    suspend fun registerPersistedSafFolder(treeUriString: String, label: String = "SAF_Custom") {
+        if (treeUriString.isBlank()) return
+        storageSource.registerPersistedSafTreeUri(treeUriString)
+        val permKey = "SAF_TREE:${treeUriString.hashCode()}"
+        backupDao.upsertStoragePermission(
+            StoragePermissionEntity(
+                permissionType = permKey,
+                isGranted = true,
+                grantedUri = treeUriString,
+                persistedSafTree = true,
+                diagnosticMessage = "Persisted SAF Directory Tree ($label)"
+            )
+        )
+        val accountId = currentAccountId()
+        backupDao.upsertBackupFolder(
+            BackupFolderEntity(
+                folderKey = "$accountId:SAF/$label",
+                accountId = accountId,
+                folderName = label,
+                relativePath = "SAF/$label",
+                safTreeUri = treeUriString,
+                backupEnabled = true,
+                isProtectedAndroidFolder = false,
+                accessStatus = FolderAccessStatus.ACCESSIBLE.name
+            )
+        )
+    }
+
+    /**
+     * Adds or toggles per-folder Auto-Backup for any subfolder browsed in Phone Storage Explorer.
+     */
+    suspend fun toggleCustomLocalFolderAutoBackup(localItem: LocalBrowseItem, enabled: Boolean) {
+        if (!localItem.isDirectory) return
+        val accountId = currentAccountId()
+        val relPath = localItem.relativePath.replace('\\', '/').trim('/')
+        val key = "$accountId:$relPath"
+        backupDao.upsertBackupFolder(
+            BackupFolderEntity(
+                folderKey = key,
+                accountId = accountId,
+                folderName = localItem.name,
+                relativePath = relPath,
+                backupEnabled = enabled,
+                isProtectedAndroidFolder = localItem.isRestrictedByOs,
+                accessStatus = if (localItem.isRestrictedByOs) {
+                    FolderAccessStatus.RESTRICTED_BY_ANDROID_OS.name
+                } else {
+                    FolderAccessStatus.ACCESSIBLE.name
+                }
             )
         )
     }
@@ -184,18 +287,20 @@ class BackupRepository(
     }
 
     /**
-     * Section 5A: Lists Google Drive files for My Drive Explorer, caching metadata in SQLite
-     * and falling back to cached SQLite records when offline.
+     * Section 5A: Lists Google Drive files for My Drive Explorer with pagination (`pageToken` / `cloudNextPageToken`),
+     * caching metadata in SQLite and falling back to filter/folder-aware cached SQLite records when offline.
      */
     suspend fun browseCloudDriveFiles(
         filter: DriveViewFilter = DriveViewFilter.BACKUP_ROOT,
         parentFolderId: String? = null,
         searchQuery: String = "",
-        sortOrder: DriveSortOrder = DriveSortOrder.MODIFIED_DESC
+        sortOrder: DriveSortOrder = DriveSortOrder.MODIFIED_DESC,
+        pageToken: String? = null
     ): List<CloudBrowseItem> {
         val accountId = currentAccountId()
         if (!authManager.accountState.value.isConnected) {
-            return loadCachedCloudBrowseItems(accountId)
+            _cloudNextPageToken.value = null
+            return loadCachedCloudBrowseItems(accountId, filter, parentFolderId, searchQuery)
         }
 
         return try {
@@ -218,14 +323,16 @@ class BackupRepository(
                 }
                 else -> null
             }
-            val page = driveApiClient.listDriveFiles(
+            val page = driveApiClient.browseCloudDriveFiles(
                 accessToken = token,
                 accountId = accountId,
                 filter = filter,
                 parentFolderId = effectiveParent,
                 searchQuery = searchQuery,
-                sortOrder = sortOrder
+                sortOrder = sortOrder,
+                pageToken = pageToken
             )
+            _cloudNextPageToken.value = page.nextPageToken
 
             // Persist in CloudFileEntity while preserving existing offline pin flags
             val entities = page.files.map { item ->
@@ -253,54 +360,130 @@ class BackupRepository(
             }
             backupDao.upsertCloudFiles(entities)
 
-            entities.map { e ->
-                CloudBrowseItem(
-                    driveFileId = e.driveFileId,
-                    accountId = e.accountId,
-                    name = e.name,
-                    mimeType = e.mimeType,
-                    sizeBytes = e.sizeBytes,
-                    md5Checksum = e.md5Checksum,
-                    sha256Checksum = e.sha256Checksum,
-                    parentFolderId = e.parentFolderId,
-                    isFolder = e.isFolder,
-                    isProtectedBackupFile = e.isProtectedBackupFile,
-                    starred = e.starred,
-                    shared = e.shared,
-                    webViewLink = e.webViewLink,
-                    createdTimeMs = e.createdTimeMs,
-                    modifiedTimeMs = e.modifiedTimeMs,
-                    isPinnedOffline = e.isPinnedOffline,
-                    offlineLocalPath = e.offlineLocalPath
-                )
-            }
+            entities.map { e -> e.toCloudBrowseItem() }
         } catch (_: Throwable) {
-            loadCachedCloudBrowseItems(accountId)
+            _cloudNextPageToken.value = null
+            loadCachedCloudBrowseItems(accountId, filter, parentFolderId, searchQuery)
         }
     }
 
-    private suspend fun loadCachedCloudBrowseItems(accountId: String): List<CloudBrowseItem> {
-        return backupDao.getCloudFilesForAccountPaged(accountId, 200, 0).map { e ->
-            CloudBrowseItem(
-                driveFileId = e.driveFileId,
-                accountId = e.accountId,
-                name = e.name,
-                mimeType = e.mimeType,
-                sizeBytes = e.sizeBytes,
-                md5Checksum = e.md5Checksum,
-                sha256Checksum = e.sha256Checksum,
-                parentFolderId = e.parentFolderId,
-                isFolder = e.isFolder,
-                isProtectedBackupFile = e.isProtectedBackupFile,
-                starred = e.starred,
-                shared = e.shared,
-                webViewLink = e.webViewLink,
-                createdTimeMs = e.createdTimeMs,
-                modifiedTimeMs = e.modifiedTimeMs,
-                isPinnedOffline = e.isPinnedOffline,
-                offlineLocalPath = e.offlineLocalPath
-            )
+    private suspend fun loadCachedCloudBrowseItems(
+        accountId: String,
+        filter: DriveViewFilter = DriveViewFilter.BACKUP_ROOT,
+        parentFolderId: String? = null,
+        searchQuery: String = ""
+    ): List<CloudBrowseItem> {
+        val rawEntities = when {
+            searchQuery.isNotBlank() -> backupDao.searchCloudFiles(accountId, searchQuery.trim())
+            !parentFolderId.isNullOrBlank() -> backupDao.getCloudFilesByParent(parentFolderId)
+            else -> backupDao.getCloudFilesForAccountPaged(accountId, 200, 0)
         }
+        val filtered = rawEntities.filter { e ->
+            when {
+                searchQuery.isNotBlank() || !parentFolderId.isNullOrBlank() -> true
+                filter == DriveViewFilter.STARRED -> e.starred
+                filter == DriveViewFilter.SHARED_WITH_ME -> e.shared
+                else -> true
+            }
+        }
+        return filtered.map { it.toCloudBrowseItem() }
+    }
+
+    private fun CloudFileEntity.toCloudBrowseItem(): CloudBrowseItem = CloudBrowseItem(
+        driveFileId = driveFileId,
+        accountId = accountId,
+        name = name,
+        mimeType = mimeType,
+        sizeBytes = sizeBytes,
+        md5Checksum = md5Checksum,
+        sha256Checksum = sha256Checksum,
+        parentFolderId = parentFolderId,
+        isFolder = isFolder,
+        isProtectedBackupFile = isProtectedBackupFile,
+        starred = starred,
+        shared = shared,
+        webViewLink = webViewLink,
+        createdTimeMs = createdTimeMs,
+        modifiedTimeMs = modifiedTimeMs,
+        isPinnedOffline = isPinnedOffline,
+        offlineLocalPath = offlineLocalPath
+    )
+
+    /**
+     * Creates a new subfolder on Google Drive (for My Drive Explorer) and indexes it locally.
+     */
+    suspend fun createCloudFolder(folderName: String, parentFolderId: String? = null): String? {
+        if (folderName.isBlank() || !authManager.accountState.value.isConnected) return null
+        return try {
+            val token = authManager.getValidAccessToken()
+            val effectiveParent = parentFolderId ?: authManager.accountState.value.rootDriveFolderId
+            val createdId = driveApiClient.ensureFolderExists(
+                accessToken = token,
+                folderName = folderName.trim(),
+                parentFolderId = effectiveParent
+            )
+            val now = System.currentTimeMillis()
+            backupDao.upsertCloudFile(
+                CloudFileEntity(
+                    driveFileId = createdId,
+                    accountId = currentAccountId(),
+                    name = folderName.trim(),
+                    mimeType = DriveApiClient.DRIVE_FOLDER_MIME,
+                    sizeBytes = 0L,
+                    parentFolderId = effectiveParent,
+                    isFolder = true,
+                    isProtectedBackupFile = true,
+                    createdTimeMs = now,
+                    modifiedTimeMs = now
+                )
+            )
+            createdId
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    /**
+     * Queues a shared or picked URI (`ACTION_SEND` / `ACTION_SEND_MULTIPLE` or "Upload File" button)
+     * directly into the permanent backup queue.
+     */
+    suspend fun uploadDirectUriToDrive(
+        uriString: String,
+        displayName: String,
+        mimeType: String,
+        sizeBytes: Long,
+        targetSubfolder: String = "Shared_To_Drive"
+    ): Boolean {
+        if (uriString.isBlank()) return false
+        val safeDisplay = displayName.ifBlank { "shared_file_${System.currentTimeMillis()}" }
+        val relPath = "$targetSubfolder/$safeDisplay"
+        val identity = "shared:$relPath"
+        val now = System.currentTimeMillis()
+
+        val hashes = try {
+            if (sizeBytes in 0L..(64L * 1024L * 1024L)) {
+                SourceFileReadOnlyGuard.computeStreamingHashes {
+                    storageSource.openInputStream(uriString)
+                }
+            } else null
+        } catch (_: Throwable) {
+            null
+        }
+
+        val resolvedSize = if (sizeBytes > 0L) sizeBytes else (hashes?.byteSize ?: 0L)
+        val discovered = DiscoveredSourceFile(
+            sourceUri = uriString,
+            sourceFileIdentity = identity,
+            relativePath = relPath,
+            displayName = safeDisplay,
+            folderCategory = targetSubfolder,
+            fileSize = resolvedSize,
+            lastModifiedMs = now,
+            mimeType = mimeType.ifBlank { "application/octet-stream" },
+            sha256Hash = hashes?.sha256Hex,
+            md5Hash = hashes?.md5Hex
+        )
+        return backupEngine.evaluateAndQueueDiscoveredFile(discovered)
     }
 
     /**
@@ -316,7 +499,7 @@ class BackupRepository(
     suspend fun queueSingleLocalFile(item: LocalBrowseItem): Boolean {
         if (item.isDirectory || item.isRestrictedByOs) return false
         val normalizedTarget = item.relativePath.replace('\\', '/').trim('/')
-        val discovered = storageSource.scanFilesSequence(computeHashes = true)
+        val discovered = storageSource.scanFilesSequence(computeHashes = false)
             .firstOrNull { it.relativePath.replace('\\', '/').trim('/').equals(normalizedTarget, ignoreCase = true) }
             ?: return false
         return backupEngine.evaluateAndQueueDiscoveredFile(discovered)
@@ -330,22 +513,37 @@ class BackupRepository(
             driveFileId = fileId,
             originalFileName = record.displayName,
             versionNumber = record.backupVersion,
-            targetSubfolder = parentFolder
+            targetSubfolder = parentFolder,
+            mimeType = record.mimeType
         )
     }
 
     suspend fun restoreCloudBrowseItem(item: CloudBrowseItem): RestoreOutcome {
-        return cloudFileOps.restoreCloudFileToLocal(
-            driveFileId = item.driveFileId,
-            originalFileName = item.name,
-            versionNumber = 1
-        )
+        return if (item.isFolder) {
+            cloudFileOps.restoreCloudFolderRecursively(item)
+        } else {
+            cloudFileOps.restoreCloudFileToLocal(
+                driveFileId = item.driveFileId,
+                originalFileName = item.name,
+                versionNumber = 1,
+                mimeType = item.mimeType
+            )
+        }
+    }
+
+    /**
+     * One-way Cloud-to-Local Folder Mirror (Rule 3: Separation of Backup & Mirroring).
+     */
+    suspend fun mirrorCloudFolderToLocal(item: CloudBrowseItem): RestoreOutcome {
+        return cloudFileOps.mirrorCloudFolderToLocal(item)
     }
 
     suspend fun toggleOfflinePin(item: CloudBrowseItem): RestoreOutcome {
         return if (item.isPinnedOffline) {
             cloudFileOps.unpinCloudFileOffline(item.driveFileId)
             RestoreOutcome(true, null, 0L, "Removed '${item.name}' from offline cache (Cloud file untouched).")
+        } else if (item.isFolder) {
+            cloudFileOps.pinCloudFolderOfflineRecursively(item, _settings.value.offlineCacheBudgetBytes)
         } else {
             cloudFileOps.pinCloudFileOffline(item, _settings.value.offlineCacheBudgetBytes)
         }
@@ -512,7 +710,8 @@ class BackupRepository(
             periodicIntervalHours = p.getInt("interval_hours", 6),
             chunkSizeBytes = p.getInt("chunk_size_bytes", 256 * 1024),
             offlineCacheBudgetBytes = p.getLong("offline_cache_budget_bytes", 100L * 1024 * 1024),
-            backgroundSyncPaused = p.getBoolean("background_sync_paused", false)
+            backgroundSyncPaused = p.getBoolean("background_sync_paused", false),
+            maxUploadSpeedKbps = p.getInt("max_upload_speed_kbps", 0)
         )
     }
 }

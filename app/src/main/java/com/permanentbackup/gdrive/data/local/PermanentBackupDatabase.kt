@@ -56,7 +56,7 @@ class BackupTypeConverters {
         StoragePermissionEntity::class,
         DriveChangeTokenEntity::class
     ],
-    version = 2,
+    version = 3,
     exportSchema = false
 )
 @TypeConverters(BackupTypeConverters::class)
@@ -426,6 +426,26 @@ abstract class PermanentBackupDatabase : RoomDatabase() {
             }
         }
 
+        val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "ALTER TABLE `backup_file_records` ADD COLUMN `accountId` TEXT NOT NULL DEFAULT 'default_account'"
+                )
+                db.execSQL(
+                    "DROP INDEX IF EXISTS `index_backup_file_records_sourceFileIdentity_backupVersion`"
+                )
+                db.execSQL(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS `index_backup_file_records_accountId_sourceFileIdentity_backupVersion` ON `backup_file_records` (`accountId`, `sourceFileIdentity`, `backupVersion`)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_backup_file_records_accountId` ON `backup_file_records` (`accountId`)"
+                )
+                db.execSQL(
+                    "ALTER TABLE `app_settings` ADD COLUMN `maxUploadSpeedKbps` INTEGER NOT NULL DEFAULT 0"
+                )
+            }
+        }
+
         @Volatile
         private var INSTANCE: PermanentBackupDatabase? = null
 
@@ -442,7 +462,7 @@ abstract class PermanentBackupDatabase : RoomDatabase() {
                 DB_NAME
             )
                 .setJournalMode(JournalMode.WRITE_AHEAD_LOGGING)
-                .addMigrations(MIGRATION_1_2)
+                .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
                 .build()
         }
     }

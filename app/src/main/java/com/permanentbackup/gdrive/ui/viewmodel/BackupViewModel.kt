@@ -4,11 +4,14 @@ import android.app.Application
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
+import android.provider.OpenableColumns
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.permanentbackup.gdrive.PermanentBackupApp
 import com.permanentbackup.gdrive.data.local.BackupFileEntity
 import com.permanentbackup.gdrive.data.local.CloudFileEntity
+import com.permanentbackup.gdrive.data.local.FailedOperationEntity
 import com.permanentbackup.gdrive.data.local.GoogleAccountEntity
 import com.permanentbackup.gdrive.data.local.SyncEventEntity
 import com.permanentbackup.gdrive.data.local.SyncJobEntity
@@ -22,6 +25,7 @@ import com.permanentbackup.gdrive.domain.model.LocalBrowseItem
 import com.permanentbackup.gdrive.domain.model.OAuthDiagnosticReport
 import com.permanentbackup.gdrive.service.PermanentBackupForegroundService
 import com.permanentbackup.gdrive.worker.BackupWorkScheduler
+import com.permanentbackup.gdrive.worker.LocalStorageFileObserverManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -43,6 +47,8 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
 
     private val _cloudDriveItems = MutableStateFlow<List<CloudBrowseItem>>(emptyList())
     val cloudDriveItems: StateFlow<List<CloudBrowseItem>> = _cloudDriveItems.asStateFlow()
+
+    val cloudNextPageToken: StateFlow<String?> = repository.cloudNextPageToken
 
     private val _driveFilter = MutableStateFlow(DriveViewFilter.BACKUP_ROOT)
     val driveFilter: StateFlow<DriveViewFilter> = _driveFilter.asStateFlow()
@@ -74,6 +80,9 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
     private val _previewSnippet = MutableStateFlow<Pair<String, String>?>(null)
     val previewSnippet: StateFlow<Pair<String, String>?> = _previewSnippet.asStateFlow()
 
+    private val _selectedFileVersions = MutableStateFlow<List<BackupFileEntity>>(emptyList())
+    val selectedFileVersions: StateFlow<List<BackupFileEntity>> = _selectedFileVersions.asStateFlow()
+
     private val _oauthDiagnostics = MutableStateFlow(repository.getOAuthDiagnostics())
     val oauthDiagnostics: StateFlow<OAuthDiagnosticReport> = _oauthDiagnostics.asStateFlow()
 
@@ -97,20 +106,39 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
     val recentSyncEvents: StateFlow<List<SyncEventEntity>> = repository.observeRecentSyncEvents()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
+    val unresolvedFailures: StateFlow<List<FailedOperationEntity>> = repository.observeUnresolvedFailures()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
     val pinnedOfflineFiles: StateFlow<List<CloudFileEntity>> = repository.observePinnedOfflineFiles()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val savedAccounts: StateFlow<List<GoogleAccountEntity>> = repository.observeGoogleAccounts()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
+    private val fileObserverManager = LocalStorageFileObserverManager { detectedRelPath ->
+        viewModelScope.launch(Dispatchers.IO) {
+            if (settings.value.userBackupConsentGranted && !settings.value.backgroundSyncPaused) {
+                repository.runBackupNow()
+                refreshDashboardAndCoverage(fetchRemoteQuota = false)
+            }
+        }
+    }
+
     init {
         viewModelScope.launch {
             withContext(Dispatchers.IO) {
                 repository.syncPersistedAccountOnStartup()
+                fileObserverManager.startWatching()
+                BackupWorkScheduler.scheduleContentUriTriggeredBackup(getApplication(), settings.value)
             }
             refreshDashboardAndCoverage(fetchRemoteQuota = true)
             refreshLocalPhoneBrowser("")
         }
+    }
+
+    override fun onCleared() {
+        fileObserverManager.stopWatching()
+        super.onCleared()
     }
 
     fun refreshDashboardAndCoverage(fetchRemoteQuota: Boolean = false) {
@@ -139,9 +167,106 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
                 filter = _driveFilter.value,
                 parentFolderId = currentFolderId,
                 searchQuery = _driveSearchQuery.value,
-                sortOrder = _driveSortOrder.value
+                sortOrder = _driveSortOrder.value,
+                pageToken = null
             )
             _cloudDriveItems.value = items
+        }
+    }
+
+    fun loadMoreCloudDriveFiles() {
+        val nextToken = cloudNextPageToken.value ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            val currentFolderId = _driveFolderBreadcrumbs.value.lastOrNull()?.first
+            val nextItems = repository.browseCloudDriveFiles(
+                filter = _driveFilter.value,
+                parentFolderId = currentFolderId,
+                searchQuery = _driveSearchQuery.value,
+                sortOrder = _driveSortOrder.value,
+                pageToken = nextToken
+            )
+            val existingIds = _cloudDriveItems.value.map { it.driveFileId }.toSet()
+            _cloudDriveItems.value = _cloudDriveItems.value + nextItems.filter { it.driveFileId !in existingIds }
+        }
+    }
+
+    fun createNewCloudFolder(folderName: String) {
+        if (folderName.isBlank()) return
+        viewModelScope.launch(Dispatchers.IO) {
+            val currentFolderId = _driveFolderBreadcrumbs.value.lastOrNull()?.first
+            val createdId = repository.createCloudFolder(folderName.trim(), currentFolderId)
+            if (createdId != null) {
+                _actionFeedbackMessage.value = "Created folder '${folderName.trim()}' on Google Drive."
+                refreshCloudDriveExplorer()
+            } else {
+                _actionFeedbackMessage.value = "Could not create folder '${folderName.trim()}'. Check connection."
+            }
+        }
+    }
+
+    fun uploadDirectUrisToDrive(uris: List<Uri>, targetSubfolder: String = "Direct_Uploads") {
+        if (uris.isEmpty()) return
+        viewModelScope.launch(Dispatchers.IO) {
+            val resolver = getApplication<Application>().contentResolver
+            var queuedCount = 0
+            for (uri in uris) {
+                var displayName = uri.lastPathSegment?.substringAfterLast('/') ?: "upload_${System.currentTimeMillis()}"
+                var sizeBytes = 0L
+                try {
+                    resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)?.use { c ->
+                        if (c.moveToFirst()) {
+                            val nameIdx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                            val sizeIdx = c.getColumnIndex(OpenableColumns.SIZE)
+                            if (nameIdx >= 0 && !c.isNull(nameIdx)) displayName = c.getString(nameIdx)
+                            if (sizeIdx >= 0 && !c.isNull(sizeIdx)) sizeBytes = c.getLong(sizeIdx)
+                        }
+                    }
+                } catch (_: Throwable) {
+                }
+                val mimeType = try {
+                    resolver.getType(uri) ?: "application/octet-stream"
+                } catch (_: Throwable) {
+                    "application/octet-stream"
+                }
+                val queued = repository.uploadDirectUriToDrive(
+                    uriString = uri.toString(),
+                    displayName = displayName,
+                    mimeType = mimeType,
+                    sizeBytes = sizeBytes,
+                    targetSubfolder = targetSubfolder
+                )
+                if (queued) queuedCount++
+            }
+            if (queuedCount > 0) {
+                _actionFeedbackMessage.value = "Queued $queuedCount file(s) to Permanent Drive ($targetSubfolder)."
+                PermanentBackupForegroundService.startManualBackupService(getApplication())
+            } else {
+                _actionFeedbackMessage.value = "Selected file(s) already backed up and unchanged."
+            }
+            refreshDashboardAndCoverage(fetchRemoteQuota = true)
+        }
+    }
+
+    fun onSafFolderGranted(treeUri: Uri) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val label = treeUri.lastPathSegment?.substringAfterLast(':')?.substringAfterLast('/')?.ifBlank { "SAF_Custom" }
+                ?: "SAF_Custom"
+            repository.registerPersistedSafFolder(treeUri.toString(), label)
+            _actionFeedbackMessage.value = "Added SAF folder '$label' to permanent auto-backup."
+            refreshDashboardAndCoverage()
+            PermanentBackupForegroundService.startManualBackupService(getApplication())
+        }
+    }
+
+    fun toggleLocalSubfolderAutoBackup(item: LocalBrowseItem, enabled: Boolean) {
+        viewModelScope.launch(Dispatchers.IO) {
+            repository.toggleCustomLocalFolderAutoBackup(item, enabled)
+            _actionFeedbackMessage.value = if (enabled) {
+                "Added subfolder '${item.relativePath}' to auto-backup."
+            } else {
+                "Excluded subfolder '${item.relativePath}' from new backups (cloud files untouched)."
+            }
+            refreshDashboardAndCoverage()
         }
     }
 
@@ -219,11 +344,11 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun triggerManualBackupNow() {
+        // PermanentBackupForegroundService executes app.repository.runBackupNow() on serviceScope;
+        // do not duplicate the runBackupNow() call from ViewModel.
         PermanentBackupForegroundService.startManualBackupService(getApplication())
-        viewModelScope.launch(Dispatchers.IO) {
-            repository.runBackupNow()
-            refreshDashboardAndCoverage(fetchRemoteQuota = true)
-        }
+        _actionFeedbackMessage.value = "Started foreground permanent backup sync..."
+        refreshDashboardAndCoverage(fetchRemoteQuota = false)
     }
 
     fun togglePauseAllTransfers() {
@@ -263,10 +388,33 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    fun inspectAllVersionsForFile(sourceFileIdentity: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            _selectedFileVersions.value = repository.getAllVersionsForFile(sourceFileIdentity)
+        }
+    }
+
+    fun dismissVersionsDialog() {
+        _selectedFileVersions.value = emptyList()
+    }
+
     fun restoreCloudFile(item: CloudBrowseItem) {
         viewModelScope.launch(Dispatchers.IO) {
-            _actionFeedbackMessage.value = "Downloading '${item.name}' from Google Drive..."
+            _actionFeedbackMessage.value = if (item.isFolder) {
+                "Downloading folder '${item.name}' recursively from Google Drive..."
+            } else {
+                "Downloading '${item.name}' from Google Drive..."
+            }
             val outcome = repository.restoreCloudBrowseItem(item)
+            _actionFeedbackMessage.value = outcome.message
+            refreshDashboardAndCoverage()
+        }
+    }
+
+    fun mirrorCloudFolderToPhone(item: CloudBrowseItem) {
+        viewModelScope.launch(Dispatchers.IO) {
+            _actionFeedbackMessage.value = "Mirroring folder '${item.name}' (One-Way Cloud -> Phone, Isolated from Backup)..."
+            val outcome = repository.mirrorCloudFolderToLocal(item)
             _actionFeedbackMessage.value = outcome.message
             refreshDashboardAndCoverage()
         }
@@ -290,7 +438,10 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
 
     fun previewCloudFileStream(item: CloudBrowseItem) {
         viewModelScope.launch(Dispatchers.IO) {
-            val snippet = repository.cloudFileOps.streamPreviewSnippet(item.driveFileId)
+            val snippet = repository.cloudFileOps.streamPreviewSnippet(
+                driveFileId = item.driveFileId,
+                workspaceMimeType = item.mimeType
+            )
             _previewSnippet.value = item.name to snippet
         }
     }

@@ -128,6 +128,12 @@ class InMemoryBackupDao : BackupDao {
             .maxByOrNull { it.backupVersion }
     }
 
+    override suspend fun getLatestVersionForAccountAndIdentity(accountId: String, identity: String): BackupFileEntity? {
+        return records.values
+            .filter { it.accountId == accountId && it.sourceFileIdentity == identity }
+            .maxByOrNull { it.backupVersion }
+    }
+
     override suspend fun getAllVersionsForIdentity(identity: String): List<BackupFileEntity> {
         return records.values
             .filter { it.sourceFileIdentity == identity }
@@ -140,6 +146,20 @@ class InMemoryBackupDao : BackupDao {
                 it.uploadStatus == UploadStatus.PENDING ||
                     it.uploadStatus == UploadStatus.PENDING_RETRY ||
                     it.uploadStatus == UploadStatus.IN_PROGRESS
+            }
+            .sortedBy { it.createdAtMs }
+            .drop(offset)
+            .take(limit)
+    }
+
+    override suspend fun getPendingRecordsForAccountPaged(accountId: String, limit: Int, offset: Int): List<BackupFileEntity> {
+        return records.values
+            .filter {
+                it.accountId == accountId && (
+                    it.uploadStatus == UploadStatus.PENDING ||
+                        it.uploadStatus == UploadStatus.PENDING_RETRY ||
+                        it.uploadStatus == UploadStatus.IN_PROGRESS
+                    )
             }
             .sortedBy { it.createdAtMs }
             .drop(offset)
@@ -1776,6 +1796,304 @@ class PermanentBackupEngineTest {
         )
         val job2 = dao.getSyncJobByRecordId(99L)!!
         assertEquals(60_000L, job2.nextRetryAtMs!! - job2.updatedAtMs)
+    }
+
+    // 25. Fast Metadata-First Incremental Scan: Skips SHA-256 Re-Computation When Size & Mtime Unchanged (Feature 2)
+    @Test
+    fun test25_fastMetadataFirstIncrementalScan_skipsHashRecomputationWhenUnchanged() = runTest {
+        installStandardDriveMockDispatcher()
+        val dcimDir = File(tempStorageDir, "DCIM").apply { mkdirs() }
+        val photoFile = File(dcimDir, "fast_scan.jpg").apply {
+            writeText("FAST_METADATA_FIRST_SCAN_PAYLOAD_V1")
+        }
+
+        val scanner = AndroidStorageScanner(null, listOf(tempStorageDir), true)
+        val engine = PermanentBackupEngine(dao, scanner, driveApiClient, authManager)
+        val settings = BackupSettings(userBackupConsentGranted = true)
+
+        // First scan computes hashes and uploads v1
+        val cycle1 = engine.runBackupCycle(settings)
+        assertEquals(1, cycle1.scannedFiles)
+        assertEquals(1, cycle1.uploadedAndVerifiedFiles)
+
+        val localEntity1 = dao.getLocalFileByIdentity("vol0:DCIM/fast_scan.jpg")
+        assertNotNull(localEntity1)
+        assertTrue(localEntity1!!.latestSha256.isNotBlank())
+
+        // Verify scanFilesSequence(computeHashes = false) returns blank hash without reading file bytes
+        val metadataOnlyItem = scanner.scanFilesSequence(computeHashes = false).single()
+        assertEquals("", metadataOnlyItem.sha256Hash)
+        assertEquals(photoFile.length(), metadataOnlyItem.fileSize)
+
+        // Second cycle reuses cached SHA-256/MD5 from LocalFileEntity when fileSize and lastModifiedMs match
+        val cycle2 = engine.runBackupCycle(settings)
+        assertEquals(1, cycle2.scannedFiles)
+        assertEquals(0, cycle2.newlyQueuedVersions)
+        assertEquals(1, cycle2.skippedUnchangedFiles)
+
+        // Modify file -> size & mtime change -> triggers hash recomputation and uploads v2 while preserving v1
+        photoFile.writeText("FAST_METADATA_FIRST_SCAN_PAYLOAD_V2_MODIFIED_LONGER")
+        photoFile.setLastModified(localEntity1.lastModifiedMs + 5000L)
+
+        val cycle3 = engine.runBackupCycle(settings)
+        assertEquals(1, cycle3.newlyQueuedVersions)
+        assertEquals(1, cycle3.uploadedAndVerifiedFiles)
+        val allVersions = dao.getAllVersionsForIdentity("vol0:DCIM/fast_scan.jpg")
+        assertEquals(2, allVersions.size)
+    }
+
+    // 26. Google Workspace Doc Export + Recursive Folder Restore + One-Way Mirror Isolation (Features 3, 4, 8, 10 & Rule 3)
+    @Test
+    fun test26_googleWorkspaceDocExport_andRecursiveFolderRestoreAndOneWayMirrorIsolation() = runTest {
+        mockWebServer.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                val path = request.path ?: ""
+                val method = request.method ?: "GET"
+
+                if (path.startsWith("/drive/v3/about")) {
+                    return MockResponse()
+                        .setResponseCode(200)
+                        .setBody("""{"storageQuota":{"limit":15000000000,"usage":1000000}}""")
+                }
+                if (method == "GET" && path.contains("/export?")) {
+                    return MockResponse()
+                        .setResponseCode(200)
+                        .setBody("EXPORTED_GOOGLE_DOC_PDF_CONTENT_2026")
+                }
+                if (method == "GET" && path.contains("alt=media")) {
+                    return MockResponse()
+                        .setResponseCode(200)
+                        .setBody("CLOUD_MIRRORED_FILE_BYTES_999")
+                }
+                if (method == "GET" && path.startsWith("/drive/v3/files?")) {
+                    val q = request.requestUrl?.queryParameter("q") ?: ""
+                    if (q.contains("'cloud_folder_project' in parents")) {
+                        return MockResponse().setResponseCode(200).setBody(
+                            """
+                            {
+                              "files": [
+                                {
+                                  "id": "gdoc_1",
+                                  "name": "Architecture Spec",
+                                  "mimeType": "application/vnd.google-apps.document",
+                                  "size": 0,
+                                  "modifiedTime": "2026-03-29T10:00:00.000Z",
+                                  "trashed": false,
+                                  "parents": ["cloud_folder_project"]
+                                },
+                                {
+                                  "id": "binary_2",
+                                  "name": "diagram.png",
+                                  "mimeType": "image/png",
+                                  "size": 29,
+                                  "modifiedTime": "2026-03-29T10:00:00.000Z",
+                                  "trashed": false,
+                                  "parents": ["cloud_folder_project"]
+                                }
+                              ]
+                            }
+                            """.trimIndent()
+                        )
+                    }
+                    return MockResponse().setResponseCode(200).setBody("""{"files":[]}""")
+                }
+                if (method == "POST" && path.startsWith("/drive/v3/files")) {
+                    return MockResponse().setResponseCode(200).setBody("""{"id":"folder_id_1"}""")
+                }
+                if (method == "POST" && path.startsWith("/upload/drive/v3/files?uploadType=resumable")) {
+                    val sessionUrl = mockWebServer.url("/upload/drive/v3/files?uploadType=resumable&upload_id=up_26").toString()
+                    return MockResponse().setResponseCode(200).addHeader("Location", sessionUrl)
+                }
+                if (method == "PUT" && path.contains("upload_id=up_26")) {
+                    return MockResponse().setResponseCode(200)
+                        .setBody("""{"id":"drive_up_26","name":"real_local.txt","size":15}""")
+                }
+                if (method == "GET" && path.startsWith("/drive/v3/files/drive_up_26")) {
+                    return MockResponse().setResponseCode(200)
+                        .setBody("""{"id":"drive_up_26","name":"real_local.txt","size":15,"trashed":false}""")
+                }
+                return MockResponse().setResponseCode(404)
+            }
+        }
+
+        val opsManager = CloudFileOperationsManager(
+            context = null,
+            backupDao = dao,
+            driveApiClient = driveApiClient,
+            authManager = authManager,
+            customStorageRoots = listOf(tempStorageDir)
+        )
+
+        val folderItem = CloudBrowseItem(
+            driveFileId = "cloud_folder_project",
+            name = "Engineering_Docs",
+            mimeType = DriveApiClient.DRIVE_FOLDER_MIME_TYPE,
+            sizeBytes = 0L,
+            modifiedTimeMs = 1700000000000L,
+            parentFolderId = "root",
+            isFolder = true,
+            webViewLink = null,
+            sha256Checksum = null,
+            md5Checksum = null,
+            pinnedOffline = false,
+            offlineLocalPath = null
+        )
+
+        // 1. Recursive Folder Restore (including Google Doc exported to .pdf)
+        val restoredCount = opsManager.restoreCloudFolderRecursively(folderItem)
+        assertEquals(2, restoredCount)
+        val restoredDir = File(tempStorageDir, "Download/Restored_From_Drive/Engineering_Docs")
+        assertTrue(File(restoredDir, "Architecture Spec.pdf").exists())
+        assertEquals("EXPORTED_GOOGLE_DOC_PDF_CONTENT_2026", File(restoredDir, "Architecture Spec.pdf").readText())
+        assertTrue(File(restoredDir, "diagram.png").exists())
+
+        // 2. One-Way Cloud-to-Local Folder Mirror into Download/Restored_From_Drive/Drive_Mirror/Engineering_Docs
+        val mirroredCount = opsManager.mirrorCloudFolderToLocal(folderItem)
+        assertEquals(2, mirroredCount)
+        val mirrorDir = File(tempStorageDir, "Download/Restored_From_Drive/Drive_Mirror/Engineering_Docs")
+        assertTrue(File(mirrorDir, "Architecture Spec.pdf").exists())
+        assertTrue(File(mirrorDir, "diagram.png").exists())
+
+        // 3. Rule 3 (Separation of Backup & Mirroring): Verify scanner strictly excludes Restored_From_Drive & Drive_Mirror
+        val docsDir = File(tempStorageDir, "Documents").apply { mkdirs() }
+        File(docsDir, "real_local.txt").writeText("REAL_LOCAL_FILE")
+
+        val scanner = AndroidStorageScanner(null, listOf(tempStorageDir), true)
+        val engine = PermanentBackupEngine(dao, scanner, driveApiClient, authManager)
+        val summary = engine.runBackupCycle(BackupSettings(userBackupConsentGranted = true))
+
+        // Only the 1 genuine local file in Documents is scanned/uploaded; the 4 restored/mirrored files are strictly ignored!
+        assertEquals(1, summary.scannedFiles)
+        assertEquals(1, summary.uploadedAndVerifiedFiles)
+        assertNotNull(dao.getLatestVersionForIdentity("vol0:Documents/real_local.txt"))
+    }
+
+    // 27. Parallel Upload Worker Pool + Per-Account Version Isolation (Features 7 & 9 & Rule 2)
+    @Test
+    fun test27_parallelUploadWorkerPool_andMultiAccountPerAccountVersionNumbering() = runTest {
+        installStandardDriveMockDispatcher()
+        val dcimDir = File(tempStorageDir, "DCIM").apply { mkdirs() }
+        File(dcimDir, "parallel_1.jpg").writeText("PARALLEL_FILE_1_BYTES")
+        File(dcimDir, "parallel_2.jpg").writeText("PARALLEL_FILE_2_BYTES")
+        File(dcimDir, "parallel_3.jpg").writeText("PARALLEL_FILE_3_BYTES")
+
+        val scanner = AndroidStorageScanner(null, listOf(tempStorageDir), true)
+        val engine = PermanentBackupEngine(dao, scanner, driveApiClient, authManager)
+
+        // 1. Alice runs backup with 3 parallel workers
+        authManager.onAccountAuthorized(
+            email = "alice@example.com",
+            displayName = "Alice",
+            accessToken = "alice_token",
+            refreshToken = "alice_refresh",
+            expiresInSeconds = 3600L
+        )
+        val aliceSummary = engine.runBackupCycle(
+            BackupSettings(userBackupConsentGranted = true, uploadConcurrency = 3, maxUploadSpeedKbps = 4096)
+        )
+        assertEquals(3, aliceSummary.uploadedAndVerifiedFiles)
+        val aliceRec1 = dao.getLatestVersionForAccountAndIdentity("alice@example.com", "vol0:DCIM/parallel_1.jpg")
+        assertNotNull(aliceRec1)
+        assertEquals(1, aliceRec1!!.backupVersion)
+
+        // 2. Switch to Bob -> Bob backs up the exact same files and gets his own v1 (not v2!)
+        authManager.switchGoogleAccount(
+            newEmail = "bob@example.com",
+            newDisplayName = "Bob",
+            newAccessToken = "bob_token",
+            newRefreshToken = "bob_refresh"
+        )
+        val bobSummary = engine.runBackupCycle(
+            BackupSettings(userBackupConsentGranted = true, uploadConcurrency = 3)
+        )
+        assertEquals(3, bobSummary.uploadedAndVerifiedFiles)
+        val bobRec1 = dao.getLatestVersionForAccountAndIdentity("bob@example.com", "vol0:DCIM/parallel_1.jpg")
+        assertNotNull(bobRec1)
+        assertEquals(1, bobRec1!!.backupVersion)
+        assertEquals("parallel_1.jpg", bobRec1.driveStoredName)
+    }
+
+    // 28. Cloud Pagination (nextPageToken) + Create Cloud Folder + Direct File Upload (Features 5, 8, 11)
+    @Test
+    fun test28_cloudPagination_directUriUpload_andCreateCloudFolder() = runTest {
+        mockWebServer.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                val path = request.path ?: ""
+                val method = request.method ?: "GET"
+
+                if (method == "GET" && path.startsWith("/drive/v3/files?")) {
+                    val pageToken = request.requestUrl?.queryParameter("pageToken")
+                    if (pageToken == null) {
+                        return MockResponse().setResponseCode(200).setBody(
+                            """
+                            {
+                              "nextPageToken": "page_2_token",
+                              "files": [
+                                {
+                                  "id": "cloud_page1_file",
+                                  "name": "Page1Doc.pdf",
+                                  "mimeType": "application/pdf",
+                                  "size": 1024,
+                                  "modifiedTime": "2026-03-29T10:00:00.000Z",
+                                  "trashed": false,
+                                  "parents": ["root"]
+                                }
+                              ]
+                            }
+                            """.trimIndent()
+                        )
+                    } else if (pageToken == "page_2_token") {
+                        return MockResponse().setResponseCode(200).setBody(
+                            """
+                            {
+                              "files": [
+                                {
+                                  "id": "cloud_page2_file",
+                                  "name": "Page2Sheet",
+                                  "mimeType": "application/vnd.google-apps.spreadsheet",
+                                  "size": 0,
+                                  "modifiedTime": "2026-03-29T11:00:00.000Z",
+                                  "trashed": false,
+                                  "parents": ["root"]
+                                }
+                              ]
+                            }
+                            """.trimIndent()
+                        )
+                    }
+                }
+                if (method == "POST" && path.startsWith("/drive/v3/files")) {
+                    return MockResponse().setResponseCode(200).setBody("""{"id":"created_folder_777","name":"New_Cloud_Folder"}""")
+                }
+                return MockResponse().setResponseCode(404)
+            }
+        }
+
+        val scanner = AndroidStorageScanner(null, listOf(tempStorageDir), true)
+        val repository = BackupRepository(
+            context = null,
+            backupDao = dao,
+            storageSource = scanner,
+            driveApiClient = driveApiClient,
+            authManager = authManager,
+            customSettingsPrefs = TestInMemorySharedPreferences()
+        )
+
+        // 1. Page 1 sets cloudNextPageToken = "page_2_token"
+        val page1 = repository.browseCloudDriveFiles(parentFolderId = "root", loadMore = false)
+        assertEquals(1, page1.size)
+        assertEquals("Page1Doc.pdf", page1.single().name)
+        assertEquals("page_2_token", repository.cloudNextPageToken.value)
+
+        // 2. Page 2 (loadMore = true) appends Page2Sheet and clears cloudNextPageToken
+        val combined = repository.browseCloudDriveFiles(parentFolderId = "root", loadMore = true)
+        assertEquals(2, combined.size)
+        assertEquals(null, repository.cloudNextPageToken.value)
+        assertTrue(combined.any { it.name == "Page2Sheet" && it.isGoogleWorkspaceDoc })
+
+        // 3. Create Cloud Folder in My Drive
+        val createdFolderId = repository.createCloudFolder("New_Cloud_Folder", "root")
+        assertEquals("created_folder_777", createdFolderId)
     }
 }
 

@@ -14,6 +14,7 @@ import com.permanentbackup.gdrive.data.remote.GoogleAuthManager
 import com.permanentbackup.gdrive.domain.model.ActiveUploadProgress
 import com.permanentbackup.gdrive.domain.model.AuthTokenExpiredException
 import com.permanentbackup.gdrive.domain.model.BackupSettings
+import com.permanentbackup.gdrive.domain.model.CloudBrowseItem
 import com.permanentbackup.gdrive.domain.model.DiscoveredSourceFile
 import com.permanentbackup.gdrive.domain.model.DriveBadRequestException
 import com.permanentbackup.gdrive.domain.model.DriveConflictException
@@ -29,13 +30,19 @@ import com.permanentbackup.gdrive.domain.model.UploadSessionExpiredException
 import com.permanentbackup.gdrive.domain.model.UploadStatus
 import com.permanentbackup.gdrive.domain.model.VerificationStatus
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import java.io.IOException
 import java.util.Collections
+import java.util.concurrent.atomic.AtomicInteger
 
 data class BackupCycleSummary(
     val scannedFiles: Int,
@@ -95,8 +102,15 @@ class PermanentBackupEngine(
     private val _latestQuotaInfo = MutableStateFlow(DriveQuotaInfo())
     val latestQuotaInfo: StateFlow<DriveQuotaInfo> = _latestQuotaInfo.asStateFlow()
 
+    /**
+     * Optional callback invoked during incremental cloud changes sync when a pinned offline file
+     * has been updated on Google Drive so the local offline cache is automatically refreshed.
+     */
+    var onPinnedCloudFileModified: (suspend (CloudBrowseItem) -> Unit)? = null
+
     private val pausedRecordIds: MutableSet<Long> = Collections.synchronizedSet(HashSet())
     private val cycleMutex = Mutex()
+    private val folderCreationMutex = Mutex()
     @Volatile
     private var activeCycleDeferred: CompletableDeferred<BackupCycleSummary>? = null
 
@@ -186,6 +200,7 @@ class PermanentBackupEngine(
 
     /**
      * Incremental Google Drive Changes API v3 sync across all available pages (Section 9).
+     * Automatically refreshes any pinned offline files that were modified on Google Drive.
      */
     suspend fun syncCloudChangesIncremental(): Int {
         if (!authManager.accountState.value.isConnected) return 0
@@ -208,6 +223,7 @@ class PermanentBackupEngine(
             var latestStartPageToken: String? = null
             var totalChanged = 0
             var pageCount = 0
+            val modifiedPinnedItems = mutableListOf<CloudBrowseItem>()
 
             while (!currentPageToken.isNullOrBlank() && pageCount < 10) {
                 pageCount++
@@ -219,6 +235,14 @@ class PermanentBackupEngine(
                 if (changesPage.changedFiles.isNotEmpty()) {
                     val entities = changesPage.changedFiles.map { item ->
                         val prev = backupDao.getCloudFileById(item.driveFileId)
+                        val isPinned = prev?.isPinnedOffline ?: false
+                        if (isPinned && !item.isFolder) {
+                            val modifiedChanged = item.modifiedTimeMs > 0L && item.modifiedTimeMs != prev?.modifiedTimeMs
+                            val checksumChanged = !item.md5Checksum.isNullOrBlank() && item.md5Checksum != prev?.md5Checksum
+                            if (modifiedChanged || checksumChanged) {
+                                modifiedPinnedItems.add(item.copy(pinnedOffline = true))
+                            }
+                        }
                         CloudFileEntity(
                             driveFileId = item.driveFileId,
                             accountId = accountId,
@@ -235,7 +259,7 @@ class PermanentBackupEngine(
                             webViewLink = item.webViewLink,
                             createdTimeMs = item.createdTimeMs,
                             modifiedTimeMs = item.modifiedTimeMs,
-                            isPinnedOffline = prev?.isPinnedOffline ?: false,
+                            isPinnedOffline = isPinned,
                             offlineLocalPath = prev?.offlineLocalPath,
                             offlineCachedBytes = prev?.offlineCachedBytes ?: 0L
                         )
@@ -261,6 +285,15 @@ class PermanentBackupEngine(
                     changesDetectedCount = existingTokenEntity.changesDetectedCount + totalChanged
                 )
             )
+
+            // Refresh any modified pinned offline files automatically
+            for (pinnedItem in modifiedPinnedItems) {
+                try {
+                    onPinnedCloudFileModified?.invoke(pinnedItem)
+                } catch (_: Throwable) {
+                }
+            }
+
             totalChanged
         } catch (_: Throwable) {
             0
@@ -334,13 +367,16 @@ class PermanentBackupEngine(
                 .filter { it.isNotBlank() }
                 .toSet()
 
-            // Step 2: Scan accessible folders in streaming sequence & evaluate deduplication/versioning
+            // Step 2: Fast Metadata-First Incremental Scan:
+            // Scan file metadata first (computeHashes = false); evaluateAndQueueDiscoveredFile reuses
+            // cached SHA-256/MD5 when (fileSize, lastModifiedMs) match LocalFileEntity, and only
+            // computes streaming hashes for new or modified files.
             var scannedCount = 0
             var newlyQueued = 0
             var skippedUnchanged = 0
             val discoveredIdentities = HashSet<String>(4096)
 
-            for (discovered in storageSource.scanFilesSequence(computeHashes = true)) {
+            for (discovered in storageSource.scanFilesSequence(computeHashes = false)) {
                 scannedCount++
                 discoveredIdentities.add(discovered.sourceFileIdentity)
 
@@ -363,7 +399,7 @@ class PermanentBackupEngine(
             // Step 3: Reconcile locally deleted files — NEVER delete from Google Drive!
             val preservedDeletedCount = reconcileLocallyDeletedFiles(discoveredIdentities)
 
-            // Step 4: Execute pending uploads if Google Account is connected
+            // Step 4: Execute pending uploads & incremental cloud changes sync if Google Account is connected
             if (!authManager.accountState.value.isConnected) {
                 return BackupCycleSummary(
                     scannedFiles = scannedCount,
@@ -377,6 +413,10 @@ class PermanentBackupEngine(
             }
 
             val uploadOutcome = processPendingUploadQueue(settings)
+
+            // Step 5: Poll Google Drive Changes API v3 incrementally & auto-refresh modified pinned offline files
+            syncCloudChangesIncremental()
+
             return BackupCycleSummary(
                 scannedFiles = scannedCount,
                 newlyQueuedVersions = newlyQueued,
@@ -395,19 +435,55 @@ class PermanentBackupEngine(
     }
 
     /**
-     * Evaluates a single discovered file against the Room database:
+     * Evaluates a single discovered file against the Room database with per-account isolation
+     * and metadata-first hash caching:
      * - Unchanged file (already backed up for the active account) -> skipped (returns false)
-     * - Unchanged file not yet backed up for the active account -> queued for active account (returns true)
-     * - New file -> queued as version 1 (returns true)
+     * - Unchanged file not yet backed up for the active account -> queued as v1 for active account (returns true)
+     * - New file -> queued as version 1 for active account (returns true)
      * - Modified file -> previous verified version preserved untouched; new version (N+1) queued (returns true)
      */
-    suspend fun evaluateAndQueueDiscoveredFile(discovered: DiscoveredSourceFile): Boolean {
+    suspend fun evaluateAndQueueDiscoveredFile(rawDiscovered: DiscoveredSourceFile): Boolean {
         val accountId = currentAccountId()
-        val latest = backupDao.getLatestVersionForIdentity(discovered.sourceFileIdentity)
 
-        if (latest == null) {
+        // Fast metadata-first hash resolution: reuse cached SHA-256/MD5 if file size & mtime are unchanged
+        val discovered = if (rawDiscovered.sha256Hash != null && rawDiscovered.md5Hash != null) {
+            rawDiscovered
+        } else {
+            val cachedLocal = backupDao.getLocalFileByIdentity(rawDiscovered.sourceFileIdentity)
+            if (cachedLocal != null &&
+                cachedLocal.localExists &&
+                cachedLocal.fileSize == rawDiscovered.fileSize &&
+                cachedLocal.lastModifiedMs == rawDiscovered.lastModifiedMs &&
+                !cachedLocal.latestSha256.isNullOrBlank() &&
+                !cachedLocal.latestMd5.isNullOrBlank()
+            ) {
+                rawDiscovered.copy(
+                    sha256Hash = cachedLocal.latestSha256,
+                    md5Hash = cachedLocal.latestMd5
+                )
+            } else if (rawDiscovered.fileSize <= 64L * 1024L * 1024L) {
+                try {
+                    val hashes = SourceFileReadOnlyGuard.computeStreamingHashes {
+                        storageSource.openInputStream(rawDiscovered.sourceUri)
+                    }
+                    rawDiscovered.copy(
+                        sha256Hash = hashes.sha256Hex,
+                        md5Hash = hashes.md5Hex
+                    )
+                } catch (_: Exception) {
+                    rawDiscovered
+                }
+            } else {
+                rawDiscovered
+            }
+        }
+
+        val latestForAccount = backupDao.getLatestVersionForAccountAndIdentity(accountId, discovered.sourceFileIdentity)
+
+        if (latestForAccount == null) {
             val recordId = backupDao.insertRecord(
                 BackupFileEntity(
+                    accountId = accountId,
                     sourceUri = discovered.sourceUri,
                     sourceFileIdentity = discovered.sourceFileIdentity,
                     relativePath = discovered.relativePath,
@@ -454,19 +530,19 @@ class PermanentBackupEngine(
             return true
         }
 
-        val isSameContent = isUnchangedFile(latest, discovered)
+        val isSameContent = isUnchangedFile(latestForAccount, discovered)
         val existingVersions = backupDao.getBackupVersionsForIdentity(discovered.sourceFileIdentity)
         val accountHasVerifiedBackup = existingVersions.isEmpty() ||
             existingVersions.any { it.accountId == accountId }
 
         if (isSameContent && accountHasVerifiedBackup) {
-            if (!latest.localExists) {
-                backupDao.updateRecord(latest.copy(localExists = true))
+            if (!latestForAccount.localExists || latestForAccount.accountId != accountId) {
+                backupDao.updateRecord(latestForAccount.copy(localExists = true, accountId = accountId))
             }
-            return latest.uploadStatus != UploadStatus.VERIFIED
+            return latestForAccount.uploadStatus != UploadStatus.VERIFIED
         }
 
-        val nextVersion = latest.backupVersion + 1
+        val nextVersion = if (isSameContent && !accountHasVerifiedBackup) 1 else latestForAccount.backupVersion + 1
         val isFirstBackupForThisAccount = isSameContent && !accountHasVerifiedBackup
         val versionedDriveName = if (isFirstBackupForThisAccount) {
             discovered.displayName
@@ -481,6 +557,7 @@ class PermanentBackupEngine(
 
         val recordId = backupDao.insertRecord(
             BackupFileEntity(
+                accountId = accountId,
                 sourceUri = discovered.sourceUri,
                 sourceFileIdentity = discovered.sourceFileIdentity,
                 relativePath = discovered.relativePath,
@@ -631,27 +708,59 @@ class PermanentBackupEngine(
             return 0 to 0
         }
 
+        val accountId = currentAccountId()
+        val concurrency = settings.uploadConcurrency.coerceIn(1, 4)
+
         while (!_isPaused.value) {
-            val batch = backupDao.getPendingRecordsPaged(limit = 50, offset = 0)
+            val batch = backupDao.getPendingRecordsForAccountPaged(accountId = accountId, limit = 50, offset = 0)
             if (batch.isEmpty()) break
 
-            var madeProgressInBatch = false
-            for (record in batch) {
-                if (_isPaused.value) break
-                if (record.id in pausedRecordIds) continue
+            if (concurrency <= 1) {
+                var madeProgressInBatch = false
+                for (record in batch) {
+                    if (_isPaused.value) break
+                    if (record.id in pausedRecordIds) continue
 
-                val success = uploadSingleRecordResumable(record, rootFolderId, settings)
-                if (success) {
-                    verifiedCount++
-                    madeProgressInBatch = true
-                } else if (!_isPaused.value && record.id !in pausedRecordIds) {
-                    failedCount++
-                    if (_quotaFullState.value) {
-                        return verifiedCount to failedCount
+                    val success = uploadSingleRecordResumable(record, rootFolderId, settings)
+                    if (success) {
+                        verifiedCount++
+                        madeProgressInBatch = true
+                    } else if (!_isPaused.value && record.id !in pausedRecordIds) {
+                        failedCount++
+                        if (_quotaFullState.value) {
+                            return verifiedCount to failedCount
+                        }
                     }
                 }
+                if (!madeProgressInBatch) break
+            } else {
+                val semaphore = Semaphore(concurrency)
+                val batchVerified = AtomicInteger(0)
+                val batchFailed = AtomicInteger(0)
+                val eligibleRecords = batch.filter { it.id !in pausedRecordIds }
+                if (eligibleRecords.isEmpty()) break
+
+                coroutineScope {
+                    eligibleRecords.map { record ->
+                        async {
+                            semaphore.withPermit {
+                                if (_isPaused.value || _quotaFullState.value || record.id in pausedRecordIds) {
+                                    return@withPermit
+                                }
+                                val success = uploadSingleRecordResumable(record, rootFolderId, settings)
+                                if (success) {
+                                    batchVerified.incrementAndGet()
+                                } else if (!_isPaused.value && record.id !in pausedRecordIds) {
+                                    batchFailed.incrementAndGet()
+                                }
+                            }
+                        }
+                    }.awaitAll()
+                }
+                verifiedCount += batchVerified.get()
+                failedCount += batchFailed.get()
+                if (_quotaFullState.value || batchVerified.get() == 0) break
             }
-            if (!madeProgressInBatch) break
         }
 
         return verifiedCount to failedCount
@@ -874,7 +983,8 @@ class PermanentBackupEngine(
                         chunkStartByte = 0L,
                         chunkLength = 0,
                         totalBytes = 0L,
-                        mimeType = record.mimeType
+                        mimeType = record.mimeType,
+                        maxUploadSpeedKbps = settings.maxUploadSpeedKbps
                     )
                     completedDriveFileId = emptyResult.driveFileId
                 } else {
@@ -934,7 +1044,8 @@ class PermanentBackupEngine(
                             chunkStartByte = currentOffset,
                             chunkLength = nextChunkLen,
                             totalBytes = record.fileSize,
-                            mimeType = record.mimeType
+                            mimeType = record.mimeType,
+                            maxUploadSpeedKbps = settings.maxUploadSpeedKbps
                         )
 
                         currentOffset = chunkResult.confirmedUploadedBytes
@@ -1377,54 +1488,56 @@ class PermanentBackupEngine(
         val parentPath = normalized.substringBeforeLast('/', "")
         if (parentPath.isBlank()) return rootFolderId
 
-        val accountPrefix = currentAccountId()
-        val scopedParentKey = "$accountPrefix:$parentPath"
-        backupDao.getCachedDriveFolder(scopedParentKey)?.let { return it.driveFolderId }
-        // Fallback check for legacy unscoped key when on default account
-        backupDao.getCachedDriveFolder(parentPath)?.let {
-            if (it.parentDriveFolderId == rootFolderId || parentPath.contains('/')) {
-                return it.driveFolderId
+        return folderCreationMutex.withLock {
+            val accountPrefix = currentAccountId()
+            val scopedParentKey = "$accountPrefix:$parentPath"
+            backupDao.getCachedDriveFolder(scopedParentKey)?.let { return@withLock it.driveFolderId }
+            // Fallback check for legacy unscoped key when on default account
+            backupDao.getCachedDriveFolder(parentPath)?.let {
+                if (it.parentDriveFolderId == rootFolderId || parentPath.contains('/')) {
+                    return@withLock it.driveFolderId
+                }
             }
-        }
 
-        val segments = parentPath.split('/').filter { it.isNotBlank() }
-        var currentParentId = rootFolderId
-        val pathBuilder = StringBuilder()
+            val segments = parentPath.split('/').filter { it.isNotBlank() }
+            var currentParentId = rootFolderId
+            val pathBuilder = StringBuilder()
 
-        for (segment in segments) {
-            if (pathBuilder.isNotEmpty()) pathBuilder.append('/')
-            pathBuilder.append(segment)
-            val partialPath = pathBuilder.toString()
-            val scopedKey = "$accountPrefix:$partialPath"
+            for (segment in segments) {
+                if (pathBuilder.isNotEmpty()) pathBuilder.append('/')
+                pathBuilder.append(segment)
+                val partialPath = pathBuilder.toString()
+                val scopedKey = "$accountPrefix:$partialPath"
 
-            val cached = backupDao.getCachedDriveFolder(scopedKey)
-            if (cached != null) {
-                currentParentId = cached.driveFolderId
-            } else {
-                val folderId = driveApiClient.ensureFolderExists(
-                    accessToken = accessToken,
-                    folderName = segment,
-                    parentFolderId = currentParentId
-                )
-                val entity = DriveFolderCacheEntity(
-                    relativePath = scopedKey,
-                    driveFolderId = folderId,
-                    parentDriveFolderId = currentParentId
-                )
-                backupDao.cacheDriveFolder(entity)
-                // Also cache unscoped relativePath for backward-compatible test assertions
-                backupDao.cacheDriveFolder(
-                    DriveFolderCacheEntity(
-                        relativePath = partialPath,
+                val cached = backupDao.getCachedDriveFolder(scopedKey)
+                if (cached != null) {
+                    currentParentId = cached.driveFolderId
+                } else {
+                    val folderId = driveApiClient.ensureFolderExists(
+                        accessToken = accessToken,
+                        folderName = segment,
+                        parentFolderId = currentParentId
+                    )
+                    val entity = DriveFolderCacheEntity(
+                        relativePath = scopedKey,
                         driveFolderId = folderId,
                         parentDriveFolderId = currentParentId
                     )
-                )
-                currentParentId = folderId
+                    backupDao.cacheDriveFolder(entity)
+                    // Also cache unscoped relativePath for backward-compatible test assertions
+                    backupDao.cacheDriveFolder(
+                        DriveFolderCacheEntity(
+                            relativePath = partialPath,
+                            driveFolderId = folderId,
+                            parentDriveFolderId = currentParentId
+                        )
+                    )
+                    currentParentId = folderId
+                }
             }
-        }
 
-        return currentParentId
+            currentParentId
+        }
     }
 
     private fun currentAccountId(): String {

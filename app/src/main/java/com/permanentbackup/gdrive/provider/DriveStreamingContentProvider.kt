@@ -36,12 +36,29 @@ class DriveStreamingContentProvider : ContentProvider() {
                 .appendQueryParameter("size", sizeBytes.toString())
                 .build()
         }
+
+        fun buildOfflineFileUri(localFileName: String, displayName: String, mimeType: String, sizeBytes: Long): Uri {
+            return Uri.Builder()
+                .scheme("content")
+                .authority(AUTHORITY)
+                .appendPath("offline")
+                .appendPath(localFileName)
+                .appendQueryParameter("name", displayName)
+                .appendQueryParameter("mime", mimeType)
+                .appendQueryParameter("size", sizeBytes.toString())
+                .build()
+        }
     }
 
     override fun onCreate(): Boolean = true
 
     override fun getType(uri: Uri): String {
-        return uri.getQueryParameter("mime") ?: "application/octet-stream"
+        val rawMime = uri.getQueryParameter("mime") ?: "application/octet-stream"
+        return if (rawMime.startsWith("application/vnd.google-apps.") && rawMime != "application/vnd.google-apps.folder") {
+            "application/pdf"
+        } else {
+            rawMime
+        }
     }
 
     override fun query(
@@ -70,22 +87,59 @@ class DriveStreamingContentProvider : ContentProvider() {
         if (mode != "r") {
             throw SecurityException("DriveStreamingContentProvider is strictly read-only (mode '$mode' forbidden)")
         }
-        val driveFileId = uri.lastPathSegment
-            ?: throw FileNotFoundException("Missing Google Drive file ID in stream URI: $uri")
+        val pathSegments = uri.pathSegments
+        val isOfflineRoute = pathSegments.firstOrNull() == "offline"
+        val targetId = uri.lastPathSegment
+            ?: throw FileNotFoundException("Missing file identifier in URI: $uri")
+
         val app = context?.applicationContext as? PermanentBackupApp
-            ?: throw FileNotFoundException("Application context unavailable for streaming")
+
+        // 1. Check DB-recorded offlineLocalPath first for seekable ParcelFileDescriptor
+        if (app != null) {
+            val dbPinnedPath = kotlinx.coroutines.runBlocking {
+                app.database.backupDao().getCloudFileById(targetId)?.offlineLocalPath
+            }
+            if (!dbPinnedPath.isNullOrBlank()) {
+                val dbFile = java.io.File(dbPinnedPath)
+                if (dbFile.exists() && dbFile.isFile) {
+                    return ParcelFileDescriptor.open(dbFile, ParcelFileDescriptor.MODE_READ_ONLY)
+                }
+            }
+        }
+
+        // 2. Fallback check in cacheDir and filesDir offline_pinned_drive_cache
+        val candidateDirs = listOfNotNull(
+            context?.cacheDir?.resolve("offline_pinned_drive_cache"),
+            context?.filesDir?.resolve("offline_pinned_drive_cache")
+        )
+        for (cacheDir in candidateDirs) {
+            if (cacheDir.exists()) {
+                val found = cacheDir.walkTopDown().firstOrNull { f ->
+                    f.isFile && (if (isOfflineRoute) f.name == targetId else f.name.startsWith("${targetId}_"))
+                }
+                if (found != null) {
+                    return ParcelFileDescriptor.open(found, ParcelFileDescriptor.MODE_READ_ONLY)
+                }
+            }
+        }
+
+        if (app == null) {
+            throw FileNotFoundException("Application context unavailable for streaming")
+        }
 
         val pipe = ParcelFileDescriptor.createPipe()
         val readSide = pipe[0]
         val writeSide = pipe[1]
+        val rawMime = uri.getQueryParameter("mime")
 
-        thread(name = "DriveCloudStream-$driveFileId", isDaemon = true) {
+        thread(name = "DriveCloudStream-$targetId", isDaemon = true) {
             ParcelFileDescriptor.AutoCloseOutputStream(writeSide).use { outStream ->
                 try {
                     val token = app.repository.authManager.getValidAccessToken()
                     app.repository.driveApiClient.openCloudStream(
                         accessToken = token,
-                        driveFileId = driveFileId
+                        driveFileId = targetId,
+                        workspaceMimeType = rawMime
                     ).use { cloudIn ->
                         val buffer = ByteArray(DriveApiClient.STREAM_BUFFER_SIZE_BYTES)
                         while (true) {

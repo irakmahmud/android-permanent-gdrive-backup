@@ -16,7 +16,8 @@ import com.permanentbackup.gdrive.domain.model.VerificationStatus
 @Entity(
     tableName = "backup_file_records",
     indices = [
-        Index(value = ["sourceFileIdentity", "backupVersion"], unique = true),
+        Index(value = ["accountId", "sourceFileIdentity", "backupVersion"], unique = true),
+        Index(value = ["accountId"]),
         Index(value = ["sourceUri"]),
         Index(value = ["uploadStatus"]),
         Index(value = ["sha256Hash"]),
@@ -26,6 +27,7 @@ import com.permanentbackup.gdrive.domain.model.VerificationStatus
 data class BackupFileEntity(
     @PrimaryKey(autoGenerate = true)
     val id: Long = 0L,
+    val accountId: String = "default_account",
     val sourceUri: String,
     val sourceFileIdentity: String,
     val relativePath: String,
@@ -357,6 +359,7 @@ data class AppSettingsEntity(
     val chunkSizeBytes: Int = 256 * 1024,
     val offlineCacheBudgetBytes: Long = 100L * 1024 * 1024,
     val backgroundSyncPaused: Boolean = false,
+    val maxUploadSpeedKbps: Int = 0,
     val activeAccountId: String? = null,
     val updatedAtMs: Long = System.currentTimeMillis()
 )

@@ -67,6 +67,7 @@ class MainActivity : ComponentActivity() {
     @OptIn(ExperimentalMaterial3Api::class)
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        handleIncomingShareIntent(intent)
 
         setContent {
             PermanentBackupTheme {
@@ -79,9 +80,12 @@ class MainActivity : ComponentActivity() {
                 val verifiedHistory by viewModel.verifiedHistory.collectAsState()
                 val recentRecords by viewModel.recentRecords.collectAsState()
                 val recentSyncEvents by viewModel.recentSyncEvents.collectAsState()
+                val syncJobs by viewModel.syncJobs.collectAsState()
+                val unresolvedFailures by viewModel.unresolvedFailures.collectAsState()
                 val failedUploads by viewModel.failedUploads.collectAsState()
                 val folderCoverage by viewModel.folderCoverage.collectAsState()
                 val cloudDriveItems by viewModel.cloudDriveItems.collectAsState()
+                val cloudNextPageToken by viewModel.cloudNextPageToken.collectAsState()
                 val driveFilter by viewModel.driveFilter.collectAsState()
                 val driveSortOrder by viewModel.driveSortOrder.collectAsState()
                 val driveBreadcrumbs by viewModel.driveFolderBreadcrumbs.collectAsState()
@@ -96,16 +100,38 @@ class MainActivity : ComponentActivity() {
                 val signInFeedbackMessage by viewModel.signInStatusMessage.collectAsState()
                 val actionFeedbackMessage by viewModel.actionFeedbackMessage.collectAsState()
                 val previewSnippet by viewModel.previewSnippet.collectAsState()
+                val selectedFileVersions by viewModel.selectedFileVersions.collectAsState()
 
                 val safTreeLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.OpenDocumentTree()
                 ) { treeUri: Uri? ->
                     if (treeUri != null) {
-                        contentResolver.takePersistableUriPermission(
-                            treeUri,
-                            Intent.FLAG_GRANT_READ_URI_PERMISSION
-                        )
-                        viewModel.refreshDashboardAndCoverage()
+                        try {
+                            contentResolver.takePersistableUriPermission(
+                                treeUri,
+                                Intent.FLAG_GRANT_READ_URI_PERMISSION
+                            )
+                        } catch (_: Throwable) {
+                        }
+                        viewModel.onSafFolderGranted(treeUri)
+                    }
+                }
+
+                val directFileUploadLauncher = rememberLauncherForActivityResult(
+                    contract = ActivityResultContracts.OpenMultipleDocuments()
+                ) { uris: List<Uri> ->
+                    if (uris.isNotEmpty()) {
+                        uris.forEach { u ->
+                            try {
+                                contentResolver.takePersistableUriPermission(
+                                    u,
+                                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                                )
+                            } catch (_: Throwable) {
+                            }
+                        }
+                        val targetFolder = driveBreadcrumbs.lastOrNull()?.second ?: "Direct_Uploads"
+                        viewModel.uploadDirectUrisToDrive(uris, targetFolder)
                     }
                 }
 
@@ -285,6 +311,7 @@ class MainActivity : ComponentActivity() {
                                 searchQuery = driveSearchQuery,
                                 isGridView = isDriveGridView,
                                 previewSnippet = previewSnippet,
+                                hasNextPage = !cloudNextPageToken.isNullOrBlank(),
                                 onSelectFilter = { viewModel.setDriveFilter(it) },
                                 onSelectSort = { viewModel.setDriveSortOrder(it) },
                                 onSearchQueryChange = { viewModel.setDriveSearchQuery(it) },
@@ -295,8 +322,12 @@ class MainActivity : ComponentActivity() {
                                 onDismissPreview = { viewModel.dismissPreviewDialog() },
                                 onStreamOpenExternal = { openCloudStreamWithSupportedApp(it) },
                                 onDownloadRestoreFile = { viewModel.restoreCloudFile(it) },
+                                onMirrorFolderToPhone = { viewModel.mirrorCloudFolderToPhone(it) },
                                 onTogglePinOffline = { viewModel.toggleCloudFileOfflinePin(it) },
                                 onShareFileLink = { shareCloudFileLink(it) },
+                                onCreateFolder = { viewModel.createNewCloudFolder(it) },
+                                onUploadDirectFiles = { directFileUploadLauncher.launch(arrayOf("*/*")) },
+                                onLoadMore = { viewModel.loadMoreCloudDriveFiles() },
                                 onRequestFullDriveReadScope = authorizeAdditionalDriveReadScope,
                                 onRefresh = { viewModel.refreshCloudDriveExplorer() }
                             )
@@ -314,6 +345,9 @@ class MainActivity : ComponentActivity() {
                                 onToggleFolderBackup = { item, enabled ->
                                     viewModel.toggleFolderBackup(item, enabled)
                                 },
+                                onToggleSubfolderAutoBackup = { item, enabled ->
+                                    viewModel.toggleLocalSubfolderAutoBackup(item, enabled)
+                                },
                                 onBackupSingleFile = { item ->
                                     viewModel.backupSingleLocalFile(item)
                                 }
@@ -321,6 +355,9 @@ class MainActivity : ComponentActivity() {
                             AppScreen.BACKUPS -> BackupVersionHistoryScreen(
                                 verifiedHistory = verifiedHistory,
                                 actionFeedback = actionFeedbackMessage,
+                                selectedFileVersions = selectedFileVersions,
+                                onInspectAllVersions = { viewModel.inspectAllVersionsForFile(it) },
+                                onDismissVersionsDialog = { viewModel.dismissVersionsDialog() },
                                 onRestoreVersion = { viewModel.restoreBackupVersion(it) }
                             )
                             AppScreen.RECENT -> RecentActivityScreen(
@@ -333,6 +370,8 @@ class MainActivity : ComponentActivity() {
                                 settings = settings,
                                 activeQueue = activeQueue,
                                 failedList = failedUploads,
+                                syncJobs = syncJobs,
+                                unresolvedFailures = unresolvedFailures,
                                 onTriggerBackup = { viewModel.triggerManualBackupNow() },
                                 onTogglePauseAll = { viewModel.togglePauseAllTransfers() },
                                 onPauseResumeSingle = { id, pause -> viewModel.togglePauseSingleRecord(id, pause) },
@@ -343,6 +382,7 @@ class MainActivity : ComponentActivity() {
                                 pinnedFiles = pinnedOfflineFiles,
                                 usedBytes = summary.offlineCacheUsedBytes,
                                 budgetBytes = summary.offlineCacheBudgetBytes,
+                                onOpenOfflineFile = { openOfflinePinnedFileWithSupportedApp(it) },
                                 onUnpinFile = { viewModel.unpinOfflineEntity(it) }
                             )
                             AppScreen.SETTINGS -> SettingsScreen(
@@ -370,6 +410,36 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIncomingShareIntent(intent)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun handleIncomingShareIntent(intent: Intent?) {
+        val action = intent?.action ?: return
+        if (action == Intent.ACTION_SEND) {
+            val sharedUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+            } else {
+                intent.getParcelableExtra(Intent.EXTRA_STREAM)
+            }
+            if (sharedUri != null) {
+                viewModel.uploadDirectUrisToDrive(listOf(sharedUri), "Shared_To_Drive")
+            }
+        } else if (action == Intent.ACTION_SEND_MULTIPLE) {
+            val sharedUris = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri::class.java)
+            } else {
+                intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM)
+            }
+            if (!sharedUris.isNullOrEmpty()) {
+                viewModel.uploadDirectUrisToDrive(sharedUris, "Shared_To_Drive")
+            }
+        }
+    }
+
     private fun openCloudStreamWithSupportedApp(item: CloudBrowseItem) {
         try {
             val streamUri = DriveStreamingContentProvider.buildStreamUri(
@@ -378,11 +448,34 @@ class MainActivity : ComponentActivity() {
                 mimeType = item.mimeType,
                 sizeBytes = item.sizeBytes
             )
+            val resolvedMime = if (item.isGoogleWorkspaceDoc) "application/pdf" else item.mimeType
             val viewIntent = Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(streamUri, item.mimeType)
+                setDataAndType(streamUri, resolvedMime)
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
             startActivity(Intent.createChooser(viewIntent, "Open Stream: ${item.name}"))
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun openOfflinePinnedFileWithSupportedApp(entity: com.permanentbackup.gdrive.data.local.CloudFileEntity) {
+        try {
+            val streamUri = DriveStreamingContentProvider.buildStreamUri(
+                driveFileId = entity.driveFileId,
+                displayName = entity.name,
+                mimeType = entity.mimeType,
+                sizeBytes = entity.offlineCachedBytes
+            )
+            val resolvedMime = if (entity.mimeType.startsWith("application/vnd.google-apps.")) {
+                "application/pdf"
+            } else {
+                entity.mimeType
+            }
+            val viewIntent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(streamUri, resolvedMime)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(Intent.createChooser(viewIntent, "Open Offline File: ${entity.name}"))
         } catch (_: Throwable) {
         }
     }

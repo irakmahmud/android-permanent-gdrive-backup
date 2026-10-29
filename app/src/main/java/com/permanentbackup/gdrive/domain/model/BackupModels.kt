@@ -149,7 +149,8 @@ data class BackupSettings(
     val periodicIntervalHours: Int = 6,
     val chunkSizeBytes: Int = 256 * 1024, // 256 KiB multiple required by Google Drive Resumable Upload API
     val offlineCacheBudgetBytes: Long = 100L * 1024 * 1024, // Default low-storage 100 MB offline budget
-    val backgroundSyncPaused: Boolean = false
+    val backgroundSyncPaused: Boolean = false,
+    val maxUploadSpeedKbps: Int = 0 // 0 = Unlimited bandwidth
 )
 
 data class FolderCoverageItem(
@@ -207,7 +208,14 @@ data class CloudBrowseItem(
     val modifiedTimeMs: Long = 0L,
     val isPinnedOffline: Boolean = false,
     val offlineLocalPath: String? = null
-)
+) {
+    val isGoogleWorkspaceDoc: Boolean
+        get() = mimeType.startsWith("application/vnd.google-apps.") &&
+            !isFolder &&
+            mimeType != "application/vnd.google-apps.shortcut" &&
+            mimeType != "application/vnd.google-apps.form" &&
+            mimeType != "application/vnd.google-apps.map"
+}
 
 data class LocalBrowseItem(
     val absolutePath: String,

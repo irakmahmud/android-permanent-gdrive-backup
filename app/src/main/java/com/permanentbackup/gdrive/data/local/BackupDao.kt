@@ -47,6 +47,17 @@ interface BackupDao {
         """
         SELECT * FROM backup_file_records 
         WHERE sourceFileIdentity = :identity 
+          AND (accountId = :accountId OR accountId = 'default_account')
+        ORDER BY backupVersion DESC 
+        LIMIT 1
+        """
+    )
+    suspend fun getLatestVersionForAccountAndIdentity(accountId: String, identity: String): BackupFileEntity?
+
+    @Query(
+        """
+        SELECT * FROM backup_file_records 
+        WHERE sourceFileIdentity = :identity 
         ORDER BY backupVersion DESC
         """
     )
@@ -61,6 +72,17 @@ interface BackupDao {
         """
     )
     suspend fun getPendingRecordsPaged(limit: Int, offset: Int): List<BackupFileEntity>
+
+    @Query(
+        """
+        SELECT * FROM backup_file_records 
+        WHERE uploadStatus IN ('PENDING', 'PENDING_RETRY', 'IN_PROGRESS') 
+          AND (accountId = :accountId OR accountId = 'default_account')
+        ORDER BY createdAtMs ASC 
+        LIMIT :limit OFFSET :offset
+        """
+    )
+    suspend fun getPendingRecordsForAccountPaged(accountId: String, limit: Int, offset: Int): List<BackupFileEntity>
 
     @Query(
         """

@@ -1,4 +1,4 @@
-name: Remote Cloud Android Build & Verification (Permanent Drive v2.1.0)
+name: Remote Cloud Android Build & Verification (Permanent Drive v2.2.0)
 
 on:
   push:
@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   remote-android-apk-build:
-    name: Remote Cloud Build, Lint, 24 Unit/Integration Tests, Secret Scan & v2.1.0 Release
+    name: Remote Cloud Build, Lint, 28 Unit/Integration Tests, Secret Scan & v2.2.0 Release
     runs-on: ubuntu-latest
     env:
       CLOUD_BRIDGE_PAYLOAD: ${{ secrets.CLOUD_BRIDGE_PAYLOAD }}
@@ -42,7 +42,7 @@ jobs:
         run: |
           ./gradlew :app:lintDebug --no-daemon
 
-      - name: "Stage 8, 9 & 10: Execute 24 Unit, Integration & 3-Layer Never-Delete Policy Tests"
+      - name: "Stage 8, 9 & 10: Execute 28 Unit, Integration & 3-Layer Never-Delete Policy Tests"
         run: |
           ./gradlew :app:testDebugUnitTest --info --no-daemon
 
@@ -75,7 +75,7 @@ jobs:
       - name: "Stage 14a: Upload Downloadable APK & Reports Artifact"
         uses: actions/upload-artifact@v4
         with:
-          name: Permanent-Drive-v2.1.0-Debug-APK
+          name: Permanent-Drive-v2.2.0-Debug-APK
           path: |
             app/build/outputs/apk/debug/app-debug.apk
             app/build/outputs/apk/debug/app-debug.apk.sha256
@@ -83,17 +83,26 @@ jobs:
             app/build/reports/tests/testDebugUnitTest/
             app/build/reports/lint-results-debug.html
 
-      - name: "Stage 14b: Publish Direct Downloadable APK to GitHub Releases (v2.1.0)"
+      - name: "Stage 14b: Publish Direct Downloadable APK to GitHub Releases (v2.2.0)"
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.1.0
-          name: "Permanent Drive v2.1.0 — Fixed Native Account Authorization & Instant Cloud Drive Connection"
+          tag_name: v2.2.0
+          name: "Permanent Drive v2.2.0 — Complete 11-Feature Google Drive Desktop Parity with 3-Rule Zero-Deletion Safety"
           body: |
-            Automated Remote Cloud Build of **Permanent Drive v2.1.0** (`com.permanentbackup.gdrive`, `versionCode = 6`).
-            - **Fixed Stuck Authorization (`Authorizing Google Drive access for irakiroan@gmail.com...`)**: Resolved the `completeNativeConsentResult` callback loop and added automatic 3-tier authorization fallback (`AuthorizationClient` -> `GoogleAuthUtil` -> `CloudDriveBridge`) so selecting any Google Account in the Native Android Account Picker authorizes immediately without getting stuck on `Status: Disconnected`.
-            - **Instant Auto-Connect & Persistent Session**: Automatically connects and verifies `Android_Permanent_Backup` root folder and 5.00 TB storage quota on startup and after account selection.
-            - **9-Screen Google Drive Desktop Alternative**: Home, My Drive Explorer, Local Phone Explorer, Backups, Recent, Transfers, Offline Cache, Settings, and Accounts.
-            - **3-Layer Immutable Never-Delete Policy**: Enforced in `PermanentBackupEngine`, `NeverDeleteGuardInterceptor`, and 24 automated JUnit/MockWebServer tests.
+            Automated Remote Cloud Build of **Permanent Drive v2.2.0** (`com.permanentbackup.gdrive`, `versionCode = 7`).
+            - **11 Desktop Parity Features Implemented**:
+              1. Read-Only SAF `DocumentsProvider` (`PermanentDriveDocumentsProvider`) & Seekable Local Descriptor in `DriveStreamingContentProvider` + Open File in External App.
+              2. Real-Time File Watcher (`LocalStorageFileObserverManager` + WorkManager `ContentUriTrigger`) & Fast Metadata-First Incremental Scan (`computeHashes = false` when size + mtime match).
+              3. Custom SAF Folder Persistence (`registerPersistedSafFolder`), Per-Folder Auto-Backup Toggle in Local Explorer, & Removable SD Card Root Switching.
+              4. Automatic Background Incremental Cloud Changes Sync (`syncCloudChangesIncremental`), Auto-Refresh of Modified Pinned Offline Files, & One-Way Cloud-to-Local Folder Mirror (`Drive_Mirror`) Strictly Isolated from Backup.
+              5. System-Wide `"Save to Permanent Drive"` Share Sheet Receiver (`ACTION_SEND` / `ACTION_SEND_MULTIPLE`), Direct File Upload (`+ Upload`), & Cloud Folder Creation (`+ Folder`).
+              6. Rich Live Progress Notification (`PermanentBackupForegroundService`) with Active File, %, Speed, ETA, and `Pause`/`Resume`/`Stop` Actions + Fixed Duplicate Manual Backup Trigger.
+              7. Parallel Upload Worker Pool (`Semaphore(uploadConcurrency)`) + Optional Bandwidth Rate-Limiting (`maxUploadSpeedKbps`) + Interactive Settings Controls.
+              8. Google Workspace Docs/Sheets/Slides `/export` Support (PDF/DOCX/XLSX/PPTX) + `nextPageToken` Cloud Pagination (`Load More`) + Filter/Folder-Aware Offline Browsing.
+              9. Multi-Account Per-Account Version Isolation (`accountId` in `backup_file_records` + Room Migration v2->v3).
+              10. Recursive Folder Restore/Download & Recursive Folder Offline Pinning in `My Drive`.
+              11. Live Transactional `SyncJobState` & Unresolved HTTP Error Diagnostics in Transfers Screen.
+            - **3 Core Rules Strictly Enforced**: Zero Deletion, Immutable Version Preservation (`v1`, `v2`, ...), and Strict Separation of Backup vs Cloud-to-Local Mirroring (`Restored_From_Drive` / `Drive_Mirror` excluded from local scanner).
           files: |
             app/build/outputs/apk/debug/app-debug.apk
             app/build/outputs/apk/debug/app-debug.apk.sha256
