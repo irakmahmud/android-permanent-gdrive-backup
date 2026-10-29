@@ -117,8 +117,8 @@ class BackupRepository(
         // 2. Restore persisted SAF Tree URIs into storageSource so custom SAF folders are scanned
         val savedPerms = backupDao.getAllStoragePermissions()
         for (perm in savedPerms) {
-            if (perm.isGranted && !perm.grantedUri.isNullOrBlank()) {
-                storageSource.registerPersistedSafTreeUri(perm.grantedUri)
+            if (perm.granted && !perm.persistedTreeUri.isNullOrBlank()) {
+                storageSource.registerPersistedSafTreeUri(perm.persistedTreeUri)
             }
         }
 
@@ -222,11 +222,12 @@ class BackupRepository(
         val permKey = "SAF_TREE:${treeUriString.hashCode()}"
         backupDao.upsertStoragePermission(
             StoragePermissionEntity(
-                permissionType = permKey,
-                isGranted = true,
-                grantedUri = treeUriString,
-                persistedSafTree = true,
-                diagnosticMessage = "Persisted SAF Directory Tree ($label)"
+                permissionKey = permKey,
+                granted = true,
+                scopeType = "SAF_TREE",
+                persistedTreeUri = treeUriString,
+                androidSdkLevel = android.os.Build.VERSION.SDK_INT,
+                statusExplanation = "Persisted SAF Directory Tree ($label)"
             )
         )
         val accountId = currentAccountId()
@@ -236,7 +237,6 @@ class BackupRepository(
                 accountId = accountId,
                 folderName = label,
                 relativePath = "SAF/$label",
-                safTreeUri = treeUriString,
                 backupEnabled = true,
                 isProtectedAndroidFolder = false,
                 accessStatus = FolderAccessStatus.ACCESSIBLE.name
@@ -323,7 +323,7 @@ class BackupRepository(
                 }
                 else -> null
             }
-            val page = driveApiClient.browseCloudDriveFiles(
+            val page = driveApiClient.listDriveFiles(
                 accessToken = token,
                 accountId = accountId,
                 filter = filter,
@@ -335,27 +335,30 @@ class BackupRepository(
             _cloudNextPageToken.value = page.nextPageToken
 
             // Persist in CloudFileEntity while preserving existing offline pin flags
-            val entities = page.files.map { item ->
+            val entities = ArrayList<CloudFileEntity>(page.files.size)
+            for (item in page.files) {
                 val existing = backupDao.getCloudFileById(item.driveFileId)
-                CloudFileEntity(
-                    driveFileId = item.driveFileId,
-                    accountId = accountId,
-                    name = item.name,
-                    mimeType = item.mimeType,
-                    sizeBytes = item.sizeBytes,
-                    md5Checksum = item.md5Checksum,
-                    sha256Checksum = item.sha256Checksum,
-                    parentFolderId = item.parentFolderId ?: effectiveParent,
-                    isFolder = item.isFolder,
-                    isProtectedBackupFile = item.isProtectedBackupFile,
-                    starred = item.starred,
-                    shared = item.shared,
-                    webViewLink = item.webViewLink,
-                    createdTimeMs = item.createdTimeMs,
-                    modifiedTimeMs = item.modifiedTimeMs,
-                    isPinnedOffline = existing?.isPinnedOffline ?: false,
-                    offlineLocalPath = existing?.offlineLocalPath,
-                    offlineCachedBytes = existing?.offlineCachedBytes ?: 0L
+                entities.add(
+                    CloudFileEntity(
+                        driveFileId = item.driveFileId,
+                        accountId = accountId,
+                        name = item.name,
+                        mimeType = item.mimeType,
+                        sizeBytes = item.sizeBytes,
+                        md5Checksum = item.md5Checksum,
+                        sha256Checksum = item.sha256Checksum,
+                        parentFolderId = item.parentFolderId ?: effectiveParent,
+                        isFolder = item.isFolder,
+                        isProtectedBackupFile = item.isProtectedBackupFile,
+                        starred = item.starred,
+                        shared = item.shared,
+                        webViewLink = item.webViewLink,
+                        createdTimeMs = item.createdTimeMs,
+                        modifiedTimeMs = item.modifiedTimeMs,
+                        isPinnedOffline = existing?.isPinnedOffline ?: false,
+                        offlineLocalPath = existing?.offlineLocalPath,
+                        offlineCachedBytes = existing?.offlineCachedBytes ?: 0L
+                    )
                 )
             }
             backupDao.upsertCloudFiles(entities)
@@ -428,7 +431,7 @@ class BackupRepository(
                     driveFileId = createdId,
                     accountId = currentAccountId(),
                     name = folderName.trim(),
-                    mimeType = DriveApiClient.DRIVE_FOLDER_MIME,
+                    mimeType = DriveApiClient.FOLDER_MIME_TYPE,
                     sizeBytes = 0L,
                     parentFolderId = effectiveParent,
                     isFolder = true,
@@ -470,7 +473,7 @@ class BackupRepository(
             null
         }
 
-        val resolvedSize = if (sizeBytes > 0L) sizeBytes else (hashes?.byteSize ?: 0L)
+        val resolvedSize = if (sizeBytes > 0L) sizeBytes else (hashes?.totalBytesRead ?: 0L)
         val discovered = DiscoveredSourceFile(
             sourceUri = uriString,
             sourceFileIdentity = identity,

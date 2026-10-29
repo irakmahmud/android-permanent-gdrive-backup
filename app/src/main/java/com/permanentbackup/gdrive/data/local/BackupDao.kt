@@ -289,6 +289,45 @@ interface BackupDao {
     @Query(
         """
         SELECT * FROM cloud_files 
+        WHERE parentFolderId = :parentFolderId AND trashed = 0
+        ORDER BY isFolder DESC, modifiedTimeMs DESC
+        """
+    )
+    suspend fun getCloudFilesByParent(parentFolderId: String): List<CloudFileEntity>
+
+    @Query(
+        """
+        SELECT * FROM cloud_files 
+        WHERE accountId = :accountId AND trashed = 0 AND name LIKE '%' || :query || '%'
+        ORDER BY isFolder DESC, modifiedTimeMs DESC
+        LIMIT 200
+        """
+    )
+    suspend fun searchCloudFiles(accountId: String, query: String): List<CloudFileEntity>
+
+    @Query(
+        """
+        SELECT * FROM cloud_files 
+        WHERE trashed = 0 AND name LIKE '%' || :query || '%'
+        ORDER BY isFolder DESC, modifiedTimeMs DESC
+        LIMIT 200
+        """
+    )
+    suspend fun searchAllCloudFiles(query: String): List<CloudFileEntity>
+
+    @Query(
+        """
+        SELECT * FROM backup_file_records 
+        WHERE uploadStatus = 'VERIFIED' 
+        ORDER BY lastSuccessfulBackupMs DESC 
+        LIMIT :limit OFFSET :offset
+        """
+    )
+    suspend fun getVerifiedBackupsPaged(limit: Int, offset: Int): List<BackupFileEntity>
+
+    @Query(
+        """
+        SELECT * FROM cloud_files 
         WHERE accountId = :accountId AND isPinnedOffline = 1 AND trashed = 0
         ORDER BY modifiedTimeMs DESC
         """

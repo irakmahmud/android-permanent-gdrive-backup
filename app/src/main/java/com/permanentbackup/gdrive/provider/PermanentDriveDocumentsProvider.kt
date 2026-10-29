@@ -66,7 +66,7 @@ class PermanentDriveDocumentsProvider : DocumentsProvider() {
     override fun queryRoots(projection: Array<out String>?): Cursor {
         val result = MatrixCursor(projection ?: DEFAULT_ROOT_PROJECTION)
         val app = context?.applicationContext as? PermanentBackupApp
-        val accountEmail = app?.repository?.authManager?.getSavedAccountEmail()
+        val accountEmail = app?.repository?.authManager?.accountState?.value?.email?.ifBlank { null }
             ?: "Zero-Delete Cloud Vault & Offline Pinned Cache"
 
         result.newRow().apply {
@@ -172,7 +172,7 @@ class PermanentDriveDocumentsProvider : DocumentsProvider() {
                         includeFileRow(
                             cursor = result,
                             documentId = "cloud:$driveId",
-                            displayName = "${record.fileName} (v${record.backupVersion})",
+                            displayName = "${record.displayName} (v${record.backupVersion})",
                             mimeType = record.mimeType,
                             sizeBytes = record.fileSize,
                             lastModifiedMs = record.lastModifiedMs

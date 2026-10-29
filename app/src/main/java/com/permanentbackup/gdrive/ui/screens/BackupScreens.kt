@@ -1318,7 +1318,7 @@ fun TransferManagerScreen(
                             "Progress: ${formatBytes(job.uploadedBytes)} / ${formatBytes(job.totalBytes)} • Account: ${job.accountId}",
                             style = MaterialTheme.typography.bodySmall
                         )
-                        job.lastErrorMessage?.let {
+                        job.errorMessage?.let {
                             Text("Last Notice: $it", style = MaterialTheme.typography.bodySmall)
                         }
                     }

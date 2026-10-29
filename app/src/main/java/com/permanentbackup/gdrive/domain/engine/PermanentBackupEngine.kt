@@ -240,7 +240,7 @@ class PermanentBackupEngine(
                             val modifiedChanged = item.modifiedTimeMs > 0L && item.modifiedTimeMs != prev?.modifiedTimeMs
                             val checksumChanged = !item.md5Checksum.isNullOrBlank() && item.md5Checksum != prev?.md5Checksum
                             if (modifiedChanged || checksumChanged) {
-                                modifiedPinnedItems.add(item.copy(pinnedOffline = true))
+                                modifiedPinnedItems.add(item.copy(isPinnedOffline = true))
                             }
                         }
                         CloudFileEntity(

@@ -130,11 +130,11 @@ class PermanentBackupForegroundService : Service() {
             buildProgressNotification(
                 title = "Permanent Drive — Paused",
                 contentText = "Resumable session preserved; tap Resume to continue.",
-                progressPercent = progress?.progressFraction?.let { (it * 100f).toInt().coerceIn(0, 100) },
+                progressPercent = progress?.fraction?.let { (it * 100f).toInt().coerceIn(0, 100) },
                 isPaused = true
             )
         } else if (progress != null) {
-            val pct = (progress.progressFraction * 100f).toInt().coerceIn(0, 100)
+            val pct = (progress.fraction * 100f).toInt().coerceIn(0, 100)
             val speedStr = formatSpeed(progress.transferSpeedBps)
             val etaStr = progress.estimatedRemainingSeconds?.let { " • ETA ${it}s" }.orEmpty()
             buildProgressNotification(

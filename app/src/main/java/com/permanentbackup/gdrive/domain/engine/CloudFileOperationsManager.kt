@@ -188,7 +188,7 @@ class CloudFileOperationsManager(
                 if (depth > maxDepth) return
                 var pageToken: String? = null
                 do {
-                    val page = driveApiClient.browseCloudDriveFiles(
+                    val page = driveApiClient.listDriveFiles(
                         accessToken = accessToken,
                         accountId = accountId,
                         parentFolderId = currentFolderId,
@@ -378,7 +378,7 @@ class CloudFileOperationsManager(
                 if (depth > maxDepth) return
                 var pageToken: String? = null
                 do {
-                    val page = driveApiClient.browseCloudDriveFiles(
+                    val page = driveApiClient.listDriveFiles(
                         accessToken = accessToken,
                         accountId = accountId,
                         parentFolderId = currentFolderId,

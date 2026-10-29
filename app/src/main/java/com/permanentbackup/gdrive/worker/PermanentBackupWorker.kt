@@ -168,7 +168,7 @@ class LocalStorageFileObserverManager(
         val eventMask = FileObserver.CLOSE_WRITE or FileObserver.MOVED_TO or FileObserver.CREATE
         for (root in roots) {
             if (!root.exists() || !root.isDirectory) continue
-            for (folderName in AndroidStorageScanner.STANDARD_TARGET_FOLDERS) {
+            for ((folderName, _) in AndroidStorageScanner.TARGET_STANDARD_FOLDERS) {
                 val dir = File(root, folderName)
                 if (dir.exists() && dir.isDirectory && dir.canRead()) {
                     val observer = object : FileObserver(dir.absolutePath, eventMask) {

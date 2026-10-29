@@ -383,6 +383,34 @@ class InMemoryBackupDao : BackupDao {
             .take(limit)
     }
 
+    override suspend fun getCloudFilesByParent(parentFolderId: String): List<CloudFileEntity> {
+        return cloudFiles.values
+            .filter { it.parentFolderId == parentFolderId && !it.trashed }
+            .sortedWith(compareByDescending<CloudFileEntity> { it.isFolder }.thenByDescending { it.modifiedTimeMs })
+    }
+
+    override suspend fun searchCloudFiles(accountId: String, query: String): List<CloudFileEntity> {
+        return cloudFiles.values
+            .filter { it.accountId == accountId && !it.trashed && it.name.contains(query, ignoreCase = true) }
+            .sortedWith(compareByDescending<CloudFileEntity> { it.isFolder }.thenByDescending { it.modifiedTimeMs })
+            .take(200)
+    }
+
+    override suspend fun searchAllCloudFiles(query: String): List<CloudFileEntity> {
+        return cloudFiles.values
+            .filter { !it.trashed && it.name.contains(query, ignoreCase = true) }
+            .sortedWith(compareByDescending<CloudFileEntity> { it.isFolder }.thenByDescending { it.modifiedTimeMs })
+            .take(200)
+    }
+
+    override suspend fun getVerifiedBackupsPaged(limit: Int, offset: Int): List<BackupFileEntity> {
+        return records.values
+            .filter { it.uploadStatus == UploadStatus.VERIFIED }
+            .sortedByDescending { it.lastSuccessfulBackupMs ?: 0L }
+            .drop(offset)
+            .take(limit)
+    }
+
     override fun observePinnedOfflineFiles(accountId: String): Flow<List<CloudFileEntity>> =
         cloudFilesFlow.map { list -> list.filter { it.accountId == accountId && it.isPinnedOffline && !it.trashed } }
 
@@ -1916,18 +1944,20 @@ class PermanentBackupEngineTest {
             }
         }
 
+        val restoreRoot = File(tempStorageDir, "Download/Restored_From_Drive").apply { mkdirs() }
         val opsManager = CloudFileOperationsManager(
             context = null,
             backupDao = dao,
             driveApiClient = driveApiClient,
             authManager = authManager,
-            customStorageRoots = listOf(tempStorageDir)
+            customRestoreRootDir = restoreRoot
         )
 
         val folderItem = CloudBrowseItem(
             driveFileId = "cloud_folder_project",
+            accountId = "default_account",
             name = "Engineering_Docs",
-            mimeType = DriveApiClient.DRIVE_FOLDER_MIME_TYPE,
+            mimeType = DriveApiClient.FOLDER_MIME_TYPE,
             sizeBytes = 0L,
             modifiedTimeMs = 1700000000000L,
             parentFolderId = "root",
@@ -1935,22 +1965,22 @@ class PermanentBackupEngineTest {
             webViewLink = null,
             sha256Checksum = null,
             md5Checksum = null,
-            pinnedOffline = false,
+            isPinnedOffline = false,
             offlineLocalPath = null
         )
 
         // 1. Recursive Folder Restore (including Google Doc exported to .pdf)
-        val restoredCount = opsManager.restoreCloudFolderRecursively(folderItem)
-        assertEquals(2, restoredCount)
-        val restoredDir = File(tempStorageDir, "Download/Restored_From_Drive/Engineering_Docs")
+        val restoredOutcome = opsManager.restoreCloudFolderRecursively(folderItem)
+        assertTrue(restoredOutcome.success)
+        val restoredDir = File(restoreRoot, "Engineering_Docs")
         assertTrue(File(restoredDir, "Architecture Spec.pdf").exists())
         assertEquals("EXPORTED_GOOGLE_DOC_PDF_CONTENT_2026", File(restoredDir, "Architecture Spec.pdf").readText())
         assertTrue(File(restoredDir, "diagram.png").exists())
 
         // 2. One-Way Cloud-to-Local Folder Mirror into Download/Restored_From_Drive/Drive_Mirror/Engineering_Docs
-        val mirroredCount = opsManager.mirrorCloudFolderToLocal(folderItem)
-        assertEquals(2, mirroredCount)
-        val mirrorDir = File(tempStorageDir, "Download/Restored_From_Drive/Drive_Mirror/Engineering_Docs")
+        val mirroredOutcome = opsManager.mirrorCloudFolderToLocal(folderItem)
+        assertTrue(mirroredOutcome.success)
+        val mirrorDir = File(restoreRoot, "Drive_Mirror/Engineering_Docs")
         assertTrue(File(mirrorDir, "Architecture Spec.pdf").exists())
         assertTrue(File(mirrorDir, "diagram.png").exists())
 
@@ -2080,16 +2110,16 @@ class PermanentBackupEngineTest {
         )
 
         // 1. Page 1 sets cloudNextPageToken = "page_2_token"
-        val page1 = repository.browseCloudDriveFiles(parentFolderId = "root", loadMore = false)
+        val page1 = repository.browseCloudDriveFiles(parentFolderId = "root", pageToken = null)
         assertEquals(1, page1.size)
         assertEquals("Page1Doc.pdf", page1.single().name)
         assertEquals("page_2_token", repository.cloudNextPageToken.value)
 
-        // 2. Page 2 (loadMore = true) appends Page2Sheet and clears cloudNextPageToken
-        val combined = repository.browseCloudDriveFiles(parentFolderId = "root", loadMore = true)
-        assertEquals(2, combined.size)
+        // 2. Page 2 (pageToken = "page_2_token") fetches Page2Sheet and clears cloudNextPageToken
+        val page2 = repository.browseCloudDriveFiles(parentFolderId = "root", pageToken = "page_2_token")
+        assertEquals(1, page2.size)
         assertEquals(null, repository.cloudNextPageToken.value)
-        assertTrue(combined.any { it.name == "Page2Sheet" && it.isGoogleWorkspaceDoc })
+        assertTrue(page2.any { it.name == "Page2Sheet" && it.isGoogleWorkspaceDoc })
 
         // 3. Create Cloud Folder in My Drive
         val createdFolderId = repository.createCloudFolder("New_Cloud_Folder", "root")
