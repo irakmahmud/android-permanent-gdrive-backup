@@ -2222,7 +2222,21 @@ class PermanentBackupEngineTest {
         )
         assertTrue(aliceRec.driveFolderId != bobRec.driveFolderId)
 
-        // 3. Double offline scan on Bob before upload completes -> must NOT throw duplicate v1 constraint violation
+        // 3. Double offline scan on Bob before upload completes (even when Alice already has a BackupVersionEntity)
+        // must NOT insert a duplicate (bob@example.com, identity, v1) record or throw UNIQUE constraint failed
+        dao.insertBackupVersion(
+            BackupVersionEntity(
+                accountId = "alice@example.com",
+                sourceFileIdentity = "vol0:DCIM/Camera/Vacation/offline_new.jpg",
+                versionNumber = 1,
+                driveFileId = "alice_offline_file_id",
+                driveStoredName = "offline_new.jpg",
+                relativePath = "DCIM/Camera/Vacation/offline_new.jpg",
+                fileSize = 24L,
+                sha256Hash = "sha256_offline_new",
+                md5Hash = "md5_offline_new"
+            )
+        )
         val offlineFile = DiscoveredSourceFile(
             sourceUri = File(nestedDir, "offline_new.jpg").apply { writeText("OFFLINE_NEW_IMAGE_BYTES!") }.absolutePath,
             sourceFileIdentity = "vol0:DCIM/Camera/Vacation/offline_new.jpg",
@@ -2238,7 +2252,12 @@ class PermanentBackupEngineTest {
         val queuedFirst = engine.evaluateAndQueueDiscoveredFile(offlineFile)
         val queuedSecond = engine.evaluateAndQueueDiscoveredFile(offlineFile)
         assertTrue(queuedFirst)
-        assertFalse("Second scan of unchanged pending v1 on same account must be skipped", queuedSecond)
+        assertTrue(queuedSecond)
+        val bobOfflineRecords = dao.getAllRecordsSnapshot().filter {
+            it.accountId == "bob@example.com" && it.sourceFileIdentity == offlineFile.sourceFileIdentity
+        }
+        assertEquals("Must have exactly 1 pending v1 record for Bob without duplicate insertion", 1, bobOfflineRecords.size)
+        assertEquals(1, bobOfflineRecords.single().backupVersion)
     }
 
     // 30. Workspace Office Export MIME Mapping + Custom Subfolder Auto-Backup Persistence + Account Version Ledger (Features 1, 3, 8, 9)
