@@ -1,6 +1,38 @@
-# Permanent Drive v2.0.0 — Android Google Drive Desktop Alternative
+# Permanent Drive v2.2.0 — Android Google Drive Desktop Alternative
 
-A production-grade, strictly **Upload-Only, Append-Only, Never-Delete** Android Google Drive Desktop Alternative engineered in **Kotlin**, **Jetpack Compose (Material 3)**, **Room (WAL + 14 Tables)**, **WorkManager**, **Foreground Service (`dataSync`)**, **Google Identity Services (`AuthorizationClient` + `GoogleAuthUtil`)**, and **Google Drive REST API v3**. Built 100% remotely via **CircleCI** (`.circleci/config.yml`) and **GitHub Cloud Runners** (`.github/workflows/remote-android-build.yml`) with zero local Android SDK/Gradle footprint.
+A production-grade, strictly **Upload-Only, Append-Only, Never-Delete** Android Google Drive Desktop Alternative engineered in **Kotlin**, **Jetpack Compose (Material 3)**, **Room (WAL + 14 Tables, Database v3)**, **WorkManager (`ContentUriTrigger`)**, **Recursive `FileObserver`**, **Android SAF `DocumentsProvider`**, **Foreground Service (`dataSync`)**, **Google Identity Services (`AuthorizationClient` + `GoogleAuthUtil`)**, and **Google Drive REST API v3**. Built 100% remotely via **CircleCI** (`.circleci/config.yml`) and **GitHub Cloud Runners** (`.github/workflows/remote-android-build.yml`) with zero local Android SDK/Gradle footprint.
+
+---
+
+## 0. What's New in `v2.2.0` (11 Google Drive Desktop Parity Features + 3 Immutable Safety Rules)
+
+All 11 features identified in the Google Drive for Windows Desktop gap audit are fully implemented while strictly enforcing **Zero Deletion**, **Immutable Version Preservation**, and **Strict Separation of Backup vs. Cloud-to-Local Mirroring**:
+
+1. **Android SAF Virtual Drive (`PermanentDriveDocumentsProvider`) & Seekable Local/Range Streaming (`DriveStreamingContentProvider`)**:
+   - Exposes `Permanent Drive` inside the Android system file picker (`com.android.documentsui`) as a read-only SAF document provider (`deleteDocument()` throws `SecurityException`), respecting Android platform boundaries vs. Windows kernel-mounted `G:\` drives.
+   - Serves offline-pinned files via seekable `ParcelFileDescriptor.open(file, MODE_READ_ONLY)` and supports HTTP `Range` requests (`bytes=start-end`) plus direct `"Open File"` from `OfflineAccessScreen`.
+2. **Real-Time File Watching (`LocalStorageFileObserverManager` + WorkManager `ContentUriTrigger`) & Fast Metadata-First Incremental Scan**:
+   - Recursive 3-level `FileObserver` and MediaStore `ContentUriTrigger` detect file creation/modification immediately.
+   - `PermanentBackupEngine` checks `backupDao.getLocalFileByIdentity()` (`fileSize` + `lastModifiedMs`) before computing SHA-256/MD5 hashes, skipping redundant hashing for unchanged files.
+3. **Custom SAF Folder Persistence (`storage_permissions`), Per-Subfolder `Auto-Backup: ON/OFF` Toggle & Removable SD Card Root Switcher**:
+   - `safTreeLauncher` persists custom SAF document trees via `backupDao.upsertStoragePermission()` and scans them automatically.
+   - `PhoneStorageExplorerScreen` lets users switch between Internal Storage and Removable SD Card roots and toggle `Auto-Backup: ON/OFF` on any subfolder.
+4. **Background Cloud Change Polling (`syncCloudChangesIncremental`), Auto-Refresh of Pinned Offline Files & Safe One-Way Folder Mirroring**:
+   - `executeBackupCycleInternal()` polls `/drive/v3/changes`, automatically re-downloads updated pinned offline files, removes remote ghost cache entries, and supports one-way Cloud-to-Local folder mirroring (`mirrorCloudFolderToLocal`) into `Download/Drive_Mirror` (strictly excluded from backup scanning so cloud backups are never overwritten or looped).
+5. **System-Wide `"Save to Permanent Drive"` Share Sheet (`ACTION_SEND` / `ACTION_SEND_MULTIPLE`) & Direct Cloud Upload / New Folder**:
+   - Accepts shared files from any Android app (even without full `MANAGE_EXTERNAL_STORAGE` permission) and adds `+ Upload File` and `+ New Folder` actions directly inside `My Drive`.
+6. **Live Transfer Progress Notification (Speed, `%`, ETA & `Pause` / `Resume` Actions)**:
+   - `PermanentBackupForegroundService` displays real-time filename, percentage progress bar, transfer rate (`B/s`), ETA, and interactive `Pause` / `Resume` notification buttons.
+7. **Parallel Upload Worker Pool (`Semaphore`), Bandwidth Rate Limiter & Interactive Settings Controls**:
+   - Concurrent multi-file uploads controlled by `settings.uploadConcurrency` (`1x / 3x / 5x`), token-bucket bandwidth throttling (`bandwidthLimitKbps`), and interactive controls in `SettingsAndAccountsScreen` backed by `backupDao.getAppSettingsEntity()`.
+8. **Google Workspace Docs/Sheets/Slides `/export` Support & `My Drive` Pagination (`nextPageToken`)**:
+   - Exports Google Docs (`.docx`), Sheets (`.xlsx`), Slides (`.pptx`), and Drawings (`.pdf`) via `/drive/v3/files/{id}/export`, supports `"Load More"` pagination (`nextPageToken`), and preserves folder/filter context when browsing offline.
+9. **Multi-Account Isolation (`accountId` in `backup_file_records`, `MIGRATION_2_3`) & Full Version History Modal**:
+   - Scopes all queues, folder caches, dashboard metrics, and version numbers per `accountId`, and wires `getAllVersionsForFile()` + `getBackupVersionsForAccountPaged()` into `BackupVersionHistoryScreen`.
+10. **Recursive Cloud Folder Download / Restore & Folder Offline Pinning**:
+    - One-tap `Download Folder`, `Keep Folder Offline`, and `Mirror Folder to Phone` on any folder card in `My Drive`.
+11. **Transactional Sync Job State Machine (`syncJobs`) & HTTP Error Diagnostics (`observeUnresolvedFailures`) UI**:
+    - Displays live `SyncJobEntity` state transitions and `FailedOperationEntity` HTTP status codes and retry schedules inside the `Backups / Transfers` screen.
 
 ---
 
@@ -20,7 +52,7 @@ A production-grade, strictly **Upload-Only, Append-Only, Never-Delete** Android 
 | 10 | Embedded OAuth Credentials in APK | Anyone decompiling `BuildConfig.class` from `v1.2.0`/`v1.3.0` could extract the embedded refresh token. | `GoogleAuthManager.purgeLegacyCompromisedTokensIfNeeded()` detects any legacy `v1.2.0`/`v1.3.0` token on upgrade, revokes it via `https://oauth2.googleapis.com/revoke`, and clears it from storage. |
 | 11 | Inactive CircleCI Pipeline Transparency | CircleCI API returned `{"message":"Project not found"}` because the repo had not been enabled in CircleCI Web UI. | `.circleci/config.yml` is maintained with all 14 stages, while `scripts/fetch_cloud_apk.sh` transparently queries CircleCI API and distinguishes it from GitHub Actions builds. |
 | 12 | Confusing GitHub Actions vs CircleCI Builds | Previous reports did not clearly separate CircleCI status from GitHub Actions runner builds. | Build scripts and documentation explicitly distinguish CircleCI API status (`Project not found` until activated with `CIRCLE_TOKEN`) from active GitHub Actions remote cloud builds. |
-| 13 | Unverified Physical Device Claims | MockWebServer JVM tests were previously not clearly distinguished from physical Android phone + real Google Drive interactive tests. | All verification reports explicitly separate JVM/MockWebServer automated tests (`24/24 PASSED`) from physical device interactive tests (`Requires Physical Android Device & User Google Account`). |
+| 13 | Unverified Physical Device Claims | MockWebServer JVM tests were previously not clearly distinguished from physical Android phone + real Google Drive interactive tests. | All verification reports explicitly separate JVM/MockWebServer automated tests (`31/31 PASSED`) from physical device interactive tests (`Requires Physical Android Device & User Google Account`). |
 
 ---
 
@@ -30,7 +62,7 @@ A production-grade, strictly **Upload-Only, Append-Only, Never-Delete** Android 
 1. **Layer 1 — Domain Engine (`PermanentBackupEngine` & `CloudFileOperationsManager`)**:
    - Local file deletion only sets `localExists = false` in Room (`backup_file_records` and `local_files`). Cloud backups are never deleted.
    - Local file modification preserves Version $N$ on Google Drive and uploads Version $N+1$ (`filename__v2_<hash8>.ext`) as a distinct immutable Drive file (`BackupVersionEntity`).
-   - File Restore (`CloudFileOperationsManager.restoreCloudFileToLocal`) never overwrites an existing local file; if `photo.jpg` exists with different content, it restores to `photo (Restored_1).jpg`.
+   - File Restore (`CloudFileOperationsManager.restoreCloudFileToLocal`) and Folder Mirroring (`mirrorCloudFolderToLocal`) never overwrite existing local files or delete cloud backups.
 2. **Layer 2 — HTTP Transport Guard (`NeverDeleteGuardInterceptor`)**:
    - Intercepts every outgoing OkHttp request to `googleapis.com` and throws `NeverDeletePolicyViolationException` on any:
      - `HTTP DELETE`
@@ -38,9 +70,9 @@ A production-grade, strictly **Upload-Only, Append-Only, Never-Delete** Android 
      - Non-resumable `HTTP PUT` without `uploadType=resumable` and `upload_id=`
      - Request body containing `"trashed"\s*:\s*true`
 3. **Layer 3 — Automated Verification (`PermanentBackupEngineTest`)**:
-   - 24 JUnit + MockWebServer tests verify every state transition, crash reconciliation, mid-upload pause/resume, per-folder enable/disable filtering, multi-account isolation, legacy token purge + revocation, non-overwriting restore, offline cache eviction budget, and transport-level blocking of `DELETE`/`PATCH`/`PUT`/`trashed:true`.
+   - 31 JUnit + MockWebServer tests (`test01`–`test31`) verify every state transition, crash reconciliation, mid-upload pause/resume, per-folder enable/disable filtering, multi-account isolation, legacy token purge + revocation, non-overwriting restore, recursive folder mirror isolation, Google Workspace export, parallel upload worker pool, fast metadata-first incremental scanning, and transport-level blocking of `DELETE`/`PATCH`/`PUT`/`trashed:true`.
 
-### B. 12 Mandatory Room Entities + 2 Legacy Compatibility Entities (Database v2, WAL Mode)
+### B. 12 Mandatory Room Entities + 2 Legacy Compatibility Entities (Database v3, WAL Mode)
 - `GoogleAccountEntity` (`google_accounts`)
 - `BackupFolderEntity` (`backup_folders`)
 - `LocalFileEntity` (`local_files`)
@@ -53,7 +85,7 @@ A production-grade, strictly **Upload-Only, Append-Only, Never-Delete** Android 
 - `AppSettingsEntity` (`app_settings`)
 - `StoragePermissionEntity` (`storage_permissions`)
 - `DriveChangeTokenEntity` (`drive_change_tokens`)
-- Legacy preserved tables with non-destructive `MIGRATION_1_2`: `BackupFileEntity` (`backup_file_records`) & `DriveFolderCacheEntity` (`drive_folder_cache`).
+- Legacy preserved tables with non-destructive `MIGRATION_1_2` & `MIGRATION_2_3`: `BackupFileEntity` (`backup_file_records` with `accountId` isolation) & `DriveFolderCacheEntity` (`drive_folder_cache`).
 
 ### C. 9 Material 3 Screens
 1. **Home**: Account status, cloud storage quota bar, active transfer speed/ETA banner, quick backup actions, and Never-Delete policy badge.

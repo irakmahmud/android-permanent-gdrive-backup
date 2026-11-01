@@ -30,3 +30,4 @@ release/
 *.keystore
 *.jks
 google-services.json
+releases/
