@@ -15,6 +15,8 @@ import com.permanentbackup.gdrive.data.local.SyncEventEntity
 import com.permanentbackup.gdrive.data.local.SyncJobEntity
 import com.permanentbackup.gdrive.data.remote.DriveApiClient
 import com.permanentbackup.gdrive.data.remote.GoogleAuthManager
+import com.permanentbackup.gdrive.domain.engine.AlwaysSatisfiedDeviceConditions
+import com.permanentbackup.gdrive.domain.engine.AndroidDeviceConditionsProvider
 import com.permanentbackup.gdrive.domain.engine.BackupCycleSummary
 import com.permanentbackup.gdrive.domain.engine.CloudFileOperationsManager
 import com.permanentbackup.gdrive.domain.engine.PermanentBackupEngine
@@ -34,10 +36,18 @@ import com.permanentbackup.gdrive.domain.model.LocalBrowseItem
 import com.permanentbackup.gdrive.domain.model.OAuthDiagnosticReport
 import com.permanentbackup.gdrive.domain.model.RestoreOutcome
 import com.permanentbackup.gdrive.domain.model.UploadStatus
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import java.io.File
+import java.io.FileOutputStream
 
 class BackupRepository(
     private val context: Context? = null,
@@ -47,6 +57,13 @@ class BackupRepository(
     val authManager: GoogleAuthManager,
     customSettingsPrefs: SharedPreferences? = null
 ) {
+    companion object {
+        const val SHARE_STAGING_DIR_NAME = "share_staging"
+        /** Larger shares stream directly from the content URI instead of being staged (storage protection). */
+        const val MAX_SHARE_STAGING_BYTES = 512L * 1024L * 1024L
+        private const val PREF_MIRRORED_FOLDERS = "mirrored_cloud_folders_v1"
+    }
+
     private val prefs: SharedPreferences? = customSettingsPrefs
         ?: context?.applicationContext?.getSharedPreferences("permanent_backup_settings", Context.MODE_PRIVATE)
 
@@ -54,7 +71,8 @@ class BackupRepository(
         backupDao = backupDao,
         storageSource = storageSource,
         driveApiClient = driveApiClient,
-        authManager = authManager
+        authManager = authManager,
+        deviceConditions = context?.let { AndroidDeviceConditionsProvider(it) } ?: AlwaysSatisfiedDeviceConditions
     )
 
     val cloudFileOps = CloudFileOperationsManager(
@@ -75,26 +93,62 @@ class BackupRepository(
     )
     val nextScheduledBackupMs: StateFlow<Long?> = _nextScheduledBackupMs.asStateFlow()
 
+    /** Active account ID stream; every UI list re-subscribes to the right account on account switch. */
+    private val activeAccountIdFlow: Flow<String> = authManager.accountState
+        .map { state -> state.accountId.ifBlank { state.email.trim().lowercase().ifBlank { "default_account" } } }
+        .distinctUntilChanged()
+
+    private val mirrorSyncMutex = Mutex()
+
     init {
         // Automatically refresh any pinned offline file when Google Drive Changes API detects a remote edit
+        // (also auto-pins new files that appear inside a "Keep Folder Offline" folder)
         backupEngine.onPinnedCloudFileModified = { modifiedItem ->
             cloudFileOps.pinCloudFileOffline(modifiedItem, _settings.value.offlineCacheBudgetBytes)
         }
+        // Keep one-way Cloud -> Phone Mirror folders up to date whenever Drive reports changes
+        backupEngine.onCloudChangesDetected = { _ ->
+            syncRegisteredMirrorFolders()
+        }
+        // Remove the app-private share staging copy once its bytes are VERIFIED on Google Drive
+        backupEngine.onRecordVerified = { record ->
+            deleteShareStagingCopyIfAny(record.sourceUri)
+        }
     }
 
-    fun observeActiveQueue(): Flow<List<BackupFileEntity>> = backupDao.observeActiveQueue()
-    fun observeVerifiedHistory(): Flow<List<BackupFileEntity>> = backupDao.observeVerifiedHistory()
-    fun observeFailedUploads(): Flow<List<BackupFileEntity>> = backupDao.observeFailedRecords()
-    fun observeRecentRecords(): Flow<List<BackupFileEntity>> = backupDao.observeRecentRecords()
-    fun observeSyncJobs(): Flow<List<SyncJobEntity>> = backupDao.observeSyncJobs()
-    fun observeRecentSyncEvents(): Flow<List<SyncEventEntity>> = backupDao.observeRecentSyncEvents()
-    fun observeUnresolvedFailures(): Flow<List<FailedOperationEntity>> = backupDao.observeUnresolvedFailures()
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun observeActiveQueue(): Flow<List<BackupFileEntity>> =
+        activeAccountIdFlow.flatMapLatest { backupDao.observeActiveQueueForAccount(it) }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun observeVerifiedHistory(): Flow<List<BackupFileEntity>> =
+        activeAccountIdFlow.flatMapLatest { backupDao.observeVerifiedHistoryForAccount(it) }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun observeFailedUploads(): Flow<List<BackupFileEntity>> =
+        activeAccountIdFlow.flatMapLatest { backupDao.observeFailedRecordsForAccount(it) }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun observeRecentRecords(): Flow<List<BackupFileEntity>> =
+        activeAccountIdFlow.flatMapLatest { backupDao.observeRecentRecordsForAccount(it) }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun observeSyncJobs(): Flow<List<SyncJobEntity>> =
+        activeAccountIdFlow.flatMapLatest { backupDao.observeSyncJobsForAccount(it) }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun observeRecentSyncEvents(): Flow<List<SyncEventEntity>> =
+        activeAccountIdFlow.flatMapLatest { backupDao.observeRecentSyncEventsForAccount(it) }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun observeUnresolvedFailures(): Flow<List<FailedOperationEntity>> =
+        activeAccountIdFlow.flatMapLatest { backupDao.observeUnresolvedFailuresForAccount(it) }
+
     fun observeGoogleAccounts(): Flow<List<GoogleAccountEntity>> = backupDao.observeAllGoogleAccounts()
 
-    fun observePinnedOfflineFiles(): Flow<List<CloudFileEntity>> {
-        val accountId = currentAccountId()
-        return backupDao.observePinnedOfflineFiles(accountId)
-    }
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun observePinnedOfflineFiles(): Flow<List<CloudFileEntity>> =
+        activeAccountIdFlow.flatMapLatest { backupDao.observePinnedOfflineFiles(it) }
 
     suspend fun syncPersistedAccountOnStartup() {
         // 1. Restore persisted AppSettingsEntity from Room if present
@@ -270,8 +324,21 @@ class BackupRepository(
         )
     }
 
-    suspend fun runBackupNow(): BackupCycleSummary {
-        return backupEngine.runBackupCycle(_settings.value)
+    /**
+     * Full scan + upload cycle.
+     * @param respectRetryBackoff true for automatic/background triggers (WorkManager) so failed files wait for
+     *   their exponential backoff window; manual "Backup Now" retries everything immediately.
+     */
+    suspend fun runBackupNow(respectRetryBackoff: Boolean = false): BackupCycleSummary {
+        return backupEngine.runBackupCycle(_settings.value, respectRetryBackoff)
+    }
+
+    /**
+     * Uploads already-queued records only (no full storage rescan). Used after share-sheet / "Upload File",
+     * single-file "Backup File", per-file Retry/Resume so they start instantly even on huge phones.
+     */
+    suspend fun runUploadQueueNow(): BackupCycleSummary {
+        return backupEngine.runUploadQueueOnly(_settings.value)
     }
 
     suspend fun retryAllFailedUploads(): BackupCycleSummary {
@@ -283,8 +350,9 @@ class BackupRepository(
                 sessionUri = rec.resumableSessionUri,
                 status = UploadStatus.PENDING_RETRY
             )
+            backupDao.clearSyncJobRetryBackoff(rec.id)
         }
-        return backupEngine.runBackupCycle(_settings.value.copy(userBackupConsentGranted = true))
+        return backupEngine.runUploadQueueOnly(_settings.value.copy(userBackupConsentGranted = true))
     }
 
     /**
@@ -450,13 +518,21 @@ class BackupRepository(
     /**
      * Queues a shared or picked URI (`ACTION_SEND` / `ACTION_SEND_MULTIPLE` or "Upload File" button)
      * directly into the permanent backup queue.
+     *
+     * - [targetDriveFolderId]: when the user is inside a My Drive folder, the file is uploaded straight into that
+     *   exact Drive folder (identity `shared:drive:<folderId>/<name>`) instead of a mirrored subfolder.
+     * - Temporary share-sheet grants (`content://` without a persistable permission) expire when the sending app
+     *   dies, so the bytes are first staged into app-private storage; the staging copy is removed automatically
+     *   after the Drive upload is VERIFIED.
      */
     suspend fun uploadDirectUriToDrive(
         uriString: String,
         displayName: String,
         mimeType: String,
         sizeBytes: Long,
-        targetSubfolder: String = "Shared_To_Drive"
+        targetSubfolder: String = "Shared_To_Drive",
+        targetDriveFolderId: String? = null,
+        stageTemporaryGrant: Boolean = false
     ): Boolean {
         if (uriString.isBlank()) return false
         val safeDisplay = cloudFileOps.sanitizeSafeLocalFileName(
@@ -464,22 +540,38 @@ class BackupRepository(
         )
         val cleanFolder = targetSubfolder.replace('\\', '/').trim('/').ifBlank { "Shared_To_Drive" }
         val relPath = "$cleanFolder/$safeDisplay"
-        val identity = "shared:$relPath"
+        val explicitFolder = targetDriveFolderId?.trim()?.takeIf { it.isNotBlank() && !it.contains('/') }
+        val identity = if (explicitFolder != null) {
+            "${PermanentBackupEngine.SHARED_DRIVE_TARGET_PREFIX}$explicitFolder/$safeDisplay"
+        } else {
+            "shared:$relPath"
+        }
         val now = System.currentTimeMillis()
+
+        val effectiveSourceUri = if (stageTemporaryGrant) {
+            stageSharedContentLocally(uriString, safeDisplay, sizeBytes) ?: uriString
+        } else {
+            uriString
+        }
 
         val hashes = try {
             if (sizeBytes in 0L..(64L * 1024L * 1024L)) {
                 SourceFileReadOnlyGuard.computeStreamingHashes {
-                    storageSource.openInputStream(uriString)
+                    storageSource.openInputStream(effectiveSourceUri)
                 }
             } else null
         } catch (_: Throwable) {
             null
         }
 
-        val resolvedSize = if (sizeBytes > 0L) sizeBytes else (hashes?.totalBytesRead ?: 0L)
+        val stagedLength = if (effectiveSourceUri != uriString) File(effectiveSourceUri).length() else 0L
+        val resolvedSize = when {
+            sizeBytes > 0L -> sizeBytes
+            stagedLength > 0L -> stagedLength
+            else -> hashes?.totalBytesRead ?: 0L
+        }
         val discovered = DiscoveredSourceFile(
-            sourceUri = uriString,
+            sourceUri = effectiveSourceUri,
             sourceFileIdentity = identity,
             relativePath = relPath,
             displayName = safeDisplay,
@@ -490,7 +582,130 @@ class BackupRepository(
             sha256Hash = hashes?.sha256Hex,
             md5Hash = hashes?.md5Hex
         )
-        return backupEngine.evaluateAndQueueDiscoveredFile(discovered)
+        val queued = backupEngine.evaluateAndQueueDiscoveredFile(discovered)
+        if (!queued) {
+            // Already backed up & unchanged -> the staging copy is not needed
+            deleteShareStagingCopyIfAny(effectiveSourceUri)
+        }
+        return queued
+    }
+
+    /** App-private directory holding share-sheet bytes until their Drive upload is verified. */
+    fun shareStagingDirectory(): File? {
+        val base = context?.filesDir ?: return null
+        return File(base, SHARE_STAGING_DIR_NAME)
+    }
+
+    private fun stageSharedContentLocally(uriString: String, safeDisplay: String, sizeBytes: Long): String? {
+        if (!uriString.startsWith("content://")) return null
+        if (sizeBytes > MAX_SHARE_STAGING_BYTES) return null
+        val stagingDir = shareStagingDirectory() ?: return null
+        val stagedFile = File(stagingDir, "${System.currentTimeMillis()}_$safeDisplay")
+        return try {
+            if (!stagingDir.exists()) stagingDir.mkdirs()
+            if (sizeBytes > 0L && stagingDir.usableSpace < sizeBytes * 2) return null
+            var copied = 0L
+            storageSource.openInputStream(uriString).use { input ->
+                FileOutputStream(stagedFile).use { output ->
+                    val buffer = ByteArray(64 * 1024)
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read == -1) break
+                        output.write(buffer, 0, read)
+                        copied += read
+                        if (copied > MAX_SHARE_STAGING_BYTES) {
+                            throw java.io.IOException("Shared file exceeds staging limit")
+                        }
+                    }
+                }
+            }
+            stagedFile.absolutePath
+        } catch (_: Throwable) {
+            // Only our own half-written app-private staging file is removed
+            if (stagedFile.exists()) stagedFile.delete()
+            null
+        }
+    }
+
+    /**
+     * Deletes ONLY the app's own private staging copy (never user files, never Google Drive data).
+     */
+    suspend fun deleteShareStagingCopyIfAny(sourceUri: String) {
+        val stagingDir = shareStagingDirectory() ?: return
+        if (sourceUri.startsWith("content://")) return
+        try {
+            val candidate = File(sourceUri)
+            val inStaging = candidate.canonicalPath.startsWith(stagingDir.canonicalPath + File.separator)
+            if (!inStaging || !candidate.exists()) return
+            // Keep the bytes if another not-yet-verified record still points at this staged file
+            val stillNeeded = backupDao.getPendingRecordsForAccountPaged(currentAccountId(), 500, 0)
+                .any { it.sourceUri == sourceUri }
+            if (!stillNeeded) candidate.delete()
+        } catch (_: Throwable) {
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // One-way Cloud -> Phone Mirror registry (kept in sync via Drive Changes API)
+    // ------------------------------------------------------------------------
+
+    private fun mirrorRegistryEntries(): Set<String> =
+        prefs?.getStringSet(PREF_MIRRORED_FOLDERS, emptySet())?.toSet() ?: emptySet()
+
+    private fun registerMirrorFolder(item: CloudBrowseItem) {
+        val p = prefs ?: return
+        val accountId = item.accountId.ifBlank { currentAccountId() }
+        val entry = "$accountId|${item.driveFileId}|${item.name}"
+        val updated = mirrorRegistryEntries()
+            .filterNot { it.split('|').getOrNull(1) == item.driveFileId }
+            .toMutableSet()
+            .apply { add(entry) }
+        p.edit().putStringSet(PREF_MIRRORED_FOLDERS, updated).apply()
+    }
+
+    /** Mirror folders registered for the active account (driveFileId to folder name). */
+    fun getRegisteredMirrorFolders(): List<Pair<String, String>> {
+        val accountId = currentAccountId()
+        return mirrorRegistryEntries().mapNotNull { raw ->
+            val parts = raw.split('|', limit = 3)
+            if (parts.size == 3 && parts[0] == accountId) parts[1] to parts[2] else null
+        }
+    }
+
+    /** Stops future automatic mirror refreshes; already-mirrored local files are left untouched. */
+    fun unregisterMirrorFolder(driveFolderId: String) {
+        val p = prefs ?: return
+        val updated = mirrorRegistryEntries().filterNot { it.split('|').getOrNull(1) == driveFolderId }.toSet()
+        p.edit().putStringSet(PREF_MIRRORED_FOLDERS, updated).apply()
+    }
+
+    /**
+     * Incrementally refreshes every registered Mirror folder: downloads only new or changed Drive files
+     * (changed files are saved as a new non-overwriting local copy). Never touches Google Drive.
+     */
+    suspend fun syncRegisteredMirrorFolders(): Int {
+        if (!authManager.accountState.value.isConnected) return 0
+        val folders = getRegisteredMirrorFolders()
+        if (folders.isEmpty()) return 0
+        if (mirrorSyncMutex.isLocked) return 0
+        return mirrorSyncMutex.withLock {
+            var downloaded = 0
+            val accountId = currentAccountId()
+            for ((folderId, folderName) in folders) {
+                val outcome = cloudFileOps.syncMirrorFolderIncremental(
+                    CloudBrowseItem(
+                        driveFileId = folderId,
+                        accountId = accountId,
+                        name = folderName,
+                        mimeType = DriveApiClient.FOLDER_MIME_TYPE,
+                        sizeBytes = 0L,
+                        isFolder = true
+                    )
+                )
+                if (outcome.success) downloaded += outcome.filesDownloaded
+            }
+            downloaded
+        }
     }
 
     /**
@@ -566,9 +781,14 @@ class BackupRepository(
 
     /**
      * One-way Cloud-to-Local Folder Mirror (Rule 3: Separation of Backup & Mirroring).
+     * The folder is registered so later Drive changes are mirrored automatically (incremental, non-overwriting).
      */
     suspend fun mirrorCloudFolderToLocal(item: CloudBrowseItem): RestoreOutcome {
-        return cloudFileOps.mirrorCloudFolderToLocal(item)
+        val outcome = cloudFileOps.mirrorCloudFolderToLocal(item)
+        if (outcome.success && item.isFolder) {
+            registerMirrorFolder(item)
+        }
+        return outcome
     }
 
     suspend fun toggleOfflinePin(item: CloudBrowseItem): RestoreOutcome {
@@ -613,18 +833,18 @@ class BackupRepository(
     }
 
     suspend fun buildDashboardSummary(): DashboardSummary {
-        val total = backupDao.countAllRecords()
-        val verified = backupDao.countVerifiedRecords()
-        val pending = backupDao.countPendingRecords()
-        val failed = backupDao.countFailedRecords()
-        val preservedDeleted = backupDao.countPreservedAfterLocalDelete()
-        val uploadedBytes = backupDao.sumTotalVerifiedUploadedBytes()
-        val lastBackup = backupDao.getLastSuccessfulBackupTimestamp()
+        val accountId = currentAccountId()
+        val total = backupDao.countAllRecordsForAccount(accountId)
+        val verified = backupDao.countVerifiedRecordsForAccount(accountId)
+        val pending = backupDao.countPendingRecordsForAccount(accountId)
+        val failed = backupDao.countFailedRecordsForAccount(accountId)
+        val preservedDeleted = backupDao.countPreservedAfterLocalDeleteForAccount(accountId)
+        val uploadedBytes = backupDao.sumTotalVerifiedUploadedBytesForAccount(accountId)
+        val lastBackup = backupDao.getLastSuccessfulBackupTimestampForAccount(accountId)
         val coverage = getFolderCoverageItems()
         val accessibleCount = coverage.count { it.accessStatus == FolderAccessStatus.ACCESSIBLE }
         val restrictedCount = coverage.count { it.accessStatus == FolderAccessStatus.RESTRICTED_BY_ANDROID_OS }
         val accountState = authManager.accountState.value
-        val accountId = currentAccountId()
         val offlinePinnedCount = backupDao.countPinnedOfflineFiles(accountId)
         val offlineUsedBytes = backupDao.sumOfflineCachedBytes()
         val accountsCount = maxOf(backupDao.getAllGoogleAccounts().size, authManager.getKnownAccountEmails().size)
@@ -641,7 +861,7 @@ class BackupRepository(
             isRunning = backupEngine.isRunning.value,
             isPaused = _settings.value.backgroundSyncPaused || backupEngine.isPaused.value,
             quotaFull = backupEngine.quotaFullState.value,
-            networkError = backupEngine.lastNetworkError.value,
+            networkError = backupEngine.transferConditionBlock.value ?: backupEngine.lastNetworkError.value,
             pendingCount = pending,
             verifiedCount = verified
         )
@@ -669,7 +889,7 @@ class BackupRepository(
             offlineCacheBudgetBytes = _settings.value.offlineCacheBudgetBytes,
             permissionFailureMessage = backupEngine.lastPermissionError.value,
             quotaFullAlert = backupEngine.quotaFullState.value,
-            networkFailureMessage = backupEngine.lastNetworkError.value,
+            networkFailureMessage = backupEngine.transferConditionBlock.value ?: backupEngine.lastNetworkError.value,
             isBackupRunning = backupEngine.isRunning.value
         )
     }
@@ -689,7 +909,12 @@ class BackupRepository(
             quotaFull -> BackgroundSyncStatus.STORAGE_FULL
             !accountConnected || authState == AccountAuthState.AUTHORIZATION_REQUIRED -> BackgroundSyncStatus.AUTHORIZATION_REQUIRED
             isPaused -> BackgroundSyncStatus.BACKUP_PAUSED
-            networkError != null && networkError.contains("Network", ignoreCase = true) -> BackgroundSyncStatus.WAITING_FOR_NETWORK
+            networkError != null && networkError.contains("Waiting for Charging", ignoreCase = true) &&
+                pendingCount > 0 -> BackgroundSyncStatus.WAITING_FOR_CHARGING
+            networkError != null && (
+                networkError.contains("Network", ignoreCase = true) ||
+                    networkError.contains("Wi-Fi", ignoreCase = true)
+                ) -> BackgroundSyncStatus.WAITING_FOR_NETWORK
             _settings.value.chargingOnly && pendingCount > 0 -> BackgroundSyncStatus.WAITING_FOR_CHARGING
             pendingCount == 0 && verifiedCount > 0 -> BackgroundSyncStatus.BACKUP_COMPLETED
             else -> BackgroundSyncStatus.WAITING_FOR_ANDROID_SCHEDULER
@@ -697,12 +922,12 @@ class BackupRepository(
     }
 
     suspend fun getFolderCoverageItems(): List<FolderCoverageItem> {
+        val accountId = currentAccountId()
         val baseItems = storageSource.getFolderCoverageReport(emptyMap())
         val backedUpMap = mutableMapOf<String, Int>()
         for (item in baseItems) {
-            backedUpMap[item.folderName] = backupDao.countVerifiedFilesInCategory(item.folderName)
+            backedUpMap[item.folderName] = backupDao.countVerifiedFilesInCategoryForAccount(accountId, item.folderName)
         }
-        val accountId = currentAccountId()
         val savedFolders = backupDao.getBackupFoldersForAccount(accountId)
         val savedByPath = savedFolders.associateBy { it.relativePath }
         val savedByName = savedFolders.associateBy { it.folderName }

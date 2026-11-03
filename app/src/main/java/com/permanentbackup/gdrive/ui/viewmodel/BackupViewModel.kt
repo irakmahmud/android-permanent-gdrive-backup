@@ -122,7 +122,8 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
     private val fileObserverManager = LocalStorageFileObserverManager { detectedRelPath ->
         viewModelScope.launch(Dispatchers.IO) {
             if (settings.value.userBackupConsentGranted && !settings.value.backgroundSyncPaused) {
-                repository.runBackupNow()
+                // Automatic trigger: failed files keep waiting for their exponential backoff window
+                repository.runBackupNow(respectRetryBackoff = true)
                 refreshDashboardAndCoverage(fetchRemoteQuota = false)
             }
         }
@@ -209,7 +210,16 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    fun uploadDirectUrisToDrive(uris: List<Uri>, targetSubfolder: String = "Direct_Uploads") {
+    /**
+     * @param targetDriveFolderId upload straight into this exact Google Drive folder (My Drive "Upload File")
+     * @param stageTemporaryGrant share-sheet URIs carry a temporary grant -> stage bytes app-privately first
+     */
+    fun uploadDirectUrisToDrive(
+        uris: List<Uri>,
+        targetSubfolder: String = "Direct_Uploads",
+        targetDriveFolderId: String? = null,
+        stageTemporaryGrant: Boolean = false
+    ) {
         if (uris.isEmpty()) return
         viewModelScope.launch(Dispatchers.IO) {
             if (!settings.value.userBackupConsentGranted) {
@@ -241,13 +251,16 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
                     displayName = displayName,
                     mimeType = mimeType,
                     sizeBytes = sizeBytes,
-                    targetSubfolder = targetSubfolder
+                    targetSubfolder = targetSubfolder,
+                    targetDriveFolderId = targetDriveFolderId,
+                    stageTemporaryGrant = stageTemporaryGrant
                 )
                 if (queued) queuedCount++
             }
             if (queuedCount > 0) {
                 _actionFeedbackMessage.value = "Queued $queuedCount file(s) to Permanent Drive ($targetSubfolder)."
-                PermanentBackupForegroundService.startManualBackupService(getApplication())
+                // Upload-only run: starts immediately without a full phone storage rescan
+                PermanentBackupForegroundService.startUploadQueueService(getApplication())
             } else {
                 _actionFeedbackMessage.value = "Selected file(s) already backed up and unchanged."
             }
@@ -347,7 +360,7 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
             val queued = repository.queueSingleLocalFile(item)
             if (queued) {
                 _actionFeedbackMessage.value = "Queued '${item.name}' for permanent Google Drive backup."
-                repository.runBackupNow()
+                repository.runUploadQueueNow()
             } else {
                 _actionFeedbackMessage.value = "'${item.name}' is already backed up and unchanged."
             }
@@ -373,6 +386,11 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch(Dispatchers.IO) {
             repository.backupEngine.pauseSingleRecord(recordId, pause)
             refreshDashboardAndCoverage()
+            if (!pause) {
+                // Resume = upload immediately (backoff cleared); joins an in-flight cycle if one is running
+                repository.runUploadQueueNow()
+                refreshDashboardAndCoverage()
+            }
         }
     }
 
@@ -386,7 +404,7 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
     fun retrySingleRecord(recordId: Long) {
         viewModelScope.launch(Dispatchers.IO) {
             repository.requeueFailedRecord(recordId)
-            repository.runBackupNow()
+            repository.runUploadQueueNow()
             refreshDashboardAndCoverage(fetchRemoteQuota = true)
         }
     }

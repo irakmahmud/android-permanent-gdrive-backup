@@ -134,7 +134,9 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                         val targetFolder = driveBreadcrumbs.lastOrNull()?.second ?: "Direct_Uploads"
-                        viewModel.uploadDirectUrisToDrive(uris, targetFolder)
+                        // Inside a My Drive folder -> upload straight into that exact Drive folder
+                        val targetFolderId = driveBreadcrumbs.lastOrNull()?.first
+                        viewModel.uploadDirectUrisToDrive(uris, targetFolder, targetDriveFolderId = targetFolderId)
                     }
                 }
 
@@ -453,17 +455,27 @@ class MainActivity : ComponentActivity() {
             }
         }
         if (collectedUris.isNotEmpty()) {
-            collectedUris.forEach { u ->
+            val persistedUris = mutableListOf<Uri>()
+            val temporaryUris = mutableListOf<Uri>()
+            collectedUris.distinct().forEach { u ->
                 try {
                     contentResolver.takePersistableUriPermission(
                         u,
                         Intent.FLAG_GRANT_READ_URI_PERMISSION
                     )
+                    persistedUris.add(u)
                 } catch (_: Throwable) {
+                    // Temporary share grant only: bytes are staged app-privately before the sender app dies
+                    temporaryUris.add(u)
                 }
             }
             intent.action = ""
-            viewModel.uploadDirectUrisToDrive(collectedUris.distinct(), "Shared_To_Drive")
+            if (persistedUris.isNotEmpty()) {
+                viewModel.uploadDirectUrisToDrive(persistedUris, "Shared_To_Drive")
+            }
+            if (temporaryUris.isNotEmpty()) {
+                viewModel.uploadDirectUrisToDrive(temporaryUris, "Shared_To_Drive", stageTemporaryGrant = true)
+            }
         }
     }
 

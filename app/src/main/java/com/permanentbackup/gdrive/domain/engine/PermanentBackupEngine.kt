@@ -29,6 +29,7 @@ import com.permanentbackup.gdrive.domain.model.SyncJobState
 import com.permanentbackup.gdrive.domain.model.UploadSessionExpiredException
 import com.permanentbackup.gdrive.domain.model.UploadStatus
 import com.permanentbackup.gdrive.domain.model.VerificationStatus
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -71,16 +72,28 @@ class PermanentBackupEngine(
     private val backupDao: BackupDao,
     private val storageSource: StorageFileSource,
     private val driveApiClient: DriveApiClient,
-    private val authManager: GoogleAuthManager
+    private val authManager: GoogleAuthManager,
+    private val deviceConditions: DeviceConditionsProvider = AlwaysSatisfiedDeviceConditions
 ) {
     companion object {
         const val ROOT_DRIVE_FOLDER_NAME = "Android_Permanent_Backup"
         const val PAGINATION_BATCH_SIZE = 500
+        const val UPLOAD_BATCH_SIZE = 50
+
+        /** Identity prefix for direct uploads that target an explicit Google Drive folder ID (My Drive "Upload File"). */
+        const val SHARED_DRIVE_TARGET_PREFIX = "shared:drive:"
+        private const val MAX_PINNED_ANCESTOR_DEPTH = 32
     }
 
     private val _activeUploadProgress = MutableStateFlow<ActiveUploadProgress?>(null)
     val activeUploadProgress: StateFlow<ActiveUploadProgress?> = _activeUploadProgress.asStateFlow()
 
+    /** Live progress of EVERY concurrently running upload worker, keyed by record ID. */
+    private val _activeUploads = MutableStateFlow<Map<Long, ActiveUploadProgress>>(emptyMap())
+    val activeUploads: StateFlow<Map<Long, ActiveUploadProgress>> = _activeUploads.asStateFlow()
+    private val progressLock = Any()
+
+    /** Aggregate speed of all parallel upload streams. */
     private val _currentSpeedBps = MutableStateFlow(0L)
     val currentSpeedBps: StateFlow<Long> = _currentSpeedBps.asStateFlow()
 
@@ -102,17 +115,30 @@ class PermanentBackupEngine(
     private val _latestQuotaInfo = MutableStateFlow(DriveQuotaInfo())
     val latestQuotaInfo: StateFlow<DriveQuotaInfo> = _latestQuotaInfo.asStateFlow()
 
+    /** Last reason uploads were held back by Settings (Wi-Fi only / Charging only), or null. */
+    private val _transferConditionBlock = MutableStateFlow<String?>(null)
+    val transferConditionBlock: StateFlow<String?> = _transferConditionBlock.asStateFlow()
+
     /**
      * Optional callback invoked during incremental cloud changes sync when a pinned offline file
-     * has been updated on Google Drive so the local offline cache is automatically refreshed.
+     * has been updated on Google Drive (or a new file appeared inside a pinned offline folder)
+     * so the local offline cache is automatically refreshed.
      */
     var onPinnedCloudFileModified: (suspend (CloudBrowseItem) -> Unit)? = null
+
+    /** Invoked after a changes poll detected at least one change (used to keep Mirror folders in sync). */
+    var onCloudChangesDetected: (suspend (Int) -> Unit)? = null
+
+    /** Invoked after a record is VERIFIED on Drive (used to clean up app-private share staging copies). */
+    var onRecordVerified: (suspend (BackupFileEntity) -> Unit)? = null
 
     private val pausedRecordIds: MutableSet<Long> = Collections.synchronizedSet(HashSet())
     private val cycleMutex = Mutex()
     private val folderCreationMutex = Mutex()
     @Volatile
     private var activeCycleDeferred: CompletableDeferred<BackupCycleSummary>? = null
+    @Volatile
+    private var rerunRequestedSettings: BackupSettings? = null
 
     fun setEnginePaused(paused: Boolean) {
         _isPaused.value = paused
@@ -121,10 +147,67 @@ class PermanentBackupEngine(
     suspend fun pauseSingleRecord(recordId: Long, paused: Boolean) {
         if (paused) {
             pausedRecordIds.add(recordId)
+            backupDao.setSyncJobPaused(recordId, true)
         } else {
             pausedRecordIds.remove(recordId)
+            // Resume = eligible immediately (clears pause flag AND any exponential retry backoff)
+            backupDao.setSyncJobPaused(recordId, false)
+            backupDao.clearSyncJobRetryBackoff(recordId)
         }
-        backupDao.setSyncJobPaused(recordId, paused)
+    }
+
+    fun isRecordPaused(recordId: Long): Boolean = recordId in pausedRecordIds
+
+    private fun publishUploadProgress(progress: ActiveUploadProgress) {
+        synchronized(progressLock) {
+            val updated = _activeUploads.value + (progress.recordId to progress)
+            _activeUploads.value = updated
+            _activeUploadProgress.value = progress
+            _currentSpeedBps.value = updated.values.sumOf { it.transferSpeedBps }
+        }
+    }
+
+    private fun clearUploadProgress(recordId: Long) {
+        synchronized(progressLock) {
+            val updated = _activeUploads.value - recordId
+            _activeUploads.value = updated
+            _activeUploadProgress.value = updated.values.lastOrNull()
+            _currentSpeedBps.value = updated.values.sumOf { it.transferSpeedBps }
+        }
+    }
+
+    private fun resetAllUploadProgress() {
+        synchronized(progressLock) {
+            _activeUploads.value = emptyMap()
+            _activeUploadProgress.value = null
+            _currentSpeedBps.value = 0L
+        }
+    }
+
+    /**
+     * Re-evaluates Settings → "Wi-Fi only" / "Charging only" against the live device state.
+     * Publishes the user-facing block reason to [transferConditionBlock] (or clears it).
+     */
+    fun checkTransferConditions(settings: BackupSettings): TransferConditionResult {
+        val result = try {
+            deviceConditions.evaluate(settings)
+        } catch (e: Exception) {
+            TransferConditionResult(true)
+        }
+        _transferConditionBlock.value = if (result.allowed) null else result.blockReason
+        return result
+    }
+
+    /**
+     * Explicit Google Drive folder ID encoded in a direct-upload identity
+     * (`shared:drive:<folderId>/<fileName>`), or null for regular mirrored-hierarchy backups.
+     */
+    fun explicitDriveTargetFolderId(sourceFileIdentity: String): String? {
+        if (!sourceFileIdentity.startsWith(SHARED_DRIVE_TARGET_PREFIX)) return null
+        return sourceFileIdentity.removePrefix(SHARED_DRIVE_TARGET_PREFIX)
+            .substringBefore('/')
+            .trim()
+            .ifBlank { null }
     }
 
     /**
@@ -200,7 +283,11 @@ class PermanentBackupEngine(
 
     /**
      * Incremental Google Drive Changes API v3 sync across all available pages (Section 9).
-     * Automatically refreshes any pinned offline files that were modified on Google Drive.
+     * - Indexes new/modified Drive files in the local `cloud_files` cache.
+     * - Hides files reported `removed`/`trashed` from the LOCAL cache only (zero cloud deletion).
+     * - Automatically refreshes pinned offline files modified on Drive and auto-pins new files that
+     *   appear inside a folder the user pinned with "Keep Folder Offline".
+     * - Notifies [onCloudChangesDetected] so one-way Mirror folders stay in sync.
      */
     suspend fun syncCloudChangesIncremental(): Int {
         if (!authManager.accountState.value.isConnected) return 0
@@ -224,6 +311,7 @@ class PermanentBackupEngine(
             var totalChanged = 0
             var pageCount = 0
             val modifiedPinnedItems = mutableListOf<CloudBrowseItem>()
+            val pinnedAncestorCache = HashMap<String, Boolean>()
 
             while (!currentPageToken.isNullOrBlank() && pageCount < 10) {
                 pageCount++
@@ -236,11 +324,16 @@ class PermanentBackupEngine(
                     val entities = changesPage.changedFiles.map { item ->
                         val prev = backupDao.getCloudFileById(item.driveFileId)
                         val isPinned = prev?.isPinnedOffline ?: false
-                        if (isPinned && !item.isFolder) {
-                            val modifiedChanged = item.modifiedTimeMs > 0L && item.modifiedTimeMs != prev?.modifiedTimeMs
-                            val checksumChanged = !item.md5Checksum.isNullOrBlank() && item.md5Checksum != prev?.md5Checksum
-                            if (modifiedChanged || checksumChanged) {
-                                modifiedPinnedItems.add(item.copy(isPinnedOffline = true))
+                        if (!item.isFolder) {
+                            if (isPinned) {
+                                val modifiedChanged = item.modifiedTimeMs > 0L && item.modifiedTimeMs != prev?.modifiedTimeMs
+                                val checksumChanged = !item.md5Checksum.isNullOrBlank() && item.md5Checksum != prev?.md5Checksum
+                                if (modifiedChanged || checksumChanged || prev?.trashed == true) {
+                                    modifiedPinnedItems.add(item.copy(isPinnedOffline = true))
+                                }
+                            } else if (isInsidePinnedOfflineFolder(item.parentFolderId, pinnedAncestorCache)) {
+                                // New/updated file inside a "Keep Folder Offline" folder -> auto-pin
+                                modifiedPinnedItems.add(item)
                             }
                         }
                         CloudFileEntity(
@@ -252,6 +345,7 @@ class PermanentBackupEngine(
                             md5Checksum = item.md5Checksum,
                             sha256Checksum = item.sha256Checksum,
                             parentFolderId = item.parentFolderId,
+                            relativePath = prev?.relativePath,
                             isFolder = item.isFolder,
                             isProtectedBackupFile = item.isProtectedBackupFile,
                             starred = item.starred,
@@ -266,6 +360,13 @@ class PermanentBackupEngine(
                     }
                     backupDao.upsertCloudFiles(entities)
                     totalChanged += changesPage.changedFiles.size
+                }
+                if (changesPage.removedFileIds.isNotEmpty()) {
+                    // LOCAL cache hygiene only: hides ghost entries in My Drive / virtual drive.
+                    // Nothing is deleted or trashed on Google Drive, and pinned bytes stay on disk
+                    // so an un-trash on Drive restores the entry seamlessly.
+                    backupDao.markCloudFilesRemovedLocally(changesPage.removedFileIds.distinct())
+                    totalChanged += changesPage.removedFileIds.size
                 }
                 if (!changesPage.newStartPageToken.isNullOrBlank()) {
                     latestStartPageToken = changesPage.newStartPageToken
@@ -286,27 +387,90 @@ class PermanentBackupEngine(
                 )
             )
 
-            // Refresh any modified pinned offline files automatically
+            // Refresh modified pinned offline files / auto-pin new files in pinned folders
             for (pinnedItem in modifiedPinnedItems) {
                 try {
                     onPinnedCloudFileModified?.invoke(pinnedItem)
-                } catch (_: Throwable) {
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                }
+            }
+
+            if (totalChanged > 0) {
+                try {
+                    onCloudChangesDetected?.invoke(totalChanged)
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
                 }
             }
 
             totalChanged
-        } catch (_: Throwable) {
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
             0
         }
+    }
+
+    private suspend fun isInsidePinnedOfflineFolder(parentFolderId: String?, cache: MutableMap<String, Boolean>): Boolean {
+        val visited = ArrayList<String>()
+        var nextId: String? = parentFolderId
+        var depth = 0
+        var result = false
+        while (depth < MAX_PINNED_ANCESTOR_DEPTH) {
+            val id = nextId
+            if (id.isNullOrBlank()) break
+            val cached = cache[id]
+            if (cached != null) {
+                result = cached
+                break
+            }
+            visited.add(id)
+            val entity = backupDao.getCloudFileById(id) ?: break
+            if (entity.isFolder && entity.isPinnedOffline && !entity.trashed) {
+                result = true
+                break
+            }
+            nextId = entity.parentFolderId
+            depth++
+        }
+        visited.forEach { cache[it] = result }
+        return result
     }
 
     /**
      * Executes a complete scan + deduplication + version detection + resumable upload cycle.
      * Coalesces concurrent invocations so two callers never scan or upload in parallel.
+     *
+     * @param respectRetryBackoff when true (automatic/background triggers), records in RETRY_SCHEDULED
+     *   whose exponential `nextRetryAtMs` is still in the future are skipped. Manual runs retry immediately.
      */
-    suspend fun runBackupCycle(settings: BackupSettings): BackupCycleSummary {
+    suspend fun runBackupCycle(
+        settings: BackupSettings,
+        respectRetryBackoff: Boolean = false
+    ): BackupCycleSummary = runCoalesced(settings) {
+        executeBackupCycleInternal(settings, respectRetryBackoff)
+    }
+
+    /**
+     * Uploads already-queued records only (no full storage rescan). Used by single-file "Backup File",
+     * share-sheet uploads, the real-time watcher (after targeted queuing), Resume and the SAF provider.
+     */
+    suspend fun runUploadQueueOnly(
+        settings: BackupSettings,
+        respectRetryBackoff: Boolean = false
+    ): BackupCycleSummary = runCoalesced(settings) {
+        executeUploadOnlyInternal(settings, respectRetryBackoff)
+    }
+
+    private suspend fun runCoalesced(
+        settings: BackupSettings,
+        block: suspend () -> BackupCycleSummary
+    ): BackupCycleSummary {
         activeCycleDeferred?.let { inFlight ->
             if (inFlight.isActive) {
+                // A cycle is already running: ask it to make one more upload pass for anything queued
+                // after it started (e.g. a Resume tap or a watcher event), then share its result.
+                rerunRequestedSettings = settings
                 return inFlight.await()
             }
         }
@@ -314,7 +478,20 @@ class PermanentBackupEngine(
             val deferred = CompletableDeferred<BackupCycleSummary>()
             activeCycleDeferred = deferred
             try {
-                val summary = executeBackupCycleInternal(settings)
+                rerunRequestedSettings = null
+                var summary = block()
+                var extraPasses = 0
+                while (extraPasses < 3 && !_isPaused.value) {
+                    val pendingRerun = rerunRequestedSettings ?: break
+                    rerunRequestedSettings = null
+                    extraPasses++
+                    val extra = executeUploadOnlyInternal(pendingRerun, respectRetryBackoff = false)
+                    summary = summary.copy(
+                        uploadedAndVerifiedFiles = summary.uploadedAndVerifiedFiles + extra.uploadedAndVerifiedFiles,
+                        failedUploads = summary.failedUploads + extra.failedUploads,
+                        quotaFull = summary.quotaFull || extra.quotaFull
+                    )
+                }
                 deferred.complete(summary)
                 summary
             } catch (t: Throwable) {
@@ -326,7 +503,52 @@ class PermanentBackupEngine(
         }
     }
 
-    private suspend fun executeBackupCycleInternal(settings: BackupSettings): BackupCycleSummary {
+    private suspend fun executeUploadOnlyInternal(
+        settings: BackupSettings,
+        respectRetryBackoff: Boolean
+    ): BackupCycleSummary {
+        if (!settings.userBackupConsentGranted) {
+            val msg = "User backup consent not granted yet. No files were scanned or read."
+            _lastPermissionError.value = msg
+            return BackupCycleSummary(0, 0, 0, 0, 0, 0, permissionDenied = true, errorMessage = msg)
+        }
+        if (settings.backgroundSyncPaused || _isPaused.value) {
+            return BackupCycleSummary(
+                0, 0, 0, 0, 0,
+                preservedDeletedLocalFiles = backupDao.countPreservedAfterLocalDelete(),
+                errorMessage = "Backup is currently paused by user."
+            )
+        }
+        if (!authManager.accountState.value.isConnected) {
+            return BackupCycleSummary(
+                0, 0, 0, 0, 0,
+                preservedDeletedLocalFiles = backupDao.countPreservedAfterLocalDelete(),
+                errorMessage = "Google Account is not connected. Queued files are kept safely."
+            )
+        }
+        _isRunning.value = true
+        try {
+            val outcome = processPendingUploadQueue(settings, respectRetryBackoff)
+            return BackupCycleSummary(
+                scannedFiles = 0,
+                newlyQueuedVersions = 0,
+                skippedUnchangedFiles = 0,
+                uploadedAndVerifiedFiles = outcome.first,
+                failedUploads = outcome.second,
+                preservedDeletedLocalFiles = backupDao.countPreservedAfterLocalDelete(),
+                quotaFull = _quotaFullState.value,
+                errorMessage = _transferConditionBlock.value ?: _lastNetworkError.value
+            )
+        } finally {
+            resetAllUploadProgress()
+            _isRunning.value = false
+        }
+    }
+
+    private suspend fun executeBackupCycleInternal(
+        settings: BackupSettings,
+        respectRetryBackoff: Boolean
+    ): BackupCycleSummary {
         if (!settings.userBackupConsentGranted) {
             val msg = "User backup consent not granted yet. No files were scanned or read."
             _lastPermissionError.value = msg
@@ -421,7 +643,7 @@ class PermanentBackupEngine(
                 )
             }
 
-            val uploadOutcome = processPendingUploadQueue(settings)
+            val uploadOutcome = processPendingUploadQueue(settings, respectRetryBackoff)
 
             // Step 5: Poll Google Drive Changes API v3 incrementally & auto-refresh modified pinned offline files
             syncCloudChangesIncremental()
@@ -434,11 +656,10 @@ class PermanentBackupEngine(
                 failedUploads = uploadOutcome.second,
                 preservedDeletedLocalFiles = preservedDeletedCount,
                 quotaFull = _quotaFullState.value,
-                errorMessage = _lastNetworkError.value
+                errorMessage = _transferConditionBlock.value ?: _lastNetworkError.value
             )
         } finally {
-            _activeUploadProgress.value = null
-            _currentSpeedBps.value = 0L
+            resetAllUploadProgress()
             _isRunning.value = false
         }
     }
@@ -670,9 +891,17 @@ class PermanentBackupEngine(
         return backupDao.countPreservedAfterLocalDelete()
     }
 
-    private suspend fun processPendingUploadQueue(settings: BackupSettings): Pair<Int, Int> {
+    private suspend fun processPendingUploadQueue(
+        settings: BackupSettings,
+        respectRetryBackoff: Boolean = false
+    ): Pair<Int, Int> {
         var verifiedCount = 0
         var failedCount = 0
+
+        // Engine-level Settings enforcement (manual / share / watcher / provider runs bypass WorkManager constraints)
+        if (!checkTransferConditions(settings).allowed) {
+            return 0 to 0
+        }
 
         val accessToken = try {
             authManager.getValidAccessToken()
@@ -721,20 +950,58 @@ class PermanentBackupEngine(
         val accountId = currentAccountId()
         val concurrency = settings.uploadConcurrency.coerceIn(1, 4)
 
+        // Every record is attempted at most once per pass. Paging skips records that are paused, still inside
+        // their exponential retry backoff window, or already attempted, so they can never starve records behind
+        // them in the queue (previously the first 50 blocked records stalled the whole queue).
+        val attemptedIds = HashSet<Long>()
+        var pageOffset = 0
+        var batchesProcessed = 0
+
         while (!_isPaused.value) {
-            val batch = backupDao.getPendingRecordsForAccountPaged(accountId = accountId, limit = 50, offset = 0)
+            val batch = backupDao.getPendingRecordsForAccountPaged(
+                accountId = accountId,
+                limit = UPLOAD_BATCH_SIZE,
+                offset = pageOffset
+            )
             if (batch.isEmpty()) break
 
+            // Re-check Wi-Fi / charging between batches (e.g. the phone left Wi-Fi mid-run)
+            if (batchesProcessed > 0 && !checkTransferConditions(settings).allowed) break
+            batchesProcessed++
+
+            val nowMs = System.currentTimeMillis()
+            val eligibleRecords = ArrayList<BackupFileEntity>(batch.size)
+            for (record in batch) {
+                if (record.id in attemptedIds || record.id in pausedRecordIds) continue
+                val job = backupDao.getSyncJobByRecordId(record.id)
+                if (job?.isPaused == true) {
+                    // Persisted per-file pause survives process death
+                    pausedRecordIds.add(record.id)
+                    continue
+                }
+                if (respectRetryBackoff) {
+                    val nextRetryAt = job?.nextRetryAtMs
+                    if (nextRetryAt != null && nextRetryAt > nowMs) continue
+                }
+                eligibleRecords.add(record)
+            }
+
+            if (eligibleRecords.isEmpty()) {
+                pageOffset += batch.size
+                continue
+            }
+            eligibleRecords.forEach { attemptedIds.add(it.id) }
+
+            var verifiedInBatch = 0
             if (concurrency <= 1) {
-                var madeProgressInBatch = false
-                for (record in batch) {
+                for (record in eligibleRecords) {
                     if (_isPaused.value) break
                     if (record.id in pausedRecordIds) continue
 
                     val success = uploadSingleRecordResumable(record, rootFolderId, settings)
                     if (success) {
                         verifiedCount++
-                        madeProgressInBatch = true
+                        verifiedInBatch++
                     } else if (!_isPaused.value && record.id !in pausedRecordIds) {
                         failedCount++
                         if (_quotaFullState.value) {
@@ -742,13 +1009,10 @@ class PermanentBackupEngine(
                         }
                     }
                 }
-                if (!madeProgressInBatch) break
             } else {
                 val semaphore = Semaphore(concurrency)
                 val batchVerified = AtomicInteger(0)
                 val batchFailed = AtomicInteger(0)
-                val eligibleRecords = batch.filter { it.id !in pausedRecordIds }
-                if (eligibleRecords.isEmpty()) break
 
                 coroutineScope {
                     eligibleRecords.map { record ->
@@ -767,10 +1031,14 @@ class PermanentBackupEngine(
                         }
                     }.awaitAll()
                 }
-                verifiedCount += batchVerified.get()
+                verifiedInBatch = batchVerified.get()
+                verifiedCount += verifiedInBatch
                 failedCount += batchFailed.get()
-                if (_quotaFullState.value || batchVerified.get() == 0) break
             }
+            if (_quotaFullState.value) break
+
+            // VERIFIED records leave the pending set; everything else in this page stays in place.
+            pageOffset += (batch.size - verifiedInBatch).coerceAtLeast(0)
         }
 
         return verifiedCount to failedCount
@@ -779,8 +1047,71 @@ class PermanentBackupEngine(
     /**
      * Streams a single file record to Google Drive using Resumable Upload & verifies remote integrity.
      * Follows SyncJobState: PREPARING -> UPLOADING -> VERIFYING -> COMPLETED.
+     * Each concurrent worker publishes its own entry in [activeUploads]; the entry is always removed when
+     * the worker finishes (success, failure, pause or cancellation).
      */
     suspend fun uploadSingleRecordResumable(
+        initialRecord: BackupFileEntity,
+        rootDriveFolderId: String,
+        settings: BackupSettings
+    ): Boolean {
+        return try {
+            uploadSingleRecordResumableInternal(initialRecord, rootDriveFolderId, settings)
+        } finally {
+            clearUploadProgress(initialRecord.id)
+        }
+    }
+
+    /**
+     * Google Drive Desktop-style content deduplication: if identical bytes (same SHA-256 + size) were already
+     * VERIFIED for this account, create an independent server-side copy instead of re-uploading.
+     * The source Drive file is never modified, moved or deleted. Returns the new Drive file ID only when the
+     * copy passes remote size/checksum verification; otherwise returns null and the caller uploads normally.
+     */
+    private suspend fun tryServerSideCopyDedup(
+        accessToken: String,
+        accountId: String,
+        record: BackupFileEntity,
+        targetFolderId: String
+    ): String? {
+        val sha256 = record.sha256Hash
+        if (sha256.isNullOrBlank() || record.fileSize <= 0L) return null
+        val duplicate = backupDao.findVerifiedDuplicateBySha256(
+            accountId = accountId,
+            sha256 = sha256,
+            fileSize = record.fileSize,
+            excludeRecordId = record.id
+        ) ?: return null
+        val sourceDriveFileId = duplicate.driveFileId ?: return null
+        return try {
+            val copied = driveApiClient.copyDriveFile(
+                accessToken = accessToken,
+                sourceDriveFileId = sourceDriveFileId,
+                parentFolderId = targetFolderId,
+                newName = record.driveStoredName,
+                localSha256 = sha256,
+                backupVersion = record.backupVersion
+            )
+            val verification = driveApiClient.verifyRemoteFile(
+                accessToken = accessToken,
+                driveFileId = copied.id,
+                expectedSize = record.fileSize,
+                expectedMd5 = record.md5Hash,
+                expectedSha256 = sha256
+            )
+            if (verification == VerificationStatus.VERIFICATION_FAILED) null else copied.id
+        } catch (e: StorageQuotaFullException) {
+            throw e
+        } catch (e: AuthTokenExpiredException) {
+            throw e
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            // Source missing on Drive (removed via web UI), permission or transient error -> regular upload
+            null
+        }
+    }
+
+    private suspend fun uploadSingleRecordResumableInternal(
         initialRecord: BackupFileEntity,
         rootDriveFolderId: String,
         settings: BackupSettings
@@ -880,11 +1211,13 @@ class PermanentBackupEngine(
         val chunkSize = settings.chunkSizeBytes.coerceAtLeast(DriveApiClient.DEFAULT_CHUNK_SIZE_BYTES)
 
         try {
-            val targetFolderId = resolveDriveSubFolderHierarchy(
-                accessToken = accessToken,
-                rootFolderId = rootDriveFolderId,
-                relativeFilePath = record.relativePath
-            )
+            // Direct uploads into an explicit Drive folder (My Drive "Upload File") bypass the mirrored hierarchy
+            val targetFolderId = explicitDriveTargetFolderId(record.sourceFileIdentity)
+                ?: resolveDriveSubFolderHierarchy(
+                    accessToken = accessToken,
+                    rootFolderId = rootDriveFolderId,
+                    relativeFilePath = record.relativePath
+                )
 
             // Section 7 Reconciliation Check: If a previous upload succeeded remotely right before a local crash
             // or DB failure, reconcile with the existing remote file without uploading a duplicate!
@@ -930,6 +1263,22 @@ class PermanentBackupEngine(
 
             // Step B: Start a new Resumable Upload session if needed
             if (sessionUri.isNullOrBlank()) {
+                // Step B0: Content dedup (moved / renamed / duplicated files) via server-side copy — zero re-upload
+                val dedupDriveFileId = tryServerSideCopyDedup(
+                    accessToken = accessToken,
+                    accountId = accountId,
+                    record = record,
+                    targetFolderId = targetFolderId
+                )
+                if (dedupDriveFileId != null) {
+                    return finalizeAndVerifyUpload(
+                        accessToken = accessToken,
+                        record = record,
+                        driveFileId = dedupDriveFileId,
+                        driveFolderId = targetFolderId
+                    )
+                }
+
                 sessionUri = driveApiClient.initiateResumableUploadSession(
                     accessToken = accessToken,
                     parentFolderId = targetFolderId,
@@ -1028,22 +1377,23 @@ class PermanentBackupEngine(
                         } else {
                             0L
                         }
-                        _currentSpeedBps.value = speedBps
                         val remainingBytes = (record.fileSize - currentOffset).coerceAtLeast(0L)
                         val etaSeconds = if (speedBps > 0L) remainingBytes / speedBps else null
 
-                        _activeUploadProgress.value = ActiveUploadProgress(
-                            recordId = record.id,
-                            fileName = record.driveStoredName,
-                            relativePath = record.relativePath,
-                            backupVersion = record.backupVersion,
-                            uploadedBytes = currentOffset,
-                            totalBytes = record.fileSize,
-                            resumableSessionActive = true,
-                            transferSpeedBps = speedBps,
-                            estimatedRemainingSeconds = etaSeconds,
-                            syncJobState = SyncJobState.UPLOADING,
-                            isPaused = record.id in pausedRecordIds
+                        publishUploadProgress(
+                            ActiveUploadProgress(
+                                recordId = record.id,
+                                fileName = record.driveStoredName,
+                                relativePath = record.relativePath,
+                                backupVersion = record.backupVersion,
+                                uploadedBytes = currentOffset,
+                                totalBytes = record.fileSize,
+                                resumableSessionActive = true,
+                                transferSpeedBps = speedBps,
+                                estimatedRemainingSeconds = etaSeconds,
+                                syncJobState = SyncJobState.UPLOADING,
+                                isPaused = record.id in pausedRecordIds
+                            )
                         )
 
                         val nextChunkLen = minOf(chunkSize.toLong(), remainingBytes).toInt()
@@ -1477,10 +1827,23 @@ class PermanentBackupEngine(
             newState = SyncJobState.COMPLETED,
             uploadedBytes = record.fileSize,
             totalBytes = record.fileSize,
-            transferSpeedBps = _currentSpeedBps.value
+            transferSpeedBps = _activeUploads.value[record.id]?.transferSpeedBps ?: 0L
         )
 
         _lastNetworkError.value = null
+
+        // Post-verification hooks (e.g. delete app-private share staging copy). Failures never undo VERIFIED.
+        try {
+            onRecordVerified?.invoke(
+                record.copy(
+                    uploadStatus = UploadStatus.VERIFIED,
+                    driveFileId = driveFileId,
+                    driveFolderId = driveFolderId
+                )
+            )
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+        }
         return true
     }
 

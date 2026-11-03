@@ -12,6 +12,15 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
 
+/** Result of an incremental one-way Mirror folder refresh. */
+data class MirrorSyncOutcome(
+    val success: Boolean,
+    val filesDownloaded: Int,
+    val filesSkippedUnchanged: Int,
+    val bytesDownloaded: Long,
+    val message: String
+)
+
 /**
  * Section 5D, 5E, 5F, 10 & 15:
  * Manages Cloud File Restore (strictly non-overwriting & path-traversal safe),
@@ -28,6 +37,7 @@ class CloudFileOperationsManager(
 ) {
     companion object {
         const val PREVIEW_MAX_BYTES = 16 * 1024L // 16 KiB streaming preview snippet
+        const val MIRROR_SUBFOLDER = "Drive_Mirror"
     }
 
     /**
@@ -252,8 +262,114 @@ class CloudFileOperationsManager(
     suspend fun mirrorCloudFolderToLocal(folderItem: CloudBrowseItem): RestoreOutcome {
         return restoreCloudFolderRecursively(
             folderItem = folderItem,
-            targetSubfolder = "Drive_Mirror"
+            targetSubfolder = MIRROR_SUBFOLDER
         )
+    }
+
+    /**
+     * Incremental refresh of an existing one-way Mirror folder (`Restored_From_Drive/Drive_Mirror/<folder>`):
+     * - Files already mirrored with the same byte size are skipped (no re-download).
+     * - New Drive files are downloaded; changed Drive files are saved as a NEW non-overwriting local copy,
+     *   so neither Google Drive nor any previously mirrored local file is ever deleted or overwritten.
+     */
+    suspend fun syncMirrorFolderIncremental(folderItem: CloudBrowseItem, maxDepth: Int = 6): MirrorSyncOutcome {
+        if (!folderItem.isFolder) return MirrorSyncOutcome(false, 0, 0, 0L, "Not a folder")
+        return try {
+            val accessToken = authManager.getValidAccessToken()
+            val accountId = folderItem.accountId.ifBlank { "default_account" }
+            val baseRestoreDir = resolveRestoreBaseDirectory()
+            val baseSubfolder = "$MIRROR_SUBFOLDER/${sanitizeSafeLocalFileName(folderItem.name)}"
+            var downloaded = 0
+            var skipped = 0
+            var bytes = 0L
+
+            // Per-folder ledger (driveFileId -> modifiedTime:size:md5) so a changed Drive file is mirrored once,
+            // not re-downloaded as a fresh copy on every Changes API poll.
+            val ledgerDir = File(context?.filesDir ?: baseRestoreDir, "mirror_ledger")
+            val ledgerFile = File(ledgerDir, "${sanitizeSafeLocalFileName(folderItem.driveFileId)}.properties")
+            val ledger = java.util.Properties()
+            if (ledgerFile.exists()) {
+                ledgerFile.inputStream().use { ledger.load(it) }
+            }
+            var ledgerDirty = false
+
+            suspend fun traverse(currentFolderId: String, relSubfolder: String, depth: Int) {
+                if (depth > maxDepth) return
+                var pageToken: String? = null
+                do {
+                    val page = driveApiClient.listDriveFiles(
+                        accessToken = accessToken,
+                        accountId = accountId,
+                        parentFolderId = currentFolderId,
+                        pageSize = 100,
+                        pageToken = pageToken
+                    )
+                    for (child in page.files) {
+                        if (child.isFolder) {
+                            traverse(child.driveFileId, "$relSubfolder/${sanitizeSafeLocalFileName(child.name)}", depth + 1)
+                            continue
+                        }
+                        val safeSub = relSubfolder.replace('\\', '/').split('/')
+                            .map { sanitizeSafeLocalFileName(it) }
+                            .filter { it.isNotBlank() && it != "restored_file" }
+                            .joinToString(File.separator)
+                        val exportFormat = if (driveApiClient.isGoogleWorkspaceDocument(child.mimeType)) {
+                            driveApiClient.resolveWorkspaceExportFormat(child.mimeType)
+                        } else {
+                            null
+                        }
+                        val baseName = sanitizeSafeLocalFileName(child.name)
+                        val expectedName = if (exportFormat != null && !baseName.endsWith(exportFormat.second, ignoreCase = true)) {
+                            "$baseName${exportFormat.second}"
+                        } else {
+                            baseName
+                        }
+                        val expectedFile = File(File(baseRestoreDir, safeSub), expectedName)
+                        val fingerprint = "${child.modifiedTimeMs}:${child.sizeBytes}:${child.md5Checksum.orEmpty()}"
+                        val ledgerHit = ledger.getProperty(child.driveFileId) == fingerprint
+                        val initialMirrorMatch = !ledger.containsKey(child.driveFileId) && expectedFile.exists() && (
+                            exportFormat != null || child.sizeBytes <= 0L || expectedFile.length() == child.sizeBytes
+                            )
+                        if (ledgerHit || initialMirrorMatch) {
+                            if (!ledgerHit) {
+                                ledger.setProperty(child.driveFileId, fingerprint)
+                                ledgerDirty = true
+                            }
+                            skipped++
+                            continue
+                        }
+                        val outcome = restoreCloudFileToLocal(
+                            driveFileId = child.driveFileId,
+                            originalFileName = child.name,
+                            targetSubfolder = relSubfolder,
+                            mimeType = child.mimeType
+                        )
+                        if (outcome.success) {
+                            downloaded++
+                            bytes += outcome.restoredBytes
+                            ledger.setProperty(child.driveFileId, fingerprint)
+                            ledgerDirty = true
+                        }
+                    }
+                    pageToken = page.nextPageToken
+                } while (!pageToken.isNullOrBlank())
+            }
+
+            traverse(folderItem.driveFileId, baseSubfolder, 1)
+            if (ledgerDirty) {
+                ledgerFile.parentFile?.mkdirs()
+                FileOutputStream(ledgerFile).use { ledger.store(it, "Permanent Drive one-way mirror ledger") }
+            }
+            MirrorSyncOutcome(
+                success = true,
+                filesDownloaded = downloaded,
+                filesSkippedUnchanged = skipped,
+                bytesDownloaded = bytes,
+                message = "Mirror '${folderItem.name}': $downloaded new/changed file(s) downloaded, $skipped unchanged."
+            )
+        } catch (e: Exception) {
+            MirrorSyncOutcome(false, 0, 0, 0L, "Mirror refresh failed: ${e.message}")
+        }
     }
 
     /**

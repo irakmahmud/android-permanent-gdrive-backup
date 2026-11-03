@@ -39,7 +39,8 @@ class PermanentBackupWorker(
         // Re-arm one-time ContentUriTrigger observer for continuous real-time MediaStore watching
         BackupWorkScheduler.scheduleContentUriTriggeredBackup(applicationContext, currentSettings)
 
-        val summary = app.repository.runBackupNow()
+        // Automatic trigger: respect each failed file's exponential retry backoff window
+        val summary = app.repository.runBackupNow(respectRetryBackoff = true)
 
         if (summary.quotaFull || summary.permissionDenied) {
             // Do not endlessly spin retries when storage quota is full or user revoked permission

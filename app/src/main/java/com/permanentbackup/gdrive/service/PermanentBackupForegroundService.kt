@@ -37,10 +37,23 @@ class PermanentBackupForegroundService : Service() {
         const val ACTION_PAUSE_BACKUP = "com.permanentbackup.gdrive.action.PAUSE_BACKUP"
         const val ACTION_RESUME_BACKUP = "com.permanentbackup.gdrive.action.RESUME_BACKUP"
         const val ACTION_STOP_BACKUP = "com.permanentbackup.gdrive.action.STOP_BACKUP"
+        /** Upload already-queued files only (share-sheet / "Upload File") — no full storage rescan. */
+        const val ACTION_UPLOAD_QUEUE = "com.permanentbackup.gdrive.action.UPLOAD_QUEUE"
 
         fun startManualBackupService(context: Context) {
             val intent = Intent(context, PermanentBackupForegroundService::class.java).apply {
                 action = ACTION_START_BACKUP
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
+        }
+
+        fun startUploadQueueService(context: Context) {
+            val intent = Intent(context, PermanentBackupForegroundService::class.java).apply {
+                action = ACTION_UPLOAD_QUEUE
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(intent)
@@ -95,9 +108,14 @@ class PermanentBackupForegroundService : Service() {
 
         if (app != null) {
             startObservingLiveProgress(app)
+            val uploadQueueOnly = intent?.action == ACTION_UPLOAD_QUEUE
             serviceScope.launch {
                 try {
-                    app.repository.runBackupNow()
+                    if (uploadQueueOnly) {
+                        app.repository.runUploadQueueNow()
+                    } else {
+                        app.repository.runBackupNow()
+                    }
                 } finally {
                     progressObserverJob?.cancel()
                     if (app.repository.backupEngine.isPaused.value) {

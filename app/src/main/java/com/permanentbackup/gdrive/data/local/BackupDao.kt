@@ -531,4 +531,117 @@ interface BackupDao {
 
     @Query("SELECT * FROM drive_change_tokens WHERE accountId = :accountId LIMIT 1")
     suspend fun getDriveChangeToken(accountId: String): DriveChangeTokenEntity?
+
+    // ========================================================================
+    // v2.3.0 — Google Drive Desktop parity: account isolation, dedup, cache hygiene
+    // ========================================================================
+
+    /** Most recent VERIFIED backup of identical bytes for this account (server-side copy dedup source). */
+    @Query(
+        """
+        SELECT * FROM backup_file_records
+        WHERE accountId = :accountId
+          AND uploadStatus = 'VERIFIED'
+          AND sha256Hash = :sha256
+          AND fileSize = :fileSize
+          AND driveFileId IS NOT NULL
+          AND id != :excludeRecordId
+        ORDER BY lastSuccessfulBackupMs DESC
+        LIMIT 1
+        """
+    )
+    suspend fun findVerifiedDuplicateBySha256(
+        accountId: String,
+        sha256: String,
+        fileSize: Long,
+        excludeRecordId: Long
+    ): BackupFileEntity?
+
+    /** Hides Drive files reported removed/trashed from the LOCAL cache only (never touches Google Drive). */
+    @Query("UPDATE cloud_files SET trashed = 1 WHERE driveFileId IN (:driveFileIds)")
+    suspend fun markCloudFilesRemovedLocally(driveFileIds: List<String>)
+
+    @Query("UPDATE sync_jobs SET nextRetryAtMs = NULL, isPaused = 0, updatedAtMs = :nowMs WHERE recordId = :recordId")
+    suspend fun clearSyncJobRetryBackoff(recordId: Long, nowMs: Long = System.currentTimeMillis())
+
+    @Query("SELECT * FROM backup_file_records WHERE (accountId = :accountId OR accountId = 'default_account') ORDER BY createdAtMs DESC LIMIT 500")
+    fun observeRecentRecordsForAccount(accountId: String): Flow<List<BackupFileEntity>>
+
+    @Query("SELECT * FROM backup_file_records WHERE uploadStatus = 'VERIFIED' AND (accountId = :accountId OR accountId = 'default_account') ORDER BY lastSuccessfulBackupMs DESC LIMIT 500")
+    fun observeVerifiedHistoryForAccount(accountId: String): Flow<List<BackupFileEntity>>
+
+    @Query("SELECT * FROM backup_file_records WHERE uploadStatus IN ('FAILED', 'PENDING_RETRY') AND (accountId = :accountId OR accountId = 'default_account') ORDER BY createdAtMs DESC")
+    fun observeFailedRecordsForAccount(accountId: String): Flow<List<BackupFileEntity>>
+
+    @Query("SELECT * FROM backup_file_records WHERE uploadStatus IN ('PENDING', 'IN_PROGRESS', 'PENDING_RETRY') AND (accountId = :accountId OR accountId = 'default_account') ORDER BY createdAtMs ASC")
+    fun observeActiveQueueForAccount(accountId: String): Flow<List<BackupFileEntity>>
+
+    @Query("SELECT * FROM sync_jobs WHERE (accountId = :accountId OR accountId = 'default_account') ORDER BY updatedAtMs DESC LIMIT 500")
+    fun observeSyncJobsForAccount(accountId: String): Flow<List<SyncJobEntity>>
+
+    @Query("SELECT * FROM sync_events WHERE (accountId = :accountId OR accountId = 'default_account') ORDER BY timestampMs DESC LIMIT 200")
+    fun observeRecentSyncEventsForAccount(accountId: String): Flow<List<SyncEventEntity>>
+
+    @Query("SELECT * FROM failed_operations WHERE resolved = 0 AND (accountId = :accountId OR accountId = 'default_account') ORDER BY occurredAtMs DESC LIMIT 200")
+    fun observeUnresolvedFailuresForAccount(accountId: String): Flow<List<FailedOperationEntity>>
+
+    @Query("SELECT COUNT(*) FROM backup_file_records WHERE (accountId = :accountId OR accountId = 'default_account')")
+    suspend fun countAllRecordsForAccount(accountId: String): Int
+
+    @Query("SELECT COUNT(*) FROM backup_file_records WHERE uploadStatus = 'VERIFIED' AND (accountId = :accountId OR accountId = 'default_account')")
+    suspend fun countVerifiedRecordsForAccount(accountId: String): Int
+
+    @Query("SELECT COUNT(*) FROM backup_file_records WHERE uploadStatus IN ('PENDING', 'PENDING_RETRY', 'IN_PROGRESS') AND (accountId = :accountId OR accountId = 'default_account')")
+    suspend fun countPendingRecordsForAccount(accountId: String): Int
+
+    @Query("SELECT COUNT(*) FROM backup_file_records WHERE uploadStatus = 'FAILED' AND (accountId = :accountId OR accountId = 'default_account')")
+    suspend fun countFailedRecordsForAccount(accountId: String): Int
+
+    @Query("SELECT COUNT(*) FROM backup_file_records WHERE uploadStatus = 'VERIFIED' AND localExists = 0 AND (accountId = :accountId OR accountId = 'default_account')")
+    suspend fun countPreservedAfterLocalDeleteForAccount(accountId: String): Int
+
+    @Query("SELECT COALESCE(SUM(fileSize), 0) FROM backup_file_records WHERE uploadStatus = 'VERIFIED' AND (accountId = :accountId OR accountId = 'default_account')")
+    suspend fun sumTotalVerifiedUploadedBytesForAccount(accountId: String): Long
+
+    @Query("SELECT MAX(lastSuccessfulBackupMs) FROM backup_file_records WHERE uploadStatus = 'VERIFIED' AND (accountId = :accountId OR accountId = 'default_account')")
+    suspend fun getLastSuccessfulBackupTimestampForAccount(accountId: String): Long?
+
+    @Query("SELECT COUNT(DISTINCT sourceFileIdentity) FROM backup_file_records WHERE uploadStatus = 'VERIFIED' AND folderCategory = :category AND (accountId = :accountId OR accountId = 'default_account')")
+    suspend fun countVerifiedFilesInCategoryForAccount(accountId: String, category: String): Int
+
+    /** Exact (wildcard-free) relative-path prefix count, e.g. prefix "SDCard_1" matches "SDCard_1/...". */
+    @Query(
+        """
+        SELECT COUNT(DISTINCT sourceFileIdentity) FROM backup_file_records
+        WHERE uploadStatus = 'VERIFIED'
+          AND (accountId = :accountId OR accountId = 'default_account')
+          AND substr(relativePath, 1, length(:pathPrefix) + 1) = :pathPrefix || '/'
+        """
+    )
+    suspend fun countVerifiedFilesUnderPathForAccount(accountId: String, pathPrefix: String): Int
+
+    @Query("SELECT COUNT(*) FROM local_files WHERE localExists = 1 AND substr(relativePath, 1, length(:pathPrefix) + 1) = :pathPrefix || '/'")
+    suspend fun countLocalFilesUnderPath(pathPrefix: String): Int
+
+    @Query(
+        """
+        SELECT * FROM cloud_files
+        WHERE accountId = :accountId AND parentFolderId = :parentFolderId AND trashed = 0
+        ORDER BY isFolder DESC, name ASC
+        """
+    )
+    suspend fun getCloudFilesByParentForAccount(accountId: String, parentFolderId: String): List<CloudFileEntity>
+
+    @Query("SELECT * FROM cloud_files WHERE accountId = :accountId AND isPinnedOffline = 1 AND trashed = 0 ORDER BY name ASC")
+    suspend fun getPinnedOfflineFilesForAccount(accountId: String): List<CloudFileEntity>
+
+    @Query(
+        """
+        SELECT * FROM backup_file_records
+        WHERE uploadStatus = 'VERIFIED' AND (accountId = :accountId OR accountId = 'default_account')
+        ORDER BY lastSuccessfulBackupMs DESC
+        LIMIT :limit OFFSET :offset
+        """
+    )
+    suspend fun getVerifiedBackupsForAccountPaged(accountId: String, limit: Int, offset: Int): List<BackupFileEntity>
 }

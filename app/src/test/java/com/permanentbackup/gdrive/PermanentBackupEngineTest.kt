@@ -17,12 +17,15 @@ import com.permanentbackup.gdrive.data.local.SyncEventEntity
 import com.permanentbackup.gdrive.data.local.SyncJobEntity
 import com.permanentbackup.gdrive.data.local.UploadSessionEntity
 import com.permanentbackup.gdrive.data.remote.DriveApiClient
+import com.permanentbackup.gdrive.data.remote.GlobalBandwidthLimiter
 import com.permanentbackup.gdrive.data.remote.GoogleAuthManager
 import com.permanentbackup.gdrive.data.repository.BackupRepository
 import com.permanentbackup.gdrive.domain.engine.AndroidStorageScanner
 import com.permanentbackup.gdrive.domain.engine.CloudFileOperationsManager
+import com.permanentbackup.gdrive.domain.engine.DeviceConditionsProvider
 import com.permanentbackup.gdrive.domain.engine.PermanentBackupEngine
 import com.permanentbackup.gdrive.domain.engine.SourceFileReadOnlyGuard
+import com.permanentbackup.gdrive.domain.engine.TransferConditionResult
 import com.permanentbackup.gdrive.domain.model.AccountAuthState
 import com.permanentbackup.gdrive.domain.model.BackupSettings
 import com.permanentbackup.gdrive.domain.model.CloudBrowseItem
@@ -568,6 +571,119 @@ class InMemoryBackupDao : BackupDao {
 
     override suspend fun getDriveChangeToken(accountId: String): DriveChangeTokenEntity? =
         driveChangeTokens[accountId]
+
+    // v2.3.0 additions
+    private fun ownedBy(accountId: String, rowAccount: String) = rowAccount == accountId || rowAccount == "default_account"
+    private fun underPath(relativePath: String, prefix: String) = relativePath.startsWith("$prefix/")
+
+    override suspend fun findVerifiedDuplicateBySha256(
+        accountId: String,
+        sha256: String,
+        fileSize: Long,
+        excludeRecordId: Long
+    ): BackupFileEntity? = records.values
+        .filter {
+            it.accountId == accountId && it.uploadStatus == UploadStatus.VERIFIED && it.sha256Hash == sha256 &&
+                it.fileSize == fileSize && it.driveFileId != null && it.id != excludeRecordId
+        }
+        .maxByOrNull { it.lastSuccessfulBackupMs ?: 0L }
+
+    override suspend fun markCloudFilesRemovedLocally(driveFileIds: List<String>) {
+        driveFileIds.forEach { id -> cloudFiles[id]?.let { cloudFiles[id] = it.copy(trashed = true) } }
+        notifyChange()
+    }
+
+    override suspend fun clearSyncJobRetryBackoff(recordId: Long, nowMs: Long) {
+        val existing = getSyncJobByRecordId(recordId) ?: return
+        syncJobs[existing.jobId] = existing.copy(nextRetryAtMs = null, isPaused = false, updatedAtMs = nowMs)
+        notifyChange()
+    }
+
+    override fun observeRecentRecordsForAccount(accountId: String): Flow<List<BackupFileEntity>> =
+        stateFlow.map { list -> list.filter { ownedBy(accountId, it.accountId) }.sortedByDescending { it.createdAtMs } }
+
+    override fun observeVerifiedHistoryForAccount(accountId: String): Flow<List<BackupFileEntity>> =
+        stateFlow.map { list -> list.filter { ownedBy(accountId, it.accountId) && it.uploadStatus == UploadStatus.VERIFIED } }
+
+    override fun observeFailedRecordsForAccount(accountId: String): Flow<List<BackupFileEntity>> =
+        stateFlow.map { list ->
+            list.filter {
+                ownedBy(accountId, it.accountId) &&
+                    (it.uploadStatus == UploadStatus.FAILED || it.uploadStatus == UploadStatus.PENDING_RETRY)
+            }
+        }
+
+    override fun observeActiveQueueForAccount(accountId: String): Flow<List<BackupFileEntity>> =
+        stateFlow.map { list ->
+            list.filter {
+                ownedBy(accountId, it.accountId) && it.uploadStatus in setOf(
+                    UploadStatus.PENDING, UploadStatus.IN_PROGRESS, UploadStatus.PENDING_RETRY
+                )
+            }
+        }
+
+    override fun observeSyncJobsForAccount(accountId: String): Flow<List<SyncJobEntity>> =
+        syncJobsFlow.map { list -> list.filter { ownedBy(accountId, it.accountId) } }
+
+    override fun observeRecentSyncEventsForAccount(accountId: String): Flow<List<SyncEventEntity>> =
+        syncEventsFlow.map { list -> list.filter { ownedBy(accountId, it.accountId) } }
+
+    override fun observeUnresolvedFailuresForAccount(accountId: String): Flow<List<FailedOperationEntity>> =
+        failuresFlow.map { list -> list.filter { !it.resolved && ownedBy(accountId, it.accountId) } }
+
+    override suspend fun countAllRecordsForAccount(accountId: String): Int =
+        records.values.count { ownedBy(accountId, it.accountId) }
+
+    override suspend fun countVerifiedRecordsForAccount(accountId: String): Int =
+        records.values.count { ownedBy(accountId, it.accountId) && it.uploadStatus == UploadStatus.VERIFIED }
+
+    override suspend fun countPendingRecordsForAccount(accountId: String): Int =
+        records.values.count {
+            ownedBy(accountId, it.accountId) && it.uploadStatus in setOf(
+                UploadStatus.PENDING, UploadStatus.PENDING_RETRY, UploadStatus.IN_PROGRESS
+            )
+        }
+
+    override suspend fun countFailedRecordsForAccount(accountId: String): Int =
+        records.values.count { ownedBy(accountId, it.accountId) && it.uploadStatus == UploadStatus.FAILED }
+
+    override suspend fun countPreservedAfterLocalDeleteForAccount(accountId: String): Int =
+        records.values.count { ownedBy(accountId, it.accountId) && it.uploadStatus == UploadStatus.VERIFIED && !it.localExists }
+
+    override suspend fun sumTotalVerifiedUploadedBytesForAccount(accountId: String): Long =
+        records.values.filter { ownedBy(accountId, it.accountId) && it.uploadStatus == UploadStatus.VERIFIED }.sumOf { it.fileSize }
+
+    override suspend fun getLastSuccessfulBackupTimestampForAccount(accountId: String): Long? =
+        records.values.filter { ownedBy(accountId, it.accountId) && it.uploadStatus == UploadStatus.VERIFIED }
+            .mapNotNull { it.lastSuccessfulBackupMs }.maxOrNull()
+
+    override suspend fun countVerifiedFilesInCategoryForAccount(accountId: String, category: String): Int =
+        records.values.filter {
+            ownedBy(accountId, it.accountId) && it.uploadStatus == UploadStatus.VERIFIED && it.folderCategory == category
+        }.map { it.sourceFileIdentity }.distinct().size
+
+    override suspend fun countVerifiedFilesUnderPathForAccount(accountId: String, pathPrefix: String): Int =
+        records.values.filter {
+            ownedBy(accountId, it.accountId) && it.uploadStatus == UploadStatus.VERIFIED && underPath(it.relativePath, pathPrefix)
+        }.map { it.sourceFileIdentity }.distinct().size
+
+    override suspend fun countLocalFilesUnderPath(pathPrefix: String): Int =
+        localFiles.values.count { it.localExists && underPath(it.relativePath, pathPrefix) }
+
+    override suspend fun getCloudFilesByParentForAccount(accountId: String, parentFolderId: String): List<CloudFileEntity> =
+        cloudFiles.values
+            .filter { it.accountId == accountId && it.parentFolderId == parentFolderId && !it.trashed }
+            .sortedWith(compareByDescending<CloudFileEntity> { it.isFolder }.thenBy { it.name })
+
+    override suspend fun getPinnedOfflineFilesForAccount(accountId: String): List<CloudFileEntity> =
+        cloudFiles.values.filter { it.accountId == accountId && it.isPinnedOffline && !it.trashed }.sortedBy { it.name }
+
+    override suspend fun getVerifiedBackupsForAccountPaged(accountId: String, limit: Int, offset: Int): List<BackupFileEntity> =
+        records.values
+            .filter { ownedBy(accountId, it.accountId) && it.uploadStatus == UploadStatus.VERIFIED }
+            .sortedByDescending { it.lastSuccessfulBackupMs ?: 0L }
+            .drop(offset)
+            .take(limit)
 
     fun getAllRecordsSnapshot(): List<BackupFileEntity> = records.values.toList()
     fun getAllSyncJobsSnapshot(): List<SyncJobEntity> = syncJobs.values.toList()
@@ -2392,6 +2508,323 @@ class PermanentBackupEngineTest {
         assertTrue(watched.contains("Download"))
         assertFalse("Restored_From_Drive must never be watched by local backup FileObserver", watched.any { it.contains("Restored_From_Drive", ignoreCase = true) })
         assertFalse("Drive_Mirror must never be watched by local backup FileObserver", watched.any { it.contains("Drive_Mirror", ignoreCase = true) })
+    }
+
+    // ========================================================================
+    // v2.3.0 — Google Drive Desktop parity gaps
+    // ========================================================================
+
+    // 32. Identical bytes (moved/duplicated file) -> server-side Drive copy instead of a second upload
+    @Test
+    fun test32_sha256ContentDedup_usesServerSideCopyInsteadOfReupload() = runTest {
+        val resumableInits = AtomicInteger(0)
+        val copyRequests = AtomicInteger(0)
+        mockWebServer.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                val path = request.path ?: ""
+                val method = request.method ?: "GET"
+                if (path.startsWith("/drive/v3/about")) {
+                    return MockResponse().setResponseCode(200)
+                        .setBody("""{"storageQuota":{"limit":15000000000,"usage":1000000}}""")
+                }
+                if (method == "GET" && path.startsWith("/drive/v3/files?")) {
+                    return MockResponse().setResponseCode(200).setBody("""{"files":[]}""")
+                }
+                if (method == "POST" && path.contains("/copy")) {
+                    copyRequests.incrementAndGet()
+                    val sourceId = path.substringAfter("/drive/v3/files/").substringBefore("/copy")
+                    val sourceSize = uploadedDriveFiles[sourceId]?.second ?: 0L
+                    val copyId = "copy_${fileIdSeq.incrementAndGet()}"
+                    uploadedDriveFiles[copyId] = Triple(copyId, sourceSize, null)
+                    return MockResponse().setResponseCode(200)
+                        .setBody("""{"id":"$copyId","name":"copied","size":$sourceSize}""")
+                }
+                if (method == "POST" && path.startsWith("/drive/v3/files")) {
+                    return MockResponse().setResponseCode(200)
+                        .setBody("""{"id":"folder_${fileIdSeq.incrementAndGet()}","name":"folder"}""")
+                }
+                if (method == "POST" && path.startsWith("/upload/drive/v3/files?uploadType=resumable")) {
+                    resumableInits.incrementAndGet()
+                    val sessionUrl = mockWebServer.url("/upload/drive/v3/files?uploadType=resumable&upload_id=s_${fileIdSeq.incrementAndGet()}").toString()
+                    return MockResponse().setResponseCode(200).addHeader("Location", sessionUrl)
+                }
+                if (method == "PUT" && path.contains("upload_id=")) {
+                    val bodyBytes = request.body.readByteArray()
+                    val totalSize = (request.getHeader("Content-Range") ?: "").substringAfter('/', "0").toLongOrNull()
+                        ?: bodyBytes.size.toLong()
+                    val driveId = "drive_file_${fileIdSeq.incrementAndGet()}"
+                    uploadedDriveFiles[driveId] = Triple(driveId, totalSize, null)
+                    return MockResponse().setResponseCode(200)
+                        .setBody("""{"id":"$driveId","name":"uploaded","size":$totalSize}""")
+                }
+                if (method == "GET" && path.startsWith("/drive/v3/files/")) {
+                    val fileId = path.substringAfter("/drive/v3/files/").substringBefore("?")
+                    val size = uploadedDriveFiles[fileId]?.second ?: 0L
+                    return MockResponse().setResponseCode(200)
+                        .setBody("""{"id":"$fileId","name":"verified","size":$size,"trashed":false}""")
+                }
+                return MockResponse().setResponseCode(404)
+            }
+        }
+
+        val sameBytes = "IDENTICAL_PHOTO_BYTES_FOR_DEDUP_2026"
+        File(tempStorageDir, "DCIM/Camera").apply { mkdirs() }.let { File(it, "IMG_0001.jpg").writeText(sameBytes) }
+        File(tempStorageDir, "Pictures/Edited").apply { mkdirs() }.let { File(it, "IMG_0001_copy.jpg").writeText(sameBytes) }
+
+        val scanner = AndroidStorageScanner(null, listOf(tempStorageDir), true)
+        val engine = PermanentBackupEngine(dao, scanner, driveApiClient, authManager)
+        val summary = engine.runBackupCycle(BackupSettings(userBackupConsentGranted = true))
+
+        assertEquals(2, summary.uploadedAndVerifiedFiles)
+        assertEquals("Only ONE byte upload for identical content", 1, resumableInits.get())
+        assertEquals("Second file materialized by server-side copy", 1, copyRequests.get())
+        val records = dao.getAllRecordsSnapshot()
+        assertEquals(2, records.size)
+        assertTrue(records.all { it.uploadStatus == UploadStatus.VERIFIED })
+        assertEquals("Each local file owns an independent Drive file", 2, records.mapNotNull { it.driveFileId }.distinct().size)
+    }
+
+    // 33. Settings "Wi-Fi only" / "Charging only" enforced by the engine itself (manual/share/watcher runs)
+    @Test
+    fun test33_deviceConditionsBlockUploads_untilWifiOrChargingAvailable() = runTest {
+        installStandardDriveMockDispatcher()
+        File(tempStorageDir, "Documents").apply { mkdirs() }.let { File(it, "contract.pdf").writeText("CONTRACT_BYTES") }
+
+        var allowed = false
+        val conditions = object : DeviceConditionsProvider {
+            override fun evaluate(settings: BackupSettings): TransferConditionResult =
+                if (allowed) TransferConditionResult(true)
+                else TransferConditionResult(false, "Waiting for Wi-Fi: 'Wi-Fi only' is enabled in Settings")
+        }
+        val scanner = AndroidStorageScanner(null, listOf(tempStorageDir), true)
+        val engine = PermanentBackupEngine(dao, scanner, driveApiClient, authManager, conditions)
+        val settings = BackupSettings(userBackupConsentGranted = true, wifiOnly = true)
+
+        val blocked = engine.runBackupCycle(settings)
+        assertEquals(1, blocked.newlyQueuedVersions)
+        assertEquals(0, blocked.uploadedAndVerifiedFiles)
+        assertEquals(0, blocked.failedUploads)
+        assertTrue(blocked.errorMessage?.contains("Waiting for Wi-Fi") == true)
+        assertTrue(engine.transferConditionBlock.value?.contains("Wi-Fi only") == true)
+        assertEquals(UploadStatus.PENDING, dao.getAllRecordsSnapshot().single().uploadStatus)
+
+        allowed = true
+        val resumed = engine.runUploadQueueOnly(settings)
+        assertEquals(1, resumed.uploadedAndVerifiedFiles)
+        assertEquals(null, engine.transferConditionBlock.value)
+        assertEquals(UploadStatus.VERIFIED, dao.getAllRecordsSnapshot().single().uploadStatus)
+    }
+
+    // 34. Automatic runs respect exponential retry backoff; manual Resume clears it and uploads immediately
+    @Test
+    fun test34_automaticRunsRespectRetryBackoff_andResumeClearsBackoff() = runTest {
+        val failInit = java.util.concurrent.atomic.AtomicBoolean(true)
+        val resumableInits = AtomicInteger(0)
+        mockWebServer.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                val path = request.path ?: ""
+                val method = request.method ?: "GET"
+                if (path.startsWith("/drive/v3/about")) {
+                    return MockResponse().setResponseCode(200)
+                        .setBody("""{"storageQuota":{"limit":15000000000,"usage":1000000}}""")
+                }
+                if (method == "GET" && path.startsWith("/drive/v3/files?")) {
+                    return MockResponse().setResponseCode(200).setBody("""{"files":[]}""")
+                }
+                if (method == "POST" && path.startsWith("/drive/v3/files")) {
+                    return MockResponse().setResponseCode(200).setBody("""{"id":"folder_docs","name":"Documents"}""")
+                }
+                if (method == "POST" && path.startsWith("/upload/drive/v3/files?uploadType=resumable")) {
+                    resumableInits.incrementAndGet()
+                    if (failInit.get()) {
+                        return MockResponse().setResponseCode(503).setBody("""{"error":{"message":"backendError"}}""")
+                    }
+                    val sessionUrl = mockWebServer.url("/upload/drive/v3/files?uploadType=resumable&upload_id=backoff_1").toString()
+                    return MockResponse().setResponseCode(200).addHeader("Location", sessionUrl)
+                }
+                if (method == "PUT" && path.contains("upload_id=backoff_1")) {
+                    val size = request.body.readByteArray().size
+                    uploadedDriveFiles["backoff_file"] = Triple("backoff_file", size.toLong(), null)
+                    return MockResponse().setResponseCode(200).setBody("""{"id":"backoff_file","size":$size}""")
+                }
+                if (method == "GET" && path.startsWith("/drive/v3/files/")) {
+                    val fileId = path.substringAfter("/drive/v3/files/").substringBefore("?")
+                    val size = uploadedDriveFiles[fileId]?.second ?: 0L
+                    return MockResponse().setResponseCode(200)
+                        .setBody("""{"id":"$fileId","name":"verified","size":$size,"trashed":false}""")
+                }
+                return MockResponse().setResponseCode(404)
+            }
+        }
+        File(tempStorageDir, "Documents").apply { mkdirs() }.let { File(it, "ledger.xlsx").writeText("LEDGER_BYTES_V1") }
+
+        val scanner = AndroidStorageScanner(null, listOf(tempStorageDir), true)
+        val engine = PermanentBackupEngine(dao, scanner, driveApiClient, authManager)
+        val settings = BackupSettings(userBackupConsentGranted = true)
+
+        val first = engine.runBackupCycle(settings)
+        assertEquals(1, first.failedUploads)
+        val record = dao.getAllRecordsSnapshot().single()
+        val job = dao.getSyncJobByRecordId(record.id)
+        assertEquals(SyncJobState.RETRY_SCHEDULED, job?.syncState)
+        assertTrue((job?.nextRetryAtMs ?: 0L) > System.currentTimeMillis())
+
+        // Automatic trigger inside the backoff window -> record is NOT attempted again
+        failInit.set(false)
+        val initsBefore = resumableInits.get()
+        val automatic = engine.runUploadQueueOnly(settings, respectRetryBackoff = true)
+        assertEquals(0, automatic.uploadedAndVerifiedFiles)
+        assertEquals(0, automatic.failedUploads)
+        assertEquals(initsBefore, resumableInits.get())
+
+        // Manual Resume clears backoff -> uploads immediately even for an automatic-style run
+        engine.pauseSingleRecord(record.id, false)
+        assertEquals(null, dao.getSyncJobByRecordId(record.id)?.nextRetryAtMs)
+        val resumed = engine.runUploadQueueOnly(settings, respectRetryBackoff = true)
+        assertEquals(1, resumed.uploadedAndVerifiedFiles)
+        assertEquals(UploadStatus.VERIFIED, dao.getRecordById(record.id)?.uploadStatus)
+    }
+
+    // 35. Changes API: removed/trashed files hidden from LOCAL cache only + auto-pin new files in pinned folders
+    @Test
+    fun test35_changesApiRemovedHygiene_andKeepFolderOfflineAutoPin() = runTest {
+        mockWebServer.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                val path = request.path ?: ""
+                if (request.method == "DELETE" || path.contains("trash")) {
+                    return MockResponse().setResponseCode(500)
+                }
+                if (path.startsWith("/drive/v3/changes/startPageToken")) {
+                    return MockResponse().setResponseCode(200).setBody("""{"startPageToken":"500"}""")
+                }
+                if (path.startsWith("/drive/v3/changes")) {
+                    return MockResponse().setResponseCode(200).setBody(
+                        """
+                        {
+                          "newStartPageToken": "501",
+                          "changes": [
+                            { "fileId": "ghost_removed", "removed": true },
+                            { "fileId": "ghost_trashed", "removed": false,
+                              "file": { "id": "ghost_trashed", "name": "old.txt", "mimeType": "text/plain", "size": 5, "trashed": true } },
+                            { "fileId": "new_in_pinned", "removed": false,
+                              "file": { "id": "new_in_pinned", "name": "plan.pdf", "mimeType": "application/pdf", "size": 2048,
+                                        "trashed": false, "parents": ["pinned_folder"] } }
+                          ]
+                        }
+                        """.trimIndent()
+                    )
+                }
+                return MockResponse().setResponseCode(404)
+            }
+        }
+        val now = System.currentTimeMillis()
+        listOf(
+            CloudFileEntity(driveFileId = "ghost_removed", accountId = "user@example.com", name = "gone.jpg",
+                mimeType = "image/jpeg", sizeBytes = 10L, parentFolderId = "root", isFolder = false,
+                isProtectedBackupFile = false, createdTimeMs = now, modifiedTimeMs = now),
+            CloudFileEntity(driveFileId = "ghost_trashed", accountId = "user@example.com", name = "old.txt",
+                mimeType = "text/plain", sizeBytes = 5L, parentFolderId = "root", isFolder = false,
+                isProtectedBackupFile = false, createdTimeMs = now, modifiedTimeMs = now),
+            CloudFileEntity(driveFileId = "pinned_folder", accountId = "user@example.com", name = "Trips",
+                mimeType = DriveApiClient.FOLDER_MIME_TYPE, sizeBytes = 0L, parentFolderId = "root", isFolder = true,
+                isProtectedBackupFile = false, createdTimeMs = now, modifiedTimeMs = now, isPinnedOffline = true)
+        ).forEach { dao.upsertCloudFile(it) }
+
+        val scanner = AndroidStorageScanner(null, listOf(tempStorageDir), true)
+        val engine = PermanentBackupEngine(dao, scanner, driveApiClient, authManager)
+        val autoPinned = mutableListOf<String>()
+        var changesNotified = 0
+        engine.onPinnedCloudFileModified = { autoPinned.add(it.driveFileId) }
+        engine.onCloudChangesDetected = { changesNotified = it }
+
+        assertEquals(0, engine.syncCloudChangesIncremental()) // initializes token "500"
+        val changed = engine.syncCloudChangesIncremental()
+        assertTrue(changed >= 3)
+
+        assertEquals(true, dao.getCloudFileById("ghost_removed")?.trashed)
+        assertEquals(true, dao.getCloudFileById("ghost_trashed")?.trashed)
+        assertEquals(false, dao.getCloudFileById("pinned_folder")?.trashed)
+        assertEquals(listOf("new_in_pinned"), autoPinned)
+        assertEquals(changed, changesNotified)
+        assertEquals("501", dao.getDriveChangeToken("user@example.com")?.startPageToken)
+    }
+
+    // 36. "Upload File" inside a My Drive folder targets that exact Drive folder + GLOBAL bandwidth cap
+    @Test
+    fun test36_directUploadIntoExplicitDriveFolder_andGlobalBandwidthLimiter() = runTest {
+        val initBodies = mutableListOf<String>()
+        val folderCreates = AtomicInteger(0)
+        mockWebServer.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                val path = request.path ?: ""
+                val method = request.method ?: "GET"
+                if (path.startsWith("/drive/v3/about")) {
+                    return MockResponse().setResponseCode(200)
+                        .setBody("""{"storageQuota":{"limit":15000000000,"usage":1000000}}""")
+                }
+                if (method == "GET" && path.startsWith("/drive/v3/files?")) {
+                    return MockResponse().setResponseCode(200).setBody("""{"files":[]}""")
+                }
+                if (method == "POST" && path.startsWith("/drive/v3/files")) {
+                    folderCreates.incrementAndGet()
+                    return MockResponse().setResponseCode(200).setBody("""{"id":"root_backup_folder","name":"root"}""")
+                }
+                if (method == "POST" && path.startsWith("/upload/drive/v3/files?uploadType=resumable")) {
+                    initBodies.add(request.body.readUtf8())
+                    val sessionUrl = mockWebServer.url("/upload/drive/v3/files?uploadType=resumable&upload_id=explicit_1").toString()
+                    return MockResponse().setResponseCode(200).addHeader("Location", sessionUrl)
+                }
+                if (method == "PUT" && path.contains("upload_id=explicit_1")) {
+                    val size = request.body.readByteArray().size
+                    uploadedDriveFiles["explicit_file"] = Triple("explicit_file", size.toLong(), null)
+                    return MockResponse().setResponseCode(200).setBody("""{"id":"explicit_file","size":$size}""")
+                }
+                if (method == "GET" && path.startsWith("/drive/v3/files/")) {
+                    val fileId = path.substringAfter("/drive/v3/files/").substringBefore("?")
+                    val size = uploadedDriveFiles[fileId]?.second ?: 0L
+                    return MockResponse().setResponseCode(200)
+                        .setBody("""{"id":"$fileId","name":"verified","size":$size,"trashed":false}""")
+                }
+                return MockResponse().setResponseCode(404)
+            }
+        }
+        authManager.setRootDriveFolderId("root_backup_folder")
+        val picked = File(tempStorageDir, "budget_2027.xlsx").apply { writeText("BUDGET_BYTES") }
+        val repository = BackupRepository(
+            context = null,
+            backupDao = dao,
+            storageSource = AndroidStorageScanner(null, listOf(tempStorageDir), permissionOverride = false),
+            driveApiClient = driveApiClient,
+            authManager = authManager,
+            customSettingsPrefs = TestInMemorySharedPreferences()
+        )
+        repository.saveSettingsToDatabase(BackupSettings(userBackupConsentGranted = true))
+
+        assertTrue(
+            repository.uploadDirectUriToDrive(
+                uriString = picked.absolutePath,
+                displayName = "budget_2027.xlsx",
+                mimeType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                sizeBytes = picked.length(),
+                targetSubfolder = "Finance",
+                targetDriveFolderId = "drive_folder_finance_42"
+            )
+        )
+        val record = dao.getAllRecordsSnapshot().single()
+        assertEquals("shared:drive:drive_folder_finance_42/budget_2027.xlsx", record.sourceFileIdentity)
+        assertEquals("drive_folder_finance_42", repository.backupEngine.explicitDriveTargetFolderId(record.sourceFileIdentity))
+
+        val summary = repository.runUploadQueueNow()
+        assertEquals(1, summary.uploadedAndVerifiedFiles)
+        assertEquals(0, folderCreates.get())
+        assertTrue(initBodies.single().contains("drive_folder_finance_42"))
+        assertEquals("drive_folder_finance_42", dao.getRecordById(record.id)?.driveFolderId)
+
+        // Global pacer: second reservation of 1 KiB at 1 KiB/s must wait ~1s (shared by all parallel streams)
+        val limiter = GlobalBandwidthLimiter()
+        assertEquals(0L, limiter.reserve(1024, 1024L))
+        assertTrue(limiter.reserve(1024, 1024L) >= 900L)
+        assertEquals(0L, GlobalBandwidthLimiter().reserve(1024, 0L))
     }
 }
 

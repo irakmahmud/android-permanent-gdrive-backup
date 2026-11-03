@@ -63,8 +63,47 @@ data class DriveFileListPage(
 data class DriveChangesPage(
     val changedFiles: List<CloudBrowseItem>,
     val newStartPageToken: String?,
-    val nextPageToken: String?
+    val nextPageToken: String?,
+    /**
+     * Drive file IDs reported by the Changes API as `removed = true` or `file.trashed = true`.
+     * These are ONLY used to hide stale entries from the local `cloud_files` cache; nothing is ever
+     * deleted or trashed on Google Drive.
+     */
+    val removedFileIds: List<String> = emptyList()
 )
+
+/**
+ * Process-wide upload bandwidth pacer shared by every parallel upload stream of one [DriveApiClient].
+ * `maxUploadSpeedKbps` in Settings is therefore a GLOBAL cap (Google Drive Desktop semantics) instead of
+ * a per-stream cap that multiplies with `uploadConcurrency`.
+ */
+class GlobalBandwidthLimiter {
+    private val lock = Any()
+    private var nextFreeTimeNs: Long = 0L
+
+    /** Returns how long (ms) the caller must sleep before sending [bytes] at [maxBytesPerSec]. */
+    fun reserve(bytes: Int, maxBytesPerSec: Long): Long {
+        if (maxBytesPerSec <= 0L || bytes <= 0) return 0L
+        val costNs = (bytes.toLong() * 1_000_000_000L) / maxBytesPerSec
+        synchronized(lock) {
+            val now = System.nanoTime()
+            val start = if (nextFreeTimeNs > now) nextFreeTimeNs else now
+            nextFreeTimeNs = start + costNs
+            return ((start - now) / 1_000_000L).coerceAtLeast(0L)
+        }
+    }
+
+    fun acquire(bytes: Int, maxBytesPerSec: Long) {
+        val waitMs = reserve(bytes, maxBytesPerSec)
+        if (waitMs > 0L) {
+            try {
+                Thread.sleep(waitMs)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+        }
+    }
+}
 
 /**
  * Full-Featured Google Drive API v3 Client (Section 5 & Section 9):
@@ -97,6 +136,9 @@ class DriveApiClient(
     val httpClient: OkHttpClient = baseClient.newBuilder()
         .addInterceptor(NeverDeleteGuardInterceptor())
         .build()
+
+    /** Global (all parallel streams combined) upload bandwidth pacer. */
+    val bandwidthLimiter = GlobalBandwidthLimiter()
 
     /**
      * Queries Google Drive storage quota (Total, Used, Available) via Drive v3 about endpoint.
@@ -507,8 +549,6 @@ class DriveApiClient(
             override fun writeTo(sink: BufferedSink) {
                 val buffer = ByteArray(STREAM_BUFFER_SIZE_BYTES)
                 var remaining = chunkLength
-                val startNs = System.nanoTime()
-                var writtenInChunk = 0L
                 val maxBytesPerSec = if (maxUploadSpeedKbps > 0) maxUploadSpeedKbps.toLong() * 1024L else 0L
 
                 while (remaining > 0) {
@@ -517,22 +557,10 @@ class DriveApiClient(
                     if (read == -1) {
                         throw IOException("Unexpected EOF while streaming file chunk at offset $chunkStartByte")
                     }
+                    // Global pacing across ALL parallel upload streams (not per stream)
+                    bandwidthLimiter.acquire(read, maxBytesPerSec)
                     sink.write(buffer, 0, read)
                     remaining -= read
-                    writtenInChunk += read
-
-                    if (maxBytesPerSec > 0L) {
-                        val expectedMs = (writtenInChunk * 1000L) / maxBytesPerSec
-                        val elapsedMs = (System.nanoTime() - startNs) / 1_000_000L
-                        val sleepMs = (expectedMs - elapsedMs).coerceAtMost(250L)
-                        if (sleepMs > 5L) {
-                            try {
-                                Thread.sleep(sleepMs)
-                            } catch (_: InterruptedException) {
-                                Thread.currentThread().interrupt()
-                            }
-                        }
-                    }
                 }
             }
         }
@@ -767,10 +795,12 @@ class DriveApiClient(
         driveFileId: String,
         rangeStartByte: Long? = null,
         rangeEndByteInclusive: Long? = null,
-        workspaceMimeType: String? = null
+        workspaceMimeType: String? = null,
+        exportMimeTypeOverride: String? = null
     ): InputStream {
         val url = if (!workspaceMimeType.isNullOrBlank() && isGoogleWorkspaceDocument(workspaceMimeType)) {
-            val (exportMime, _) = resolveWorkspaceExportFormat(workspaceMimeType)
+            val exportMime = exportMimeTypeOverride?.ifBlank { null }
+                ?: resolveWorkspaceExportFormat(workspaceMimeType).first
             "$driveBaseUrl/drive/v3/files/$driveFileId/export".toHttpUrl().newBuilder()
                 .addQueryParameter("mimeType", exportMime)
                 .build()
@@ -866,18 +896,74 @@ class DriveApiClient(
                 val newStartToken = json.optString("newStartPageToken", "").ifBlank { null }
                 val changesArr = json.optJSONArray("changes") ?: JSONArray()
                 val items = mutableListOf<CloudBrowseItem>()
+                val removedIds = mutableListOf<String>()
                 for (i in 0 until changesArr.length()) {
                     val changeObj = changesArr.getJSONObject(i)
-                    val fileObj = changeObj.optJSONObject("file") ?: continue
-                    if (!fileObj.optBoolean("trashed", false)) {
+                    val changeFileId = changeObj.optString("fileId", "")
+                    val fileObj = changeObj.optJSONObject("file")
+                    val removed = changeObj.optBoolean("removed", false)
+                    if (removed || fileObj == null) {
+                        if (removed && changeFileId.isNotBlank()) removedIds.add(changeFileId)
+                        continue
+                    }
+                    if (fileObj.optBoolean("trashed", false)) {
+                        val trashedId = fileObj.optString("id", "").ifBlank { changeFileId }
+                        if (trashedId.isNotBlank()) removedIds.add(trashedId)
+                    } else {
                         items.add(parseCloudBrowseItem(fileObj, accountId))
                     }
                 }
                 DriveChangesPage(
                     changedFiles = items,
                     newStartPageToken = newStartToken,
-                    nextPageToken = nextToken
+                    nextPageToken = nextToken,
+                    removedFileIds = removedIds
                 )
+            }
+        }
+    }
+
+    /**
+     * Server-side copy (`POST /drive/v3/files/{id}/copy`): creates a NEW, independent Drive file with identical
+     * bytes under [parentFolderId] named [newName]. Used to deduplicate local moves/renames/duplicates by SHA-256
+     * without re-uploading. Never modifies, moves, or deletes the source file (append-only semantics).
+     */
+    fun copyDriveFile(
+        accessToken: String,
+        sourceDriveFileId: String,
+        parentFolderId: String,
+        newName: String,
+        localSha256: String?,
+        backupVersion: Int
+    ): RemoteDriveFileMetadata {
+        val metadataJson = JSONObject().apply {
+            put("name", sanitizeDriveName(newName))
+            put("parents", JSONArray().put(parentFolderId))
+            put(
+                "appProperties",
+                JSONObject().apply {
+                    put("backupVersion", backupVersion.toString())
+                    if (!localSha256.isNullOrBlank()) put("localSha256", localSha256)
+                    put("policy", "NEVER_DELETE_APPEND_ONLY")
+                    put("dedupSourceFileId", sourceDriveFileId)
+                }
+            )
+        }
+        val url = "$driveBaseUrl/drive/v3/files/$sourceDriveFileId/copy".toHttpUrl().newBuilder()
+            .addQueryParameter("fields", FILE_FIELDS)
+            .addQueryParameter("supportsAllDrives", "true")
+            .build()
+        val request = Request.Builder()
+            .url(url)
+            .header("Authorization", "Bearer $accessToken")
+            .post(metadataJson.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
+            .build()
+        httpClient.newCall(request).execute().use { response ->
+            val bodyStr = response.body?.string() ?: "{}"
+            return handleDriveHttpResponse(request, response.code, bodyStr) {
+                val meta = parseRemoteFileMetadata(JSONObject(bodyStr))
+                if (meta.id.isBlank()) throw IOException("Drive server-side copy returned empty file ID")
+                meta
             }
         }
     }
