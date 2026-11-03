@@ -2691,7 +2691,8 @@ class PermanentBackupEngineTest {
         mockWebServer.dispatcher = object : Dispatcher() {
             override fun dispatch(request: RecordedRequest): MockResponse {
                 val path = request.path ?: ""
-                if (request.method == "DELETE" || path.contains("trash")) {
+                val encodedPath = request.requestUrl?.encodedPath ?: ""
+                if (request.method == "DELETE" || encodedPath.contains("trash")) {
                     return MockResponse().setResponseCode(500)
                 }
                 if (path.startsWith("/drive/v3/changes/startPageToken")) {

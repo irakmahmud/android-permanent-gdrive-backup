@@ -1,10 +1,30 @@
-# Permanent Drive v2.2.0 — Android Google Drive Desktop Alternative
+# Permanent Drive v2.3.0 — Android Google Drive Desktop Alternative
 
 A production-grade, strictly **Upload-Only, Append-Only, Never-Delete** Android Google Drive Desktop Alternative engineered in **Kotlin**, **Jetpack Compose (Material 3)**, **Room (WAL + 14 Tables, Database v3)**, **WorkManager (`ContentUriTrigger`)**, **Recursive `FileObserver`**, **Android SAF `DocumentsProvider`**, **Foreground Service (`dataSync`)**, **Google Identity Services (`AuthorizationClient` + `GoogleAuthUtil`)**, and **Google Drive REST API v3**. Built 100% remotely via **CircleCI** (`.circleci/config.yml`) and **GitHub Cloud Runners** (`.github/workflows/remote-android-build.yml`) with zero local Android SDK/Gradle footprint.
 
 ---
 
-## 0. What's New in `v2.2.0` (11 Google Drive Desktop Parity Features + 3 Immutable Safety Rules)
+## 0. What's New in `v2.3.0` (Google Drive Desktop Parity Gaps Closed)
+
+| # | Gap in v2.2.0 | v2.3.0 Fix |
+|---|---|---|
+| 1 | "Wi-Fi only" / "Charging only" were only WorkManager constraints; manual, share-sheet, watcher and provider runs ignored them. | `DeviceConditionsProvider` (`AndroidDeviceConditionsProvider`) is checked by the engine before every upload pass and between batches; the reason is shown as `transferConditionBlock` / "Waiting for Wi-Fi/Charging". |
+| 2 | `maxUploadSpeedKbps` was per stream, so 3 parallel streams used 3x the limit. | `GlobalBandwidthLimiter` paces ALL parallel streams together (Drive Desktop semantics). |
+| 3 | Moved / renamed / duplicated files were fully re-uploaded. | SHA-256 + size dedup via server-side `files.copy` (`copyDriveFile`) — independent new Drive file, source untouched, verified; falls back to normal upload on any doubt. |
+| 4 | Failed files were retried immediately by every trigger; the first 50 blocked records could stall the queue. | Automatic runs respect `nextRetryAtMs` backoff; Resume/Retry clears it; starvation-free paging with an attempted-once-per-pass set. |
+| 5 | Share-sheet / Upload File / single-file backup triggered a full phone rescan. | `runUploadQueueOnly` + `ACTION_UPLOAD_QUEUE` foreground service; concurrent triggers coalesce with a bounded re-run pass. |
+| 6 | Changes API `removed` / `trashed` files stayed as ghosts in the local cache. | `markCloudFilesRemovedLocally` hides them in the LOCAL cache only (nothing is ever deleted or trashed on Drive). |
+| 7 | New files inside a "Keep Folder Offline" folder were not pinned. | Ancestor walk (`isInsidePinnedOfflineFolder`) auto-pins them. |
+| 8 | Mirror folders were one-shot downloads. | Registered mirrors refresh on every Drive change (`syncMirrorFolderIncremental`, ledger-based, non-overwriting). |
+| 9 | Temporary share grants could expire before upload. | Bytes are staged in app-private `share_staging/` (≤ 512 MB) and the staging copy is removed after VERIFIED upload. |
+| 10 | "Upload File" inside a My Drive folder went to a mirrored subfolder of the backup root. | Uploads go into that exact Drive folder (`shared:drive:<folderId>/<name>`). |
+| 11 | Dashboard / queue / history / failures mixed all accounts and did not switch with the account. | Account-scoped DAO queries + `flatMapLatest` on the active account; per-worker `activeUploads` progress map. |
+
+New automated tests: `test32` … `test36` (content dedup, device conditions, retry backoff + Resume, Changes API hygiene + pinned-folder auto-pin, explicit Drive folder upload + global bandwidth limiter).
+
+---
+
+## 0.1 What's New in `v2.2.0` (11 Google Drive Desktop Parity Features + 3 Immutable Safety Rules)
 
 All 11 features identified in the Google Drive for Windows Desktop gap audit are fully implemented while strictly enforcing **Zero Deletion**, **Immutable Version Preservation**, and **Strict Separation of Backup vs. Cloud-to-Local Mirroring**:
 
