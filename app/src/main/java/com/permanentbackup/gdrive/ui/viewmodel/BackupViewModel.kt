@@ -183,12 +183,13 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
                 val current = _dashboardSummary.value
                 val phoneSource = progress?.let { "/storage/emulated/0/${it.relativePath.trimStart('/')}" }
                     ?: current.currentPhoneSourcePath
+                val rootFolderName = current.accountState.rootDriveFolderName.ifBlank { "Android_Permanent_Backup" }
                 val driveTarget = progress?.let {
                     val parentFolder = it.relativePath.replace('\\', '/').substringBeforeLast('/', "")
                     if (parentFolder.isNotBlank()) {
-                        "My Drive / ${settings.value.driveRootFolderName} / $parentFolder / ${it.fileName}"
+                        "My Drive / $rootFolderName / $parentFolder / ${it.fileName}"
                     } else {
-                        "My Drive / ${settings.value.driveRootFolderName} / ${it.fileName}"
+                        "My Drive / $rootFolderName / ${it.fileName}"
                     }
                 } ?: current.currentDriveTargetPath
                 _dashboardSummary.value = current.copy(
