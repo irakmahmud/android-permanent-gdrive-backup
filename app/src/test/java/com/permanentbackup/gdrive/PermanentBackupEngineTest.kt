@@ -3014,7 +3014,7 @@ class PermanentBackupEngineTest {
         val defaultAccount = com.permanentbackup.gdrive.domain.model.GoogleAccountState()
         assertFalse(defaultAccount.isConnected)
         assertEquals("", defaultAccount.grantedScope)
-        assertNull(defaultAccount.rootDriveFolderId)
+        assertEquals(null, defaultAccount.rootDriveFolderId)
 
         val zeroFilesFolder = com.permanentbackup.gdrive.domain.model.FolderCoverageItem(
             folderName = "EmptyFolder",
