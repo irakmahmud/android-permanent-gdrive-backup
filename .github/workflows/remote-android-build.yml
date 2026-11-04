@@ -1,4 +1,4 @@
-name: Remote Cloud Android Build & Verification (Permanent Drive v2.3.3)
+name: Remote Cloud Android Build & Verification (Permanent Drive v2.3.4)
 
 on:
   push:
@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   remote-android-apk-build:
-    name: Remote Cloud Build, Lint, 39 Unit/Integration Tests, Play Protect Signing & v2.3.3 Release
+    name: Remote Cloud Build, Lint, 40 Unit/Integration Tests, Play Protect Signing & v2.3.4 Release
     runs-on: ubuntu-latest
     env:
       CLOUD_BRIDGE_PAYLOAD: ${{ secrets.CLOUD_BRIDGE_PAYLOAD }}
@@ -61,7 +61,7 @@ jobs:
         run: |
           ./gradlew :app:lintDebug --no-daemon
 
-      - name: "Stage 8, 9 & 10: Execute 39 Unit, Integration & 3-Layer Never-Delete Policy Tests"
+      - name: "Stage 8, 9 & 10: Execute 40 Unit, Integration & 3-Layer Never-Delete Policy Tests"
         run: |
           ./gradlew :app:testDebugUnitTest --info --no-daemon
 
@@ -83,7 +83,7 @@ jobs:
             --v3-signing-enabled true \
             --out "$APK_FILE" \
             /tmp/aligned.apk
-          cp "$APK_FILE" app/build/outputs/apk/debug/Permanent-Drive-v2.3.3.apk
+          cp "$APK_FILE" app/build/outputs/apk/debug/Permanent-Drive-v2.3.4.apk
           echo "=== Auditing APK DEX Bytecode for Forbidden Secrets/Tokens & Play Protect Triggers ==="
           mkdir -p /tmp/apk-inspect
           unzip -q -o "$APK_FILE" -d /tmp/apk-inspect
@@ -107,43 +107,39 @@ jobs:
           APKSIGNER_BIN=$(find "${ANDROID_HOME:-$ANDROID_SDK_ROOT}/build-tools" -name apksigner | sort -V | tail -n 1)
           "$APKSIGNER_BIN" verify --verbose --print-certs "$APK_FILE" | tee app/build/outputs/apk/debug/apk-signing-certificate.txt
           sha256sum "$APK_FILE" | tee app/build/outputs/apk/debug/app-debug.apk.sha256
-          ls -lh "$APK_FILE" app/build/outputs/apk/debug/Permanent-Drive-v2.3.3.apk
+          ls -lh "$APK_FILE" app/build/outputs/apk/debug/Permanent-Drive-v2.3.4.apk
 
       - name: "Stage 14a: Upload Downloadable APK & Reports Artifact"
         uses: actions/upload-artifact@v4
         with:
-          name: Permanent-Drive-v2.3.3-APK
+          name: Permanent-Drive-v2.3.4-APK
           path: |
-            app/build/outputs/apk/debug/Permanent-Drive-v2.3.3.apk
+            app/build/outputs/apk/debug/Permanent-Drive-v2.3.4.apk
             app/build/outputs/apk/debug/app-debug.apk
             app/build/outputs/apk/debug/app-debug.apk.sha256
             app/build/outputs/apk/debug/apk-signing-certificate.txt
             app/build/reports/tests/testDebugUnitTest/
             app/build/reports/lint-results-debug.html
 
-      - name: "Stage 14b: Publish Direct Downloadable APK to GitHub Releases (v2.3.3)"
+      - name: "Stage 14b: Publish Direct Downloadable APK to GitHub Releases (v2.3.4)"
         if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.3.3
-          name: "Permanent Drive v2.3.3 — Zero-Crash UI, Full Play Protect Hygiene, Instant Scoped-Storage Auto-Backup & Live Path Display"
+          tag_name: v2.3.4
+          name: "Permanent Drive v2.3.4 — 100% Real-Time State-Aware UI, Explicit Loading States & Custom Google Drive Folder Creation/Rename"
           body: |
-            Automated Remote Cloud Build of **Permanent Drive v2.3.3** (`com.permanentbackup.gdrive`, `versionCode = 11`).
-            - **1. Zero-Crash & Non-Blocking UI Architecture**:
-              - Removed main-thread `EncryptedSharedPreferences` Keystore IPC stalls and main-thread synchronous SQLite `writableDatabase` open.
-              - Coalesced tab-click refreshes (`refreshDashboardAndCoverage`) with 15s coverage caching and `.maxDepth(5)` directory walks so rapid clicking across tabs is instantaneous and never freezes or crashes.
-              - Protected `PermanentBackupForegroundService.onStartCommand` with `stopSelf()` fallback if `startForeground()` fails, and guarded background FGS starts on Android 12+ (`isProcessInForeground()`).
-            - **2. Full Google Play Protect Compliance**:
-              - Removed `androidx.credentials:credentials-play-services-auth` (`HiddenActivity`), `androidx.security:security-crypto` (`com.google.crypto.tink` `sun.misc.Unsafe`), and hardcoded `com.whatsapp` / `org.telegram.messenger` strings.
-              - Fixed `BootCompletedReceiver` manifest declaration (removed invalid `android:permission="android.permission.RECEIVE_BOOT_COMPLETED"` on `<receiver>` and added `android:enableOnBackInvokedCallback="true"`).
-              - Explicitly signed with `apksigner` (`--v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true`).
-            - **3. Instant Auto-Backup Start & 24/7 Never-Stop Background Loop**:
-              - Fixed `wakeUpChannel` signal handling in `PermanentBackupForegroundService`, dynamically re-attaches `FileObserver` as soon as storage permissions are granted, removed `setRequiresBatteryNotLow(true)`, and added `MediaStore` + standard folder fallback so auto-backup starts immediately on standard Android 11-15 media permissions.
-            - **4. Real-Time Phone Source & Google Drive Destination Display**:
-              - Live `currentScanActivity` and `activeUploadProgress` streams update `currentPhoneSourcePath` and `currentDriveTargetPath` and auto-refresh the Home Dashboard upon cycle completion.
+            Automated Remote Cloud Build of **Permanent Drive v2.3.4** (`com.permanentbackup.gdrive`, `versionCode = 12`).
+            - **1. Explicit Loading States Across All Screens**:
+              - Added `LoadingStateCard("Loading... Please wait while all files are being loaded...")` with spinner + progress bar across Home, My Drive, Phone Storage, Backups, Recent, Transfers, and Accounts whenever files, folders, or cloud states are loading.
+            - **2. True Google Drive Backup Folder State & User Create / Rename Controls**:
+              - Removed all predefined/demo-like folder paths before a folder is actually created on Google Drive (`isDriveRootFolderCreated` verified via `rootDriveFolderId` and `findFolderByName`).
+              - Added `CreateOrRenameBackupFolderDialog` and `createOrRenameRootBackupFolder()` so users can create the target folder on Google Drive immediately or rename/switch to any custom backup folder name.
+            - **3. Solved 15 Additional State-Blind / Predefined-Message Issues (17 Total Fixes)**:
+              - Removed all hardcoded `irakiroan@gmail.com` fallbacks, fake `15 GB` unloaded quota displays, fake `100%` completeness on `0/0` folders, fake `+6h` scheduled timers when inactive, fake 7-folder static lists before storage permission is granted, and silent folder creation on tab open; added automatic retry-with-backoff for HTTP 429/403 rate limits.
           files: |
-            app/build/outputs/apk/debug/Permanent-Drive-v2.3.3.apk
+            app/build/outputs/apk/debug/Permanent-Drive-v2.3.4.apk
             app/build/outputs/apk/debug/app-debug.apk
             app/build/outputs/apk/debug/app-debug.apk.sha256
             app/build/outputs/apk/debug/apk-signing-certificate.txt
+
 

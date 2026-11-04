@@ -2992,6 +2992,75 @@ class PermanentBackupEngineTest {
         assertEquals("WhatsApp Media", found!!.folderCategory)
         assertTrue(sampleFile.exists())
     }
+
+    // 40. v2.3.4 State-Aware Models, Uncreated Drive Folder Honesty & User Custom Folder Creation/Rename
+    @Test
+    fun test40_stateAwareDashboard_noPredefinedDemoStrings_andCustomDriveFolderCreateRename() = runTest {
+        installStandardDriveMockDispatcher()
+
+        // 1. Default model states must never pretend a folder is created, quota is loaded, or 0/0 files is 100%
+        val defaultSummary = com.permanentbackup.gdrive.domain.model.DashboardSummary()
+        assertTrue("Default DashboardSummary must start in loading state", defaultSummary.isDashboardLoading)
+        assertFalse("Default DashboardSummary must not claim Drive root folder is created", defaultSummary.isDriveRootFolderCreated)
+        assertFalse("Default DashboardSummary must not claim 24/7 auto-backup is active before setup", defaultSummary.isContinuousAutoBackupServiceActive)
+        assertEquals("", defaultSummary.currentDriveTargetPath)
+        assertEquals("", defaultSummary.currentPhoneSourcePath)
+        assertEquals(0, defaultSummary.restrictedFolderCount)
+
+        val defaultQuota = com.permanentbackup.gdrive.domain.model.DriveQuotaInfo()
+        assertFalse("Default DriveQuotaInfo must have isLoaded = false", defaultQuota.isLoaded)
+        assertFalse("Unloaded DriveQuotaInfo must not report quota full", defaultQuota.isQuotaFull)
+
+        val defaultAccount = com.permanentbackup.gdrive.domain.model.GoogleAccountState()
+        assertFalse(defaultAccount.isConnected)
+        assertEquals("", defaultAccount.grantedScope)
+        assertNull(defaultAccount.rootDriveFolderId)
+
+        val zeroFilesFolder = com.permanentbackup.gdrive.domain.model.FolderCoverageItem(
+            folderName = "EmptyFolder",
+            relativePath = "EmptyFolder",
+            accessStatus = FolderAccessStatus.ACCESSIBLE,
+            discoveredFileCount = 0,
+            backedUpFileCount = 0,
+            restrictionExplanation = "Accessible"
+        )
+        assertEquals("0/0 files must be 0% completeness, not 100%", 0f, zeroFilesFolder.completenessFraction, 0.001f)
+
+        // 2. Before root folder is created on Google Drive, DashboardSummary must report isDriveRootFolderCreated = false
+        val prefs = TestInMemorySharedPreferences()
+        val scanner = AndroidStorageScanner(null, listOf(tempStorageDir), true)
+        val repository = BackupRepository(
+            context = null,
+            backupDao = dao,
+            storageSource = scanner,
+            driveApiClient = driveApiClient,
+            authManager = authManager,
+            customSettingsPrefs = prefs
+        )
+        authManager.setRootDriveFolderId(null)
+        val preCreateDash = repository.buildDashboardSummary()
+        assertFalse("Drive folder must be reported as NOT created when rootDriveFolderId is null", preCreateDash.isDriveRootFolderCreated)
+        assertEquals("Drive target path must be empty when folder is not created yet", "", preCreateDash.currentDriveTargetPath)
+
+        // 3. User renames / creates a custom backup folder on Google Drive
+        val customFolderResult = repository.createOrRenameRootBackupFolder("My_Custom_Phone_Backup_2026")
+        assertTrue("Custom folder creation must succeed on Drive", customFolderResult.isSuccess)
+        assertEquals("My_Custom_Phone_Backup_2026", authManager.accountState.value.rootDriveFolderName)
+        assertNotNull("rootDriveFolderId must be populated after explicit creation", authManager.accountState.value.rootDriveFolderId)
+
+        // 4. Run backup and verify files back up into the user's custom folder
+        val docsDir = File(tempStorageDir, "Documents").apply { mkdirs() }
+        File(docsDir, "custom_folder_test.txt").writeText("CUSTOM_DRIVE_FOLDER_CONTENT_2026")
+        val cycle = repository.runBackupNow()
+        assertEquals(1, cycle.uploadedAndVerifiedFiles)
+
+        val postCreateDash = repository.buildDashboardSummary()
+        assertTrue("Drive folder must now be reported as created", postCreateDash.isDriveRootFolderCreated)
+        assertTrue(
+            "Drive target path must use the user's custom folder name, got: ${postCreateDash.currentDriveTargetPath}",
+            postCreateDash.currentDriveTargetPath.contains("My_Custom_Phone_Backup_2026")
+        )
+    }
 }
 
 class TestInMemorySharedPreferences : SharedPreferences {

@@ -20,6 +20,7 @@ import java.util.Collections
 
 interface StorageFileSource {
     val hasStoragePermission: Boolean
+    fun hasManageAllFilesPermission(): Boolean = hasStoragePermission
     fun scanFilesSequence(computeHashes: Boolean = true): Sequence<DiscoveredSourceFile>
     fun getFolderCoverageReport(backedUpCountsByCategory: Map<String, Int>): List<FolderCoverageItem>
     fun browseLocalDirectory(relativeSubPath: String = ""): List<LocalBrowseItem>
@@ -35,7 +36,7 @@ interface StorageFileSource {
  * Videos, Audio, WhatsApp Media, Telegram Downloads, removable SD Card storage, and persisted SAF Trees
  * while strictly refusing to read Android OS restricted app-private directories (Android/data, Android/obb, /data/data)
  * and excluding Cloud-to-Local restore/mirror directories (Restored_From_Drive, Drive_Mirror) so mirrored downloads
- * never loop back into permanent cloud backups.
+ * never loop back into permanent backups.
  */
 class AndroidStorageScanner(
     private val context: Context?,
@@ -86,6 +87,16 @@ class AndroidStorageScanner(
     }
 
     override fun getPersistedSafTreeUris(): List<String> = persistedSafTreeUris.toList()
+
+    override fun hasManageAllFilesPermission(): Boolean {
+        permissionOverride?.let { return it }
+        val ctx = context ?: return true
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            Environment.isExternalStorageManager()
+        } else {
+            hasStoragePermission
+        }
+    }
 
     override val hasStoragePermission: Boolean
         get() {

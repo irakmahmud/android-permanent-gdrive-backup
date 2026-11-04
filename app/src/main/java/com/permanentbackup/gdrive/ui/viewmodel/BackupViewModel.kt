@@ -54,6 +54,26 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
     private val _folderCoverage = MutableStateFlow<List<FolderCoverageItem>>(emptyList())
     val folderCoverage: StateFlow<List<FolderCoverageItem>> = _folderCoverage.asStateFlow()
 
+    private val _isDashboardLoading = MutableStateFlow(true)
+    val isDashboardLoading: StateFlow<Boolean> = _isDashboardLoading.asStateFlow()
+
+    private val _isScanningPhoneStorage = MutableStateFlow(true)
+    val isScanningPhoneStorage: StateFlow<Boolean> = _isScanningPhoneStorage.asStateFlow()
+
+    private val _isLoadingCloudDrive = MutableStateFlow(false)
+    val isLoadingCloudDrive: StateFlow<Boolean> = _isLoadingCloudDrive.asStateFlow()
+
+    val cloudDriveErrorMessage: StateFlow<String?> = repository.lastCloudBrowseError
+
+    private val _isLoadingLocalBrowser = MutableStateFlow(true)
+    val isLoadingLocalBrowser: StateFlow<Boolean> = _isLoadingLocalBrowser.asStateFlow()
+
+    private val _isCreatingOrRenamingDriveFolder = MutableStateFlow(false)
+    val isCreatingOrRenamingDriveFolder: StateFlow<Boolean> = _isCreatingOrRenamingDriveFolder.asStateFlow()
+
+    private val _isAuthorizingAccount = MutableStateFlow(false)
+    val isAuthorizingAccount: StateFlow<Boolean> = _isAuthorizingAccount.asStateFlow()
+
     private val _cloudDriveItems = MutableStateFlow<List<CloudBrowseItem>>(emptyList())
     val cloudDriveItems: StateFlow<List<CloudBrowseItem>> = _cloudDriveItems.asStateFlow()
 
@@ -166,6 +186,8 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
 
     init {
         viewModelScope.launch(vmExceptionHandler) {
+            _isDashboardLoading.value = true
+            _isScanningPhoneStorage.value = true
             withContext(Dispatchers.IO) {
                 runCatching { repository.syncPersistedAccountOnStartup() }
                 runCatching { fileObserverManager.startWatching() }
@@ -177,47 +199,85 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
             refreshLocalPhoneBrowser("")
         }
 
-        // Real-time stream of active scan/upload activity so the UI immediately shows which phone folder/file is backing up
+        // Real-time stream of active scan/upload activity so the UI immediately reflects the true runtime state
         viewModelScope.launch(Dispatchers.IO + vmExceptionHandler) {
             var wasRunning = false
             combine(
                 repository.backupEngine.activeUploadProgress,
                 repository.backupEngine.currentScanActivity,
-                repository.backupEngine.isRunning
-            ) { progress, scanActivity, running ->
-                Triple(progress, scanActivity, running)
-            }.collectLatest { (progress, scanActivity, running) ->
+                repository.backupEngine.isRunning,
+                repository.backupEngine.isVerifyingOrCreatingDriveFolder,
+                repository.authManager.accountState
+            ) { progress, scanActivity, running, verifyingFolder, accountState ->
+                listOf(progress, scanActivity, running, verifyingFolder, accountState)
+            }.collectLatest { values ->
+                val progress = values[0] as? com.permanentbackup.gdrive.domain.model.ActiveUploadProgress
+                val scanActivity = values[1] as? String
+                val running = values[2] as Boolean
+                val verifyingFolder = values[3] as Boolean
+                val accountState = values[4] as com.permanentbackup.gdrive.domain.model.GoogleAccountState
+
                 val current = _dashboardSummary.value
-                val rootFolderName = current.accountState.rootDriveFolderName.ifBlank { "Android_Permanent_Backup" }
+                val rootFolderName = accountState.rootDriveFolderName.ifBlank { "Android_Permanent_Backup" }
+                val isRootCreated = accountState.isConnected && !accountState.rootDriveFolderId.isNullOrBlank()
+                val hasStoragePerm = repository.storageSource.hasStoragePermission
+
                 val parsedFromScanPhone = scanActivity
                     ?.substringAfter("From Phone: ", "")
                     ?.substringBefore(" →", "")
                     ?.trim()
                     ?.takeIf { it.isNotBlank() }
-                val parsedFromScanDrive = scanActivity
-                    ?.substringAfter("To Google Drive: ", "")
-                    ?.trim()
-                    ?.takeIf { it.isNotBlank() }
+                    ?: scanActivity
+                        ?.substringAfter("Scanning Phone: ", "")
+                        ?.substringBefore(" (", "")
+                        ?.trim()
+                        ?.takeIf { it.isNotBlank() }
+                val parsedFromScanDrive = if (isRootCreated) {
+                    scanActivity
+                        ?.substringAfter("To Google Drive: ", "")
+                        ?.trim()
+                        ?.takeIf { it.isNotBlank() }
+                } else {
+                    null
+                }
 
                 val phoneSource = progress?.let { "/storage/emulated/0/${it.relativePath.trimStart('/')}" }
                     ?: parsedFromScanPhone
                     ?: current.currentPhoneSourcePath
-                val driveTarget = progress?.let {
-                    val parentFolder = it.relativePath.replace('\\', '/').substringBeforeLast('/', "")
-                    if (parentFolder.isNotBlank()) {
-                        "My Drive / $rootFolderName / $parentFolder / ${it.fileName}"
-                    } else {
-                        "My Drive / $rootFolderName / ${it.fileName}"
-                    }
-                } ?: parsedFromScanDrive ?: current.currentDriveTargetPath
+
+                val driveTarget = if (!isRootCreated) {
+                    ""
+                } else {
+                    progress?.let {
+                        val parentFolder = it.relativePath.replace('\\', '/').substringBeforeLast('/', "")
+                        if (parentFolder.isNotBlank()) {
+                            "My Drive / $rootFolderName / $parentFolder / ${it.fileName}"
+                        } else {
+                            "My Drive / $rootFolderName / ${it.fileName}"
+                        }
+                    } ?: parsedFromScanDrive ?: current.currentDriveTargetPath.ifBlank { "My Drive / $rootFolderName/" }
+                }
+
+                val isAutoActive = accountState.isConnected &&
+                    settings.value.userBackupConsentGranted &&
+                    !settings.value.backgroundSyncPaused &&
+                    hasStoragePerm
 
                 _dashboardSummary.value = current.copy(
+                    accountState = accountState,
                     isBackupRunning = running,
                     currentlyUploading = progress,
                     currentPhoneSourcePath = phoneSource,
                     currentDriveTargetPath = driveTarget,
                     currentScanningOrUploadingFile = scanActivity ?: current.currentScanningOrUploadingFile,
-                    isContinuousAutoBackupServiceActive = !settings.value.backgroundSyncPaused
+                    isContinuousAutoBackupServiceActive = isAutoActive,
+                    isScanningPhoneStorage = _isScanningPhoneStorage.value || running,
+                    isVerifyingOrCreatingDriveFolder = verifyingFolder || _isCreatingOrRenamingDriveFolder.value,
+                    hasStoragePermission = hasStoragePerm,
+                    hasManageAllFilesPermission = repository.storageSource.hasManageAllFilesPermission(),
+                    isBatteryOptimizationIgnored = repository.isBatteryOptimizationIgnored(),
+                    isDriveRootFolderCreated = isRootCreated,
+                    watchedFolderCount = fileObserverManager.getWatchedDirectoryPaths().size
                 )
 
                 if (wasRunning && !running) {
@@ -235,7 +295,9 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
                     repository.saveSettingsToDatabase(settings.value.copy(userBackupConsentGranted = true))
                 }
             }
-            if (!settings.value.backgroundSyncPaused) {
+            if (!settings.value.backgroundSyncPaused &&
+                (repository.authManager.accountState.value.isConnected || repository.storageSource.hasStoragePermission)
+            ) {
                 PermanentBackupForegroundService.startManualBackupService(getApplication())
             }
         }
@@ -282,18 +344,31 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
                     _dashboardSummary.value.dbIntegrityOk
                 }
                 val now = System.currentTimeMillis()
-                val coverage = if (forceCoverage ||
+                val shouldScanCoverage = forceCoverage ||
                     _folderCoverage.value.isEmpty() ||
                     now - lastCoverageScanMs > 15_000L
-                ) {
+                if (shouldScanCoverage) {
+                    _isScanningPhoneStorage.value = true
+                }
+                val coverage = if (shouldScanCoverage) {
                     lastCoverageScanMs = now
-                    runCatching { repository.getFolderCoverageItems() }.getOrDefault(_folderCoverage.value)
+                    try {
+                        runCatching { repository.getFolderCoverageItems() }.getOrDefault(_folderCoverage.value)
+                    } finally {
+                        _isScanningPhoneStorage.value = false
+                    }
                 } else {
                     _folderCoverage.value
                 }
+                val watchedCount = fileObserverManager.getWatchedDirectoryPaths().size
                 val summary = runCatching {
-                    repository.buildDashboardSummary(precomputedCoverage = coverage).copy(dbIntegrityOk = dbOk)
-                }.getOrDefault(DashboardSummary(dbIntegrityOk = dbOk))
+                    repository.buildDashboardSummary(
+                        precomputedCoverage = coverage,
+                        isDashboardLoading = false,
+                        isScanningPhoneStorage = _isScanningPhoneStorage.value,
+                        watchedFolderCountOverride = watchedCount
+                    ).copy(dbIntegrityOk = dbOk)
+                }.getOrDefault(DashboardSummary(dbIntegrityOk = dbOk, isDashboardLoading = false))
                 val versions = runCatching {
                     repository.getAccountBackupVersionsPaged(limit = 200)
                 }.getOrDefault(emptyList())
@@ -301,6 +376,7 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
 
                 _folderCoverage.value = coverage
                 _dashboardSummary.value = summary
+                _isDashboardLoading.value = false
                 _accountBackupVersions.value = versions
                 _oauthDiagnostics.value = diag
             }
@@ -312,45 +388,103 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
 
     fun refreshCloudDriveExplorer() {
         viewModelScope.launch(Dispatchers.IO + vmExceptionHandler) {
-            val currentFolderId = _driveFolderBreadcrumbs.value.lastOrNull()?.first
-            val items = repository.browseCloudDriveFiles(
-                filter = _driveFilter.value,
-                parentFolderId = currentFolderId,
-                searchQuery = _driveSearchQuery.value,
-                sortOrder = _driveSortOrder.value,
-                pageToken = null
-            )
-            _cloudDriveItems.value = items
+            _isLoadingCloudDrive.value = true
+            try {
+                val currentFolderId = _driveFolderBreadcrumbs.value.lastOrNull()?.first
+                val items = repository.browseCloudDriveFiles(
+                    filter = _driveFilter.value,
+                    parentFolderId = currentFolderId,
+                    searchQuery = _driveSearchQuery.value,
+                    sortOrder = _driveSortOrder.value,
+                    pageToken = null
+                )
+                _cloudDriveItems.value = items
+            } finally {
+                _isLoadingCloudDrive.value = false
+            }
         }
     }
 
     fun loadMoreCloudDriveFiles() {
         val nextToken = cloudNextPageToken.value ?: return
         viewModelScope.launch(Dispatchers.IO + vmExceptionHandler) {
-            val currentFolderId = _driveFolderBreadcrumbs.value.lastOrNull()?.first
-            val nextItems = repository.browseCloudDriveFiles(
-                filter = _driveFilter.value,
-                parentFolderId = currentFolderId,
-                searchQuery = _driveSearchQuery.value,
-                sortOrder = _driveSortOrder.value,
-                pageToken = nextToken
-            )
-            val existingIds = _cloudDriveItems.value.map { it.driveFileId }.toSet()
-            _cloudDriveItems.value = _cloudDriveItems.value + nextItems.filter { it.driveFileId !in existingIds }
+            _isLoadingCloudDrive.value = true
+            try {
+                val currentFolderId = _driveFolderBreadcrumbs.value.lastOrNull()?.first
+                val nextItems = repository.browseCloudDriveFiles(
+                    filter = _driveFilter.value,
+                    parentFolderId = currentFolderId,
+                    searchQuery = _driveSearchQuery.value,
+                    sortOrder = _driveSortOrder.value,
+                    pageToken = nextToken
+                )
+                val existingIds = _cloudDriveItems.value.map { it.driveFileId }.toSet()
+                _cloudDriveItems.value = _cloudDriveItems.value + nextItems.filter { it.driveFileId !in existingIds }
+            } finally {
+                _isLoadingCloudDrive.value = false
+            }
         }
     }
 
     fun createNewCloudFolder(folderName: String) {
         if (folderName.isBlank()) return
         viewModelScope.launch(Dispatchers.IO + vmExceptionHandler) {
-            val currentFolderId = _driveFolderBreadcrumbs.value.lastOrNull()?.first
-            val createdId = repository.createCloudFolder(folderName.trim(), currentFolderId)
-            if (createdId != null) {
-                _actionFeedbackMessage.value = "Created folder '${folderName.trim()}' on Google Drive."
-                refreshCloudDriveExplorer()
-            } else {
-                _actionFeedbackMessage.value = "Could not create folder '${folderName.trim()}'. Check connection."
+            _isLoadingCloudDrive.value = true
+            try {
+                val currentFolderId = _driveFolderBreadcrumbs.value.lastOrNull()?.first
+                val createdId = repository.createCloudFolder(folderName.trim(), currentFolderId)
+                if (createdId != null) {
+                    _actionFeedbackMessage.value = "✓ Folder '${folderName.trim()}' is created on Google Drive."
+                    refreshCloudDriveExplorer()
+                } else {
+                    _actionFeedbackMessage.value = "Could not create folder '${folderName.trim()}' on Google Drive. Connect your Google Account first."
+                }
+            } finally {
+                _isLoadingCloudDrive.value = false
             }
+        }
+    }
+
+    /**
+     * Allows the user to explicitly create the root backup folder on Google Drive right now,
+     * or rename / create a new target Google Drive backup folder.
+     */
+    fun createOrRenameRootBackupFolder(newFolderName: String) {
+        val cleanName = newFolderName.trim()
+            .replace("/", "_")
+            .replace("\\", "_")
+            .ifBlank { "Android_Permanent_Backup" }
+        viewModelScope.launch(vmExceptionHandler) {
+            _isCreatingOrRenamingDriveFolder.value = true
+            _actionFeedbackMessage.value = if (repository.authManager.accountState.value.isConnected) {
+                "Creating / verifying folder '$cleanName' on Google Drive... Please wait..."
+            } else {
+                "Saving target backup folder name '$cleanName'..."
+            }
+            val result = withContext(Dispatchers.IO) {
+                repository.createOrRenameRootBackupFolder(cleanName)
+            }
+            _isCreatingOrRenamingDriveFolder.value = false
+            result.fold(
+                onSuccess = { folderId ->
+                    if (folderId.isNotBlank()) {
+                        _actionFeedbackMessage.value =
+                            "✓ Folder '$cleanName' is created on Google Drive (My Drive/$cleanName, ID: $folderId)."
+                        _signInStatusMessage.value =
+                            "✓ Google Drive folder '$cleanName' is created at My Drive/$cleanName."
+                    } else {
+                        _actionFeedbackMessage.value =
+                            "Target folder set to '$cleanName'. Folder is not created on Google Drive yet — connect your Google Account to create it."
+                    }
+                    refreshDashboardAndCoverage(fetchRemoteQuota = false, forceCoverage = true)
+                    refreshCloudDriveExplorer()
+                },
+                onFailure = { err ->
+                    _actionFeedbackMessage.value =
+                        "Could not create folder '$cleanName' on Google Drive: ${err.message}"
+                    refreshDashboardAndCoverage(fetchRemoteQuota = false)
+                }
+            )
         }
     }
 
@@ -473,8 +607,13 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
 
     fun refreshLocalPhoneBrowser(relativeSubPath: String = _currentLocalPath.value) {
         viewModelScope.launch(Dispatchers.IO + vmExceptionHandler) {
-            _currentLocalPath.value = relativeSubPath
-            _localPhoneItems.value = repository.browseLocalPhoneStorage(relativeSubPath)
+            _isLoadingLocalBrowser.value = true
+            try {
+                _currentLocalPath.value = relativeSubPath
+                _localPhoneItems.value = repository.browseLocalPhoneStorage(relativeSubPath)
+            } finally {
+                _isLoadingLocalBrowser.value = false
+            }
         }
     }
 
@@ -513,10 +652,24 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun triggerManualBackupNow() {
+        val hasStoragePerm = repository.storageSource.hasStoragePermission
+        val accountState = repository.authManager.accountState.value
+        if (!hasStoragePerm) {
+            _actionFeedbackMessage.value =
+                "Storage permission is required to scan phone files. Please tap 'Grant All Files Access' first."
+            refreshDashboardAndCoverage(fetchRemoteQuota = false)
+            return
+        }
         // PermanentBackupForegroundService executes app.repository.runBackupNow() on serviceScope;
         // do not duplicate the runBackupNow() call from ViewModel.
         PermanentBackupForegroundService.startManualBackupService(getApplication())
-        _actionFeedbackMessage.value = "Started foreground permanent backup sync..."
+        _actionFeedbackMessage.value = if (!accountState.isConnected) {
+            "Scanning phone folders locally... Connect your Google Account to create folder '${accountState.rootDriveFolderName}' and upload."
+        } else if (accountState.rootDriveFolderId.isNullOrBlank()) {
+            "Scanning phone files & creating folder '${accountState.rootDriveFolderName}' on Google Drive... Please wait."
+        } else {
+            "Scanning phone folders & syncing to Google Drive folder '${accountState.rootDriveFolderName}'... Please wait."
+        }
         refreshDashboardAndCoverage(fetchRemoteQuota = false)
     }
 
@@ -658,7 +811,8 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
         onRecoverableConsentIntent: (Intent) -> Unit = {}
     ) {
         viewModelScope.launch(vmExceptionHandler) {
-            _signInStatusMessage.value = "Authorizing Google Drive access for $selectedEmail..."
+            _isAuthorizingAccount.value = true
+            _signInStatusMessage.value = "Loading... Authorizing Google Drive access for $selectedEmail..."
             val outcome = withContext(Dispatchers.IO) {
                 val res = repository.authManager.trySilentOrInteractiveAuthorization(
                     context = context,
@@ -673,6 +827,7 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
                 }
                 res
             }
+            _isAuthorizingAccount.value = false
 
             if (!skipGisResolution && outcome.resolutionPendingIntent != null) {
                 onResolutionPendingIntent(outcome.resolutionPendingIntent)
@@ -684,11 +839,18 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
             }
 
             if (outcome.authorized) {
-                val activeEmail = repository.authManager.accountState.value.email
+                val state = repository.authManager.accountState.value
+                val folderName = state.rootDriveFolderName.ifBlank { "Android_Permanent_Backup" }
+                val folderStatus = if (!state.rootDriveFolderId.isNullOrBlank()) {
+                    "✓ Folder '$folderName' is created on Google Drive (My Drive/$folderName)."
+                } else {
+                    "Folder '$folderName' could not be created yet (${repository.backupEngine.lastNetworkError.value ?: "will retry on sync"})."
+                }
                 _signInStatusMessage.value =
-                    "✓ Google Account ($activeEmail) Authorized! Auto-Backup to 'Android_Permanent_Backup' Started."
+                    "✓ Google Account (${state.email}) Connected! $folderStatus"
                 ensureAutoBackupRunning()
                 refreshDashboardAndCoverage(fetchRemoteQuota = false)
+                refreshCloudDriveExplorer()
             } else {
                 _signInStatusMessage.value = outcome.errorMessage
                     ?: "Google Drive authorization requires consent or OAuth client registration."
@@ -720,11 +882,16 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
 
     fun verifyAndRefreshCloudConnection() {
         viewModelScope.launch(vmExceptionHandler) {
-            _signInStatusMessage.value = "Verifying Google Drive connection & storage quota..."
+            _isAuthorizingAccount.value = true
+            _signInStatusMessage.value = "Loading... Verifying Google Drive connection, quota & backup folder..."
             val ok = withContext(Dispatchers.IO) {
                 if (!repository.authManager.accountState.value.isConnected) {
-                    val targetEmail = repository.authManager.accountState.value.email.ifBlank { "irakiroan@gmail.com" }
-                    repository.authManager.authorizeSelectedNativeAccount(selectedEmail = targetEmail)
+                    val targetEmail = repository.authManager.accountState.value.email.trim()
+                    if (targetEmail.isNotBlank()) {
+                        repository.authManager.authorizeSelectedNativeAccount(selectedEmail = targetEmail)
+                    } else {
+                        repository.authManager.authorizeViaCloudDriveBridge("")
+                    }
                 }
                 val quotaOk = repository.backupEngine.refreshRemoteQuotaAndRootFolder()
                 if (quotaOk) {
@@ -732,15 +899,23 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
                 }
                 quotaOk
             }
-            if (ok) {
-                val email = repository.authManager.accountState.value.email
+            _isAuthorizingAccount.value = false
+            val state = repository.authManager.accountState.value
+            val folderName = state.rootDriveFolderName.ifBlank { "Android_Permanent_Backup" }
+            if (ok && !state.rootDriveFolderId.isNullOrBlank()) {
                 _signInStatusMessage.value =
-                    "✓ Google Drive ($email) Verified & 'Android_Permanent_Backup' Auto-Backup Active!"
+                    "✓ Google Drive (${state.email}) Verified! Folder '$folderName' is created at My Drive/$folderName (ID: ${state.rootDriveFolderId})."
                 ensureAutoBackupRunning()
+                refreshDashboardAndCoverage(fetchRemoteQuota = false)
+                refreshCloudDriveExplorer()
+            } else if (state.isConnected) {
+                _signInStatusMessage.value =
+                    "Connected as ${state.email}, but folder '$folderName' is not created yet: ${repository.backupEngine.lastNetworkError.value ?: "Tap 'Create Folder Now' to retry."}"
                 refreshDashboardAndCoverage(fetchRemoteQuota = false)
             } else {
                 _signInStatusMessage.value =
-                    "Could not reach Google Drive or authorization needed. Check internet or reconnect."
+                    "Google Account is not connected. Tap 'Connect Google Account' to sign in."
+                refreshDashboardAndCoverage(fetchRemoteQuota = false)
             }
         }
     }

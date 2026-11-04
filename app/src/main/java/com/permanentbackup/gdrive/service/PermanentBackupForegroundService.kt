@@ -130,12 +130,31 @@ class PermanentBackupForegroundService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         activeInstance = this
         val app = application as? PermanentBackupApp
+        val accountState = app?.repository?.authManager?.accountState?.value
+        val hasStoragePerm = app?.repository?.storageSource?.hasStoragePermission ?: false
+        val rootDriveName = accountState?.rootDriveFolderName?.ifBlank { PermanentBackupEngine.ROOT_DRIVE_FOLDER_NAME }
+            ?: PermanentBackupEngine.ROOT_DRIVE_FOLDER_NAME
+        val isFolderCreated = accountState?.isConnected == true && !accountState.rootDriveFolderId.isNullOrBlank()
+
+        val initialTitle = when {
+            app?.repository?.backupEngine?.isPaused?.value == true -> "Permanent Drive — Auto-Backup Paused"
+            !hasStoragePerm -> "Permanent Drive — Storage Permission Needed"
+            accountState?.isConnected != true -> "Permanent Drive — Connect Google Account"
+            !isFolderCreated -> "Permanent Drive — Verifying Google Drive Folder..."
+            else -> "Auto-Backup Active (${accountState?.email})"
+        }
+        val initialContent = when {
+            !hasStoragePerm -> "Tap to open app and grant storage access to load phone files."
+            accountState?.isConnected != true -> "Tap to connect Google Account (no Drive folder created yet)."
+            !isFolderCreated -> "Folder '$rootDriveName' will be created on Google Drive."
+            else -> "Backed up to Created Drive Folder: My Drive/$rootDriveName/"
+        }
 
         // Always promote to foreground first to satisfy Android O+ 5-second startForeground contract
         val initialNotification = buildProgressNotification(
-            title = "Auto-Backup Active (24/7 Never-Stop)",
-            contentText = "Phone Folders → Google Drive: My Drive/${PermanentBackupEngine.ROOT_DRIVE_FOLDER_NAME}/",
-            bigText = "From Phone: /storage/emulated/0/{DCIM, Pictures, Videos, Downloads, Documents, Media}\nTo Google Drive: My Drive / ${PermanentBackupEngine.ROOT_DRIVE_FOLDER_NAME} / <Phone_Folder>",
+            title = initialTitle,
+            contentText = initialContent,
+            bigText = initialContent,
             progressPercent = null,
             isPaused = app?.repository?.backupEngine?.isPaused?.value == true,
             indeterminate = false
@@ -258,17 +277,27 @@ class PermanentBackupForegroundService : Service() {
         scanStatus: String?
     ) {
         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
-        val rootDriveName = PermanentBackupEngine.ROOT_DRIVE_FOLDER_NAME
+        val app = application as? PermanentBackupApp
+        val accountState = app?.repository?.authManager?.accountState?.value
+        val hasStoragePerm = app?.repository?.storageSource?.hasStoragePermission ?: false
+        val rootDriveName = accountState?.rootDriveFolderName?.ifBlank { PermanentBackupEngine.ROOT_DRIVE_FOLDER_NAME }
+            ?: PermanentBackupEngine.ROOT_DRIVE_FOLDER_NAME
+        val isFolderCreated = accountState?.isConnected == true && !accountState.rootDriveFolderId.isNullOrBlank()
+
         val notification = if (isPaused) {
             buildProgressNotification(
                 title = "Permanent Drive — Auto-Backup Paused",
-                contentText = "Tap Resume to continue backing up to Google Drive ($rootDriveName).",
-                bigText = "Resumable byte offset preserved.\nGoogle Drive Target: My Drive / $rootDriveName",
+                contentText = "Tap Resume to continue backing up.",
+                bigText = if (isFolderCreated) {
+                    "Resumable byte offset preserved.\nCreated Google Drive Folder: My Drive / $rootDriveName"
+                } else {
+                    "Auto-backup is paused. Folder '$rootDriveName' has not been created on Google Drive yet."
+                },
                 progressPercent = progress?.fraction?.let { (it * 100f).toInt().coerceIn(0, 100) },
                 isPaused = true,
                 indeterminate = false
             )
-        } else if (progress != null) {
+        } else if (progress != null && isFolderCreated) {
             val pct = (progress.fraction * 100f).toInt().coerceIn(0, 100)
             val speedStr = formatSpeed(progress.transferSpeedBps)
             val etaStr = progress.estimatedRemainingSeconds?.let { " • ETA ${it}s" }.orEmpty()
@@ -287,12 +316,39 @@ class PermanentBackupForegroundService : Service() {
                 isPaused = false,
                 indeterminate = false
             )
+        } else if (!hasStoragePerm) {
+            buildProgressNotification(
+                title = "Permanent Drive — Storage Permission Required",
+                contentText = "Open app and grant storage permission so phone files can be loaded.",
+                bigText = "Phone folders cannot be scanned until storage permission is granted.",
+                progressPercent = null,
+                isPaused = false,
+                indeterminate = false
+            )
+        } else if (accountState?.isConnected != true) {
+            buildProgressNotification(
+                title = "Permanent Drive — Google Account Disconnected",
+                contentText = "Connect your Google Account to create folder '$rootDriveName' on Google Drive.",
+                bigText = scanStatus ?: "No folder is created on Google Drive yet. Connect your Google Account to start cloud backup.",
+                progressPercent = null,
+                isPaused = false,
+                indeterminate = false
+            )
+        } else if (!isFolderCreated) {
+            buildProgressNotification(
+                title = "Permanent Drive — Preparing Google Drive Folder",
+                contentText = "Folder '$rootDriveName' will be created on Google Drive during sync.",
+                bigText = scanStatus ?: "Connected as ${accountState?.email}. Folder '$rootDriveName' has not been created on Google Drive yet.",
+                progressPercent = null,
+                isPaused = false,
+                indeterminate = false
+            )
         } else {
             val activeDetail = scanStatus
-                ?: "From Phone: /storage/emulated/0/{DCIM, Pictures, Videos, Downloads, Documents, Media}\nTo Google Drive: My Drive / $rootDriveName / <Phone_Folder>"
+                ?: "✓ Google Drive folder '$rootDriveName' is created at My Drive/$rootDriveName (ID: ${accountState?.rootDriveFolderId}). Monitoring phone folders for new/updated files."
             buildProgressNotification(
-                title = "Auto-Backup Active (24/7 Background Sync)",
-                contentText = "Phone → Google Drive: My Drive/$rootDriveName/",
+                title = "Auto-Backup Active (My Drive/$rootDriveName)",
+                contentText = "✓ Folder '$rootDriveName' created on Google Drive",
                 bigText = activeDetail,
                 progressPercent = null,
                 isPaused = false,

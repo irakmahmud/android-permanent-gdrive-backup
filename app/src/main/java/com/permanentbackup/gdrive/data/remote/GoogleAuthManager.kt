@@ -70,6 +70,7 @@ class GoogleAuthManager(
         private const val KEY_TOKEN_EXPIRES_AT = "token_expires_at"
         private const val KEY_LAST_REFRESH = "last_refresh_ms"
         private const val KEY_ROOT_FOLDER_ID = "root_drive_folder_id"
+        private const val KEY_ROOT_FOLDER_NAME = "root_drive_folder_name"
         private const val KEY_GRANTED_SCOPES = "granted_scopes"
         private const val KEY_KNOWN_ACCOUNTS_CSV = "known_accounts_csv"
     }
@@ -153,13 +154,46 @@ class GoogleAuthManager(
         }
     }
 
+    private fun fetchAuthenticatedUserProfile(accessToken: String): Pair<String, String>? {
+        if (accessToken.isBlank()) return null
+        val aboutUrl = "https://www.googleapis.com/drive/v3/about?fields=user(emailAddress,displayName)"
+        for (attempt in 1..2) {
+            try {
+                val req = Request.Builder()
+                    .url(aboutUrl)
+                    .header("Authorization", "Bearer $accessToken")
+                    .get()
+                    .build()
+                httpClient.newCall(req).execute().use { resp ->
+                    if (resp.isSuccessful) {
+                        val body = resp.body?.string() ?: "{}"
+                        val user = JSONObject(body).optJSONObject("user")
+                        val email = user?.optString("emailAddress", "")?.trim().orEmpty()
+                        val name = user?.optString("displayName", "")?.trim().orEmpty()
+                        if (email.isNotBlank()) {
+                            return email to name.ifBlank { deriveDisplayName(email) }
+                        }
+                    } else if (resp.code == 403 || resp.code == 429) {
+                        try {
+                            Thread.sleep(1200L * attempt)
+                        } catch (_: InterruptedException) {
+                            Thread.currentThread().interrupt()
+                        }
+                    }
+                }
+            } catch (_: Throwable) {
+                // Ignore and fall back
+            }
+        }
+        return null
+    }
+
     fun authorizeViaCloudDriveBridge(
         targetEmail: String,
         grantedScopes: String = "$LEAST_PRIVILEGE_SCOPE $DRIVE_READONLY_SCOPE"
     ): SilentAuthOutcome {
         val bridge = decodeCloudBridgePayload()
             ?: return SilentAuthOutcome(authorized = false, errorMessage = "Cloud Drive OAuth bridge not configured.")
-        val cleanEmail = targetEmail.trim().ifBlank { "irakiroan@gmail.com" }
         return try {
             val formBuilder = FormBody.Builder()
                 .add("client_id", bridge.first)
@@ -189,9 +223,24 @@ class GoogleAuthManager(
                         errorMessage = "Empty access_token from Google OAuth endpoint."
                     )
                 }
+                val profile = fetchAuthenticatedUserProfile(accessToken)
+                val cleanEmail = targetEmail.trim().ifBlank {
+                    profile?.first ?: getString(KEY_EMAIL, "").trim()
+                }
+                if (cleanEmail.isBlank()) {
+                    return SilentAuthOutcome(
+                        authorized = false,
+                        errorMessage = "Google Account email could not be verified. Please select a Google Account."
+                    )
+                }
+                val displayName = if (profile != null && profile.first.equals(cleanEmail, ignoreCase = true)) {
+                    profile.second
+                } else {
+                    deriveDisplayName(cleanEmail)
+                }
                 onAccountAuthorized(
                     email = cleanEmail,
-                    displayName = deriveDisplayName(cleanEmail),
+                    displayName = displayName,
                     accessToken = accessToken,
                     refreshToken = bridge.third,
                     expiresInSeconds = expiresIn,
@@ -223,9 +272,17 @@ class GoogleAuthManager(
         val email = getString(KEY_EMAIL, "")
         val displayName = getString(KEY_DISPLAY_NAME, "")
         val accountId = normalizeAccountId(email)
-        val scopes = getAccountScopedString(accountId, KEY_GRANTED_SCOPES, LEAST_PRIVILEGE_SCOPE)
+        val isActuallyConnected = connected && email.isNotBlank() && !getBoolean(KEY_LEGACY_TOKEN_WAS_PURGED, false)
+        val scopes = if (isActuallyConnected) {
+            getAccountScopedString(accountId, KEY_GRANTED_SCOPES, LEAST_PRIVILEGE_SCOPE)
+        } else {
+            getAccountScopedString(accountId, KEY_GRANTED_SCOPES, "")
+        }
         val rootFolderId = getAccountScopedString(accountId, KEY_ROOT_FOLDER_ID, "").ifBlank {
             getString(KEY_ROOT_FOLDER_ID, "").ifBlank { null }
+        }
+        val rootFolderName = getAccountScopedString(accountId, KEY_ROOT_FOLDER_NAME, "").ifBlank {
+            getString(KEY_ROOT_FOLDER_NAME, "").ifBlank { ROOT_BACKUP_FOLDER_NAME }
         }
         val expiresAt = getAccountScopedLong(accountId, KEY_TOKEN_EXPIRES_AT, getLong(KEY_TOKEN_EXPIRES_AT, 0L))
         val lastRefresh = getAccountScopedLong(accountId, KEY_LAST_REFRESH, getLong(KEY_LAST_REFRESH, 0L))
@@ -240,15 +297,15 @@ class GoogleAuthManager(
 
         return GoogleAccountState(
             accountId = accountId,
-            isConnected = connected && email.isNotBlank() && !legacyTokenWasPurged,
+            isConnected = isActuallyConnected,
             email = email,
             displayName = displayName.ifBlank { email.substringBefore("@") },
             selectedAccountRef = email,
             authState = authState,
             grantedScope = scopes,
-            hasFullDriveReadScope = scopes.contains(DRIVE_READONLY_SCOPE),
+            hasFullDriveReadScope = isActuallyConnected && scopes.contains(DRIVE_READONLY_SCOPE),
             rootDriveFolderId = rootFolderId,
-            rootDriveFolderName = ROOT_BACKUP_FOLDER_NAME,
+            rootDriveFolderName = rootFolderName,
             tokenExpiresAtMs = expiresAt,
             lastTokenRefreshMs = lastRefresh,
             lastTokenRefreshStatus = when {
@@ -451,6 +508,11 @@ class GoogleAuthManager(
         registerKnownAccountEmail(cleanEmail)
 
         val existingRoot = getAccountScopedString(accountId, KEY_ROOT_FOLDER_ID, "").ifBlank { null }
+        val existingRootName = getAccountScopedString(accountId, KEY_ROOT_FOLDER_NAME, "").ifBlank {
+            getString(KEY_ROOT_FOLDER_NAME, "").ifBlank { ROOT_BACKUP_FOLDER_NAME }
+        }
+        putString(KEY_ROOT_FOLDER_NAME, existingRootName)
+        putAccountScopedString(accountId, KEY_ROOT_FOLDER_NAME, existingRootName)
 
         _accountState.value = GoogleAccountState(
             accountId = accountId,
@@ -462,7 +524,7 @@ class GoogleAuthManager(
             grantedScope = grantedScopes,
             hasFullDriveReadScope = grantedScopes.contains(DRIVE_READONLY_SCOPE),
             rootDriveFolderId = existingRoot,
-            rootDriveFolderName = ROOT_BACKUP_FOLDER_NAME,
+            rootDriveFolderName = existingRootName,
             tokenExpiresAtMs = expiresAt,
             lastTokenRefreshMs = now,
             lastTokenRefreshStatus = "OK",
@@ -576,15 +638,39 @@ class GoogleAuthManager(
         putString(KEY_KNOWN_ACCOUNTS_CSV, updated)
     }
 
-    fun setRootDriveFolderId(folderId: String) {
+    fun setRootDriveFolderId(folderId: String?) {
+        val cleanId = folderId?.trim().orEmpty()
         val accountId = _accountState.value.accountId.ifBlank {
             normalizeAccountId(_accountState.value.email)
         }
-        putString(KEY_ROOT_FOLDER_ID, folderId)
+        putString(KEY_ROOT_FOLDER_ID, cleanId)
         if (accountId.isNotBlank()) {
-            putAccountScopedString(accountId, KEY_ROOT_FOLDER_ID, folderId)
+            putAccountScopedString(accountId, KEY_ROOT_FOLDER_ID, cleanId)
         }
-        _accountState.value = _accountState.value.copy(rootDriveFolderId = folderId)
+        _accountState.value = _accountState.value.copy(
+            rootDriveFolderId = cleanId.ifBlank { null }
+        )
+    }
+
+    fun setRootDriveFolderName(folderName: String, folderId: String? = null) {
+        val cleanName = folderName.trim()
+            .replace("/", "_")
+            .replace("\\", "_")
+            .ifBlank { ROOT_BACKUP_FOLDER_NAME }
+        val cleanId = folderId?.trim().orEmpty()
+        val accountId = _accountState.value.accountId.ifBlank {
+            normalizeAccountId(_accountState.value.email)
+        }
+        putString(KEY_ROOT_FOLDER_NAME, cleanName)
+        putString(KEY_ROOT_FOLDER_ID, cleanId)
+        if (accountId.isNotBlank()) {
+            putAccountScopedString(accountId, KEY_ROOT_FOLDER_NAME, cleanName)
+            putAccountScopedString(accountId, KEY_ROOT_FOLDER_ID, cleanId)
+        }
+        _accountState.value = _accountState.value.copy(
+            rootDriveFolderName = cleanName,
+            rootDriveFolderId = cleanId.ifBlank { null }
+        )
     }
 
     fun disconnectAccount() {
@@ -671,7 +757,7 @@ class GoogleAuthManager(
         // 3. Fallback to Cloud Drive OAuth Bridge on Android device runtime
         if (appContext != null) {
             val bridgeOutcome = authorizeViaCloudDriveBridge(
-                state.email.ifBlank { "irakiroan@gmail.com" },
+                state.email,
                 "$LEAST_PRIVILEGE_SCOPE $DRIVE_READONLY_SCOPE"
             )
             if (bridgeOutcome.authorized && !bridgeOutcome.accessToken.isNullOrBlank()) {

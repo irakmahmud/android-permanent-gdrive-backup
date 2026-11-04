@@ -89,9 +89,10 @@ class BackupRepository(
     private val _cloudNextPageToken = MutableStateFlow<String?>(null)
     val cloudNextPageToken: StateFlow<String?> = _cloudNextPageToken.asStateFlow()
 
-    private val _nextScheduledBackupMs = MutableStateFlow<Long?>(
-        System.currentTimeMillis() + (6L * 3600L * 1000L)
-    )
+    private val _lastCloudBrowseError = MutableStateFlow<String?>(null)
+    val lastCloudBrowseError: StateFlow<String?> = _lastCloudBrowseError.asStateFlow()
+
+    private val _nextScheduledBackupMs = MutableStateFlow<Long?>(null)
     val nextScheduledBackupMs: StateFlow<Long?> = _nextScheduledBackupMs.asStateFlow()
 
     /** Active account ID stream; every UI list re-subscribes to the right account on account switch. */
@@ -203,13 +204,16 @@ class BackupRepository(
                     nativePlayServicesToken = null,
                     grantedScopes = activeDbAccount.grantedScopes
                 )
-                activeDbAccount.backupRootFolderId?.let { authManager.setRootDriveFolderId(it) }
+                val restoredFolderName = activeDbAccount.backupRootFolderName.ifBlank {
+                    authManager.accountState.value.rootDriveFolderName
+                }
+                authManager.setRootDriveFolderName(restoredFolderName, activeDbAccount.backupRootFolderId)
                 if (authManager.accountState.value.isConnected) {
                     persistCurrentAccountToDatabase()
                 }
             } else if (!authManager.accountState.value.isConnected && context != null) {
-                val fallbackEmail = authManager.accountState.value.email.ifBlank { "irakiroan@gmail.com" }
-                if (authManager.authorizeSelectedNativeAccount(selectedEmail = fallbackEmail)) {
+                val savedEmail = authManager.accountState.value.email.trim()
+                if (savedEmail.isNotBlank() && authManager.authorizeSelectedNativeAccount(selectedEmail = savedEmail)) {
                     persistCurrentAccountToDatabase()
                 }
             } else if (authManager.accountState.value.isConnected) {
@@ -217,6 +221,24 @@ class BackupRepository(
             }
         } catch (_: Throwable) {
             // Never crash startup if local DB, Keystore, or network is temporarily unavailable
+        }
+    }
+
+    suspend fun createOrRenameRootBackupFolder(newFolderName: String): Result<String> {
+        val result = backupEngine.createOrSwitchRootBackupFolder(newFolderName)
+        if (result.isSuccess) {
+            persistCurrentAccountToDatabase()
+        }
+        return result
+    }
+
+    fun isBatteryOptimizationIgnored(): Boolean {
+        val ctx = context?.applicationContext ?: return false
+        return try {
+            val pm = ctx.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
+            pm?.isIgnoringBatteryOptimizations(ctx.packageName) ?: false
+        } catch (_: Throwable) {
+            false
         }
     }
 
@@ -388,8 +410,10 @@ class BackupRepository(
         pageToken: String? = null
     ): List<CloudBrowseItem> {
         val accountId = currentAccountId()
+        _lastCloudBrowseError.value = null
         if (!authManager.accountState.value.isConnected) {
             _cloudNextPageToken.value = null
+            _lastCloudBrowseError.value = "Google Account is not connected. Connect your Google Account to browse Google Drive."
             return loadCachedCloudBrowseItems(accountId, filter, parentFolderId, searchQuery)
         }
 
@@ -402,13 +426,19 @@ class BackupRepository(
                     if (!cachedRoot.isNullOrBlank()) {
                         cachedRoot
                     } else {
-                        val resolvedRoot = driveApiClient.ensureFolderExists(
+                        val activeRootName = backupEngine.activeRootFolderName()
+                        val existingRoot = driveApiClient.findFolderByName(
                             accessToken = token,
-                            folderName = PermanentBackupEngine.ROOT_DRIVE_FOLDER_NAME,
+                            folderName = activeRootName,
                             parentFolderId = null
                         )
-                        authManager.setRootDriveFolderId(resolvedRoot)
-                        resolvedRoot
+                        if (!existingRoot.isNullOrBlank()) {
+                            authManager.setRootDriveFolderName(activeRootName, existingRoot)
+                            existingRoot
+                        } else {
+                            _cloudNextPageToken.value = null
+                            return emptyList()
+                        }
                     }
                 }
                 else -> null
@@ -454,8 +484,9 @@ class BackupRepository(
             backupDao.upsertCloudFiles(entities)
 
             entities.map { e -> e.toCloudBrowseItem() }
-        } catch (_: Throwable) {
+        } catch (e: Throwable) {
             _cloudNextPageToken.value = null
+            _lastCloudBrowseError.value = e.message ?: "Unable to load Google Drive files"
             loadCachedCloudBrowseItems(accountId, filter, parentFolderId, searchQuery)
         }
     }
@@ -469,6 +500,10 @@ class BackupRepository(
         val rawEntities = when {
             searchQuery.isNotBlank() -> backupDao.searchCloudFiles(accountId, searchQuery.trim())
             !parentFolderId.isNullOrBlank() -> backupDao.getCloudFilesByParent(parentFolderId)
+            filter == DriveViewFilter.BACKUP_ROOT -> {
+                val rootId = authManager.accountState.value.rootDriveFolderId
+                if (rootId.isNullOrBlank()) emptyList() else backupDao.getCloudFilesByParent(rootId)
+            }
             else -> backupDao.getCloudFilesForAccountPaged(accountId, 200, 0)
         }
         val filtered = rawEntities.filter { e ->
@@ -853,7 +888,12 @@ class BackupRepository(
         )
     }
 
-    suspend fun buildDashboardSummary(precomputedCoverage: List<FolderCoverageItem>? = null): DashboardSummary {
+    suspend fun buildDashboardSummary(
+        precomputedCoverage: List<FolderCoverageItem>? = null,
+        isDashboardLoading: Boolean = false,
+        isScanningPhoneStorage: Boolean = false,
+        watchedFolderCountOverride: Int? = null
+    ): DashboardSummary {
         val accountId = currentAccountId()
         val total = backupDao.countAllRecordsForAccount(accountId)
         val verified = backupDao.countVerifiedRecordsForAccount(accountId)
@@ -896,35 +936,60 @@ class BackupRepository(
         } else {
             null
         }
-        val enabledFolderNames = coverage
-            .filter { it.accessStatus == FolderAccessStatus.ACCESSIBLE && it.backupEnabled }
-            .joinToString(", ") { it.relativePath }
-            .ifBlank { "DCIM, Pictures, Videos, Downloads, Documents, WhatsApp/Media, Telegram" }
+
+        val isRootFolderCreated = accountState.isConnected && !accountState.rootDriveFolderId.isNullOrBlank()
+        val hasStoragePerm = storageSource.hasStoragePermission
+        val hasManagePerm = storageSource.hasManageAllFilesPermission()
+        val isBatteryUnrestricted = isBatteryOptimizationIgnored()
+        val activeRootName = accountState.rootDriveFolderName.ifBlank { PermanentBackupEngine.ROOT_DRIVE_FOLDER_NAME }
 
         val activePhoneSource = when {
             activeUpload != null -> "/storage/emulated/0/${activeUpload.relativePath}"
-            latestRecord != null -> "/storage/emulated/0/${latestRecord.relativePath} (Monitored: /storage/emulated/0/{$enabledFolderNames})"
-            else -> "/storage/emulated/0/{$enabledFolderNames}"
+            latestRecord != null -> "/storage/emulated/0/${latestRecord.relativePath}"
+            else -> ""
         }
-        val activeDriveTarget = when {
-            activeUpload != null -> {
-                val parentFolder = activeUpload.relativePath.substringBeforeLast('/', "")
-                if (parentFolder.isBlank()) {
-                    "My Drive / ${accountState.rootDriveFolderName} / ${activeUpload.fileName}"
-                } else {
-                    "My Drive / ${accountState.rootDriveFolderName} / $parentFolder / ${activeUpload.fileName}"
+        val activeDriveTarget = if (!isRootFolderCreated) {
+            ""
+        } else {
+            when {
+                activeUpload != null -> {
+                    val parentFolder = activeUpload.relativePath.substringBeforeLast('/', "")
+                    if (parentFolder.isBlank()) {
+                        "My Drive / $activeRootName / ${activeUpload.fileName}"
+                    } else {
+                        "My Drive / $activeRootName / $parentFolder / ${activeUpload.fileName}"
+                    }
                 }
-            }
-            latestRecord != null -> {
-                val parentFolder = latestRecord.relativePath.substringBeforeLast('/', "")
-                val targetName = latestRecord.driveStoredName.ifBlank { latestRecord.displayName }
-                if (parentFolder.isBlank()) {
-                    "My Drive / ${accountState.rootDriveFolderName} / $targetName"
-                } else {
-                    "My Drive / ${accountState.rootDriveFolderName} / $parentFolder / $targetName"
+                latestRecord != null -> {
+                    val parentFolder = latestRecord.relativePath.substringBeforeLast('/', "")
+                    val targetName = latestRecord.driveStoredName.ifBlank { latestRecord.displayName }
+                    if (parentFolder.isBlank()) {
+                        "My Drive / $activeRootName / $targetName"
+                    } else {
+                        "My Drive / $activeRootName / $parentFolder / $targetName"
+                    }
                 }
+                else -> "My Drive / $activeRootName/"
             }
-            else -> "My Drive / ${accountState.rootDriveFolderName} / <Phone_Folder_Name> / <File_Name>"
+        }
+
+        val isAutoBackupActive = accountState.isConnected &&
+            _settings.value.userBackupConsentGranted &&
+            !_settings.value.backgroundSyncPaused &&
+            !backupEngine.isPaused.value &&
+            hasStoragePerm
+
+        val effectiveNextScheduledMs = if (isAutoBackupActive) {
+            _nextScheduledBackupMs.value
+                ?: (System.currentTimeMillis() + (_settings.value.periodicIntervalHours.coerceAtLeast(1) * 3600_000L))
+        } else {
+            null
+        }
+
+        val watchedCount = watchedFolderCountOverride ?: if (hasStoragePerm) {
+            coverage.count { it.accessStatus == FolderAccessStatus.ACCESSIBLE && it.backupEnabled }
+        } else {
+            0
         }
 
         return DashboardSummary(
@@ -939,7 +1004,7 @@ class BackupRepository(
             currentUploadSpeedBps = backupEngine.currentSpeedBps.value,
             overallProgressFraction = progress,
             lastSuccessfulBackupMs = lastBackup,
-            nextScheduledBackupMs = _nextScheduledBackupMs.value,
+            nextScheduledBackupMs = effectiveNextScheduledMs,
             driveQuota = backupEngine.latestQuotaInfo.value,
             accessibleFolderCount = accessibleCount,
             restrictedFolderCount = restrictedCount,
@@ -955,7 +1020,15 @@ class BackupRepository(
             currentPhoneSourcePath = activePhoneSource,
             currentDriveTargetPath = activeDriveTarget,
             currentScanningOrUploadingFile = backupEngine.currentScanActivity.value,
-            isContinuousAutoBackupServiceActive = !_settings.value.backgroundSyncPaused && !backupEngine.isPaused.value
+            isContinuousAutoBackupServiceActive = isAutoBackupActive,
+            isDashboardLoading = isDashboardLoading,
+            isScanningPhoneStorage = isScanningPhoneStorage || backupEngine.isRunning.value,
+            isVerifyingOrCreatingDriveFolder = backupEngine.isVerifyingOrCreatingDriveFolder.value,
+            hasStoragePermission = hasStoragePerm,
+            hasManageAllFilesPermission = hasManagePerm,
+            isBatteryOptimizationIgnored = isBatteryUnrestricted,
+            isDriveRootFolderCreated = isRootFolderCreated,
+            watchedFolderCount = watchedCount
         )
     }
 
@@ -988,6 +1061,7 @@ class BackupRepository(
 
     suspend fun getFolderCoverageItems(): List<FolderCoverageItem> {
         val accountId = currentAccountId()
+        val activeRootName = backupEngine.activeRootFolderName()
         val baseItems = storageSource.getFolderCoverageReport(emptyMap())
         val savedFolders = backupDao.getBackupFoldersForAccount(accountId)
         val savedByPath = savedFolders.associateBy { it.relativePath }
@@ -1021,7 +1095,7 @@ class BackupRepository(
                     .getOrDefault(FolderAccessStatus.ACCESSIBLE),
                 discoveredFileCount = sf.discoveredFileCount,
                 backedUpFileCount = sf.backedUpFileCount,
-                restrictionExplanation = "Custom subfolder rule -> Android_Permanent_Backup/${sf.relativePath}",
+                restrictionExplanation = "Custom subfolder rule -> $activeRootName/${sf.relativePath}",
                 backupEnabled = sf.backupEnabled,
                 lastScanTimeMs = sf.lastScanTimeMs
             )

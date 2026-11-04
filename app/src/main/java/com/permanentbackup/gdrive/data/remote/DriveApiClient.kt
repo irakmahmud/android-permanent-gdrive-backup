@@ -60,6 +60,12 @@ data class DriveFileListPage(
     val nextPageToken: String?
 )
 
+data class DriveUserAndQuota(
+    val email: String,
+    val displayName: String,
+    val quota: DriveQuotaInfo
+)
+
 data class DriveChangesPage(
     val changedFiles: List<CloudBrowseItem>,
     val newStartPageToken: String?,
@@ -135,15 +141,41 @@ class DriveApiClient(
 
     val httpClient: OkHttpClient = baseClient.newBuilder()
         .addInterceptor(NeverDeleteGuardInterceptor())
+        .apply {
+            if (driveBaseUrl.contains("googleapis.com", ignoreCase = true)) {
+                addInterceptor { chain ->
+                    var response = chain.proceed(chain.request())
+                    var attempt = 1
+                    val maxRetries = 3
+                    while (attempt <= maxRetries && (response.code == 429 || response.code == 403)) {
+                        val peeked = runCatching { response.peekBody(4096).string() }.getOrDefault("")
+                        val isRateLimit = response.code == 429 ||
+                            peeked.contains("rateLimitExceeded", ignoreCase = true) ||
+                            peeked.contains("userRateLimitExceeded", ignoreCase = true)
+                        if (!isRateLimit) break
+                        response.close()
+                        try {
+                            Thread.sleep(1200L * attempt)
+                        } catch (_: InterruptedException) {
+                            Thread.currentThread().interrupt()
+                            break
+                        }
+                        attempt++
+                        response = chain.proceed(chain.request())
+                    }
+                    response
+                }
+            }
+        }
         .build()
 
     /** Global (all parallel streams combined) upload bandwidth pacer. */
     val bandwidthLimiter = GlobalBandwidthLimiter()
 
     /**
-     * Queries Google Drive storage quota (Total, Used, Available) via Drive v3 about endpoint.
+     * Queries Google Drive user profile (email, displayName) and storage quota via Drive v3 about endpoint.
      */
-    fun fetchDriveQuota(accessToken: String): DriveQuotaInfo {
+    fun fetchDriveUserAndQuota(accessToken: String): DriveUserAndQuota {
         val url = "$driveBaseUrl/drive/v3/about?fields=storageQuota,user"
         val request = Request.Builder()
             .url(url)
@@ -155,26 +187,43 @@ class DriveApiClient(
             val bodyStr = response.body?.string() ?: "{}"
             return handleDriveHttpResponse(request, response.code, bodyStr) {
                 val json = JSONObject(bodyStr)
+                val userObj = json.optJSONObject("user") ?: JSONObject()
                 val quota = json.optJSONObject("storageQuota") ?: JSONObject()
-                DriveQuotaInfo(
-                    limitBytes = quota.optLong("limit", 15L * 1024 * 1024 * 1024),
-                    usageBytes = quota.optLong("usage", 0L),
-                    usageInDriveBytes = quota.optLong("usageInDrive", 0L),
-                    usageInTrashBytes = quota.optLong("usageInDriveTrash", 0L)
+                val email = userObj.optString("emailAddress", "").trim()
+                val displayName = userObj.optString("displayName", "").trim().ifBlank {
+                    email.substringBefore("@")
+                }
+                DriveUserAndQuota(
+                    email = email,
+                    displayName = displayName,
+                    quota = DriveQuotaInfo(
+                        limitBytes = quota.optLong("limit", 15L * 1024 * 1024 * 1024),
+                        usageBytes = quota.optLong("usage", 0L),
+                        usageInDriveBytes = quota.optLong("usageInDrive", 0L),
+                        usageInTrashBytes = quota.optLong("usageInDriveTrash", 0L),
+                        isLoaded = true
+                    )
                 )
             }
         }
     }
 
     /**
-     * Finds or creates the dedicated root folder ("Android_Permanent_Backup") or subfolder on Google Drive.
-     * Deduplicates by checking existing non-trashed folders with the same name and parent first.
+     * Queries Google Drive storage quota (Total, Used, Available) via Drive v3 about endpoint.
      */
-    fun ensureFolderExists(
+    fun fetchDriveQuota(accessToken: String): DriveQuotaInfo {
+        return fetchDriveUserAndQuota(accessToken).quota
+    }
+
+    /**
+     * Checks if a non-trashed folder with [folderName] already exists on Google Drive without creating it.
+     * Returns the Drive folder ID if found, or null if the folder has not been created yet.
+     */
+    fun findFolderByName(
         accessToken: String,
         folderName: String,
         parentFolderId: String? = null
-    ): String {
+    ): String? {
         val safeName = sanitizeDriveName(folderName)
         val escapedName = escapeDriveQueryLiteral(safeName)
         val parentClause = if (!parentFolderId.isNullOrBlank()) {
@@ -198,15 +247,33 @@ class DriveApiClient(
 
         httpClient.newCall(searchReq).execute().use { response ->
             val bodyStr = response.body?.string() ?: "{}"
-            handleDriveHttpResponse(searchReq, response.code, bodyStr) {
+            return handleDriveHttpResponse(searchReq, response.code, bodyStr) {
                 val files = JSONObject(bodyStr).optJSONArray("files")
                 if (files != null && files.length() > 0) {
                     val existingId = files.getJSONObject(0).optString("id", "")
-                    if (existingId.isNotBlank()) return existingId
+                    existingId.takeIf { it.isNotBlank() }
+                } else {
+                    null
                 }
             }
         }
+    }
 
+    /**
+     * Finds or creates the dedicated root folder ("Android_Permanent_Backup" or user-chosen name) or subfolder on Google Drive.
+     * Deduplicates by checking existing non-trashed folders with the same name and parent first.
+     */
+    fun ensureFolderExists(
+        accessToken: String,
+        folderName: String,
+        parentFolderId: String? = null
+    ): String {
+        val existingId = findFolderByName(accessToken, folderName, parentFolderId)
+        if (!existingId.isNullOrBlank()) {
+            return existingId
+        }
+
+        val safeName = sanitizeDriveName(folderName)
         // Create folder if not found
         val metadataJson = JSONObject().apply {
             put("name", safeName)
@@ -1083,16 +1150,16 @@ class DriveApiClient(
                 throw AuthTokenExpiredException("Google Drive API returned 401 Unauthorized")
             }
             403 -> {
+                if (bodyStr.contains("userRateLimitExceeded", ignoreCase = true) ||
+                    bodyStr.contains("rateLimitExceeded", ignoreCase = true)
+                ) {
+                    throw DriveRateLimitException("Google Drive API rate limit reached (HTTP 403 rateLimitExceeded)")
+                }
                 if (bodyStr.contains("storageQuotaExceeded", ignoreCase = true) ||
                     bodyStr.contains("quotaExceeded", ignoreCase = true) ||
                     bodyStr.contains("teamDriveFileLimitExceeded", ignoreCase = true)
                 ) {
                     throw StorageQuotaFullException("Google Drive storage quota is full (HTTP 403 storageQuotaExceeded)")
-                }
-                if (bodyStr.contains("userRateLimitExceeded", ignoreCase = true) ||
-                    bodyStr.contains("rateLimitExceeded", ignoreCase = true)
-                ) {
-                    throw DriveRateLimitException("Google Drive API rate limit reached (HTTP 403 rateLimitExceeded)")
                 }
                 throw DrivePermissionException(
                     "Google Drive permission or scope insufficient (HTTP 403): $sanitizedBody"

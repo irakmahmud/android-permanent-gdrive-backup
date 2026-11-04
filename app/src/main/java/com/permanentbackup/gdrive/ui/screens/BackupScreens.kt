@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
@@ -22,6 +23,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.LinearProgressIndicator
@@ -78,6 +80,106 @@ enum class AppScreen(val title: String) {
 }
 
 @Composable
+fun LoadingStateCard(
+    message: String = "Loading... Please wait while all files are being loaded...",
+    detail: String? = null
+) {
+    Card(
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.secondaryContainer
+        ),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(22.dp),
+                    strokeWidth = 2.5.dp
+                )
+                Text(
+                    text = message,
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+            detail?.takeIf { it.isNotBlank() }?.let {
+                Text(
+                    text = it,
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+        }
+    }
+}
+
+@Composable
+fun CreateOrRenameBackupFolderDialog(
+    currentFolderName: String,
+    isConnected: Boolean,
+    isFolderAlreadyCreated: Boolean,
+    onDismiss: () -> Unit,
+    onConfirmFolderName: (String) -> Unit
+) {
+    var folderNameInput by remember(currentFolderName) { mutableStateOf(currentFolderName) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Text(
+                if (isFolderAlreadyCreated) {
+                    "Rename / Switch Google Drive Backup Folder"
+                } else {
+                    "Create / Set Google Drive Backup Folder"
+                }
+            )
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    text = if (isConnected) {
+                        "Enter the Google Drive folder name under 'My Drive'. If this folder does not exist yet on your Google Drive, it will be created immediately."
+                    } else {
+                        "Enter your preferred Google Drive backup folder name. It will be saved now and created on your Google Drive as soon as you connect your Google Account."
+                    },
+                    style = MaterialTheme.typography.bodySmall
+                )
+                OutlinedTextField(
+                    value = folderNameInput,
+                    onValueChange = { folderNameInput = it },
+                    label = { Text("Google Drive Backup Folder Name") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    val sanitized = folderNameInput.trim().replace('/', '_').replace('\\', '_')
+                    if (sanitized.isNotBlank()) {
+                        onConfirmFolderName(sanitized)
+                        onDismiss()
+                    }
+                }
+            ) {
+                Text(if (isConnected) "Create / Apply Folder" else "Save Folder Name")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel")
+            }
+        }
+    )
+}
+
+@Composable
 fun HomeDashboardScreen(
     summary: DashboardSummary,
     settings: BackupSettings,
@@ -85,15 +187,33 @@ fun HomeDashboardScreen(
     activeQueue: List<BackupFileEntity> = emptyList(),
     recentRecords: List<BackupFileEntity> = emptyList(),
     actionFeedback: String?,
+    isCreatingOrRenamingDriveFolder: Boolean = false,
     onBackupNow: () -> Unit,
     onConnectOrManageAccount: () -> Unit,
     onOpenPhoneStorageScreen: () -> Unit,
     onOpenMyDriveScreen: () -> Unit,
     onEnableConsentAndPermissions: () -> Unit,
     onRequestBatteryUnrestricted: () -> Unit = {},
+    onCreateOrRenameBackupFolder: (String) -> Unit = {},
     onRefresh: () -> Unit
 ) {
     val rootDriveName = summary.accountState.rootDriveFolderName.ifBlank { "Android_Permanent_Backup" }
+    var showFolderDialog by remember { mutableStateOf(false) }
+
+    if (showFolderDialog) {
+        CreateOrRenameBackupFolderDialog(
+            currentFolderName = rootDriveName,
+            isConnected = summary.accountState.isConnected,
+            isFolderAlreadyCreated = summary.isDriveRootFolderCreated,
+            onDismiss = { showFolderDialog = false },
+            onConfirmFolderName = onCreateOrRenameBackupFolder
+        )
+    }
+
+    val isAnyLoading = summary.isDashboardLoading ||
+        summary.isScanningPhoneStorage ||
+        summary.isVerifyingOrCreatingDriveFolder ||
+        isCreatingOrRenamingDriveFolder
 
     LazyColumn(
         modifier = Modifier
@@ -101,6 +221,23 @@ fun HomeDashboardScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
+        if (isAnyLoading) {
+            item {
+                val loadingDetail = when {
+                    isCreatingOrRenamingDriveFolder || summary.isVerifyingOrCreatingDriveFolder ->
+                        "Verifying / creating folder '$rootDriveName' on Google Drive..."
+                    summary.isScanningPhoneStorage ->
+                        summary.currentScanningOrUploadingFile ?: "Scanning phone folders and verifying file states..."
+                    else ->
+                        "Checking Google Drive connection, folder state, and phone storage..."
+                }
+                LoadingStateCard(
+                    message = "Loading... Please wait while all files are being loaded...",
+                    detail = loadingDetail
+                )
+            }
+        }
+
         actionFeedback?.let { msg ->
             item {
                 Card(
@@ -117,8 +254,21 @@ fun HomeDashboardScreen(
             }
         }
 
-        // PROMINENT LIVE AUTO-BACKUP DESTINATION & PHONE SOURCE CARD
+        // STATE-AWARE LIVE AUTO-BACKUP DESTINATION & PHONE SOURCE CARD
         item {
+            val statusHeaderText = when {
+                isAnyLoading -> "⏳ LOADING CURRENT STATE — PLEASE WAIT..."
+                !summary.accountState.isConnected -> "⚠️ GOOGLE ACCOUNT NOT CONNECTED — BACKUP INACTIVE"
+                !summary.hasStoragePermission -> "⚠️ PHONE STORAGE PERMISSION REQUIRED — BACKUP WAITING"
+                !settings.userBackupConsentGranted -> "⚠️ USER BACKUP CONSENT DISABLED IN SETTINGS"
+                settings.backgroundSyncPaused -> "⏸ AUTO-BACKUP PAUSED BY USER"
+                !summary.isDriveRootFolderCreated -> "⚠️ GOOGLE DRIVE FOLDER NOT CREATED YET"
+                summary.isBackupRunning -> "🔄 BACKUP RUNNING NOW — UPLOADING TO GOOGLE DRIVE"
+                summary.isContinuousAutoBackupServiceActive ->
+                    "🟢 24/7 AUTO-BACKUP ACTIVE (${summary.watchedFolderCount} FOLDERS WATCHED)"
+                else -> "ℹ️ READY FOR BACKUP — TAP 'RUN BACKUP NOW'"
+            }
+
             Card(
                 colors = CardDefaults.cardColors(
                     containerColor = MaterialTheme.colorScheme.primaryContainer
@@ -130,54 +280,123 @@ fun HomeDashboardScreen(
                     verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     Text(
-                        text = if (settings.backgroundSyncPaused) {
-                            "⏸ AUTO-BACKUP PAUSED BY USER"
-                        } else {
-                            "🟢 24/7 AUTO-BACKUP ACTIVE (NEVER STOPS IN BACKGROUND)"
-                        },
+                        text = statusHeaderText,
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.primary
                     )
                     HorizontalDivider(modifier = Modifier.padding(vertical = 2.dp))
                     Text(
-                        text = "☁️ WHERE IT IS BACKING UP IN GOOGLE DRIVE:",
+                        text = "☁️ GOOGLE DRIVE BACKUP FOLDER STATUS:",
                         style = MaterialTheme.typography.labelLarge,
                         fontWeight = FontWeight.Bold
                     )
+                    if (summary.isDriveRootFolderCreated) {
+                        Text(
+                            text = "✓ Folder '$rootDriveName' is created on Google Drive",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        Text(
+                            text = "Active Drive Target Path: ${
+                                summary.currentDriveTargetPath.ifBlank { "My Drive / $rootDriveName" }
+                            } (Folder ID: ${summary.accountState.rootDriveFolderId})",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    } else if (summary.accountState.isConnected) {
+                        Text(
+                            text = "Folder '$rootDriveName' is NOT created on Google Drive yet. A folder named '$rootDriveName' will be created when backup starts, or use the buttons below to create or rename it now.",
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                    } else {
+                        Text(
+                            text = "No Google Drive backup folder is created yet because no Google Account is connected. After connecting, folder '$rootDriveName' will be created (or you can rename it below).",
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        if (summary.accountState.isConnected && !summary.isDriveRootFolderCreated) {
+                            Button(
+                                onClick = { onCreateOrRenameBackupFolder(rootDriveName) },
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("Create '$rootDriveName' Now", fontSize = 12.sp)
+                            }
+                        }
+                        OutlinedButton(
+                            onClick = { showFolderDialog = true },
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text(
+                                if (summary.isDriveRootFolderCreated) {
+                                    "Rename / New Drive Folder"
+                                } else {
+                                    "Rename / Set Folder Name"
+                                },
+                                fontSize = 12.sp
+                            )
+                        }
+                    }
+
                     Text(
-                        text = summary.currentDriveTargetPath.ifBlank {
-                            "My Drive / $rootDriveName / <Phone_Folder_Name> / <File_Name>"
-                        },
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontWeight = FontWeight.SemiBold
-                    )
-                    Text(
-                        text = "Google Account: ${if (summary.accountState.isConnected) summary.accountState.email else "Auto-Connecting (irakiroan@gmail.com)..."} • Root Folder: My Drive / $rootDriveName",
+                        text = "Google Account: ${
+                            if (summary.accountState.isConnected) {
+                                summary.accountState.email
+                            } else {
+                                "Not Connected (Tap 'Connect Google Account' below)"
+                            }
+                        }",
                         style = MaterialTheme.typography.bodySmall
                     )
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = "📱 WHICH FOLDER OR FILE IS BACKING UP FROM PHONE:",
+                        text = "📱 PHONE STORAGE SOURCE STATUS:",
                         style = MaterialTheme.typography.labelLarge,
                         fontWeight = FontWeight.Bold
                     )
+                    val phoneSourceStatusText = when {
+                        summary.currentPhoneSourcePath.isNotBlank() -> summary.currentPhoneSourcePath
+                        summary.isScanningPhoneStorage || summary.isDashboardLoading ->
+                            "Loading... Please wait while all files are being loaded..."
+                        !summary.hasStoragePermission ->
+                            "Storage permission not granted yet — grant permission below to scan phone folders."
+                        summary.accessibleFolderCount == 0 ->
+                            "No phone folders with files backed up yet (0 active source paths)."
+                        else ->
+                            "${summary.accessibleFolderCount} phone folder(s) accessible (${summary.totalDiscoveredFiles} file(s) discovered)."
+                    }
                     Text(
-                        text = summary.currentPhoneSourcePath.ifBlank {
-                            "/storage/emulated/0/{DCIM, Pictures, Movies, Download, Documents, Music, WhatsApp, Telegram}"
-                        },
+                        text = phoneSourceStatusText,
                         style = MaterialTheme.typography.bodyMedium,
                         fontWeight = FontWeight.SemiBold
                     )
-                    Text(
-                        text = "Live Engine Status: ${
+                    val liveEngineStatusText = when {
+                        !summary.currentScanningOrUploadingFile.isNullOrBlank() ->
                             summary.currentScanningOrUploadingFile
-                                ?: if (summary.isBackupRunning) {
-                                    "Scanning phone folders & uploading new/modified files to My Drive / $rootDriveName..."
-                                } else {
-                                    "24/7 Real-Time Watcher Active — Monitoring all phone folders for new or modified files"
-                                }
-                        }",
+                        isAnyLoading ->
+                            "Loading... Please wait while all files are being loaded..."
+                        summary.isBackupRunning ->
+                            "Scanning phone folders & uploading files..."
+                        !summary.accountState.isConnected ->
+                            "Waiting for Google Account sign-in."
+                        !summary.hasStoragePermission ->
+                            "Waiting for Phone Storage permission."
+                        settings.backgroundSyncPaused ->
+                            "Background auto-backup is paused by user."
+                        !summary.isDriveRootFolderCreated ->
+                            "Connected to ${summary.accountState.email} — Drive folder '$rootDriveName' not created yet."
+                        summary.isContinuousAutoBackupServiceActive ->
+                            "Real-Time FileObserver Active — Watching ${summary.watchedFolderCount} phone folder(s)."
+                        else ->
+                            "Idle — Ready to run backup."
+                    }
+                    Text(
+                        text = "Live Engine Status: $liveEngineStatusText",
                         style = MaterialTheme.typography.bodySmall
                     )
                 }
@@ -240,17 +459,24 @@ fun HomeDashboardScreen(
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Text(
-                        text = "Permanent Drive — Auto-Backup & Permissions",
+                        text = "Permanent Drive — Setup & Runtime Status",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
                     )
                     Button(
                         onClick = onConnectOrManageAccount,
-                        modifier = Modifier.fillMaxWidth()
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (summary.accountState.isConnected) {
+                                MaterialTheme.colorScheme.secondary
+                            } else {
+                                MaterialTheme.colorScheme.primary
+                            }
+                        )
                     ) {
                         Text(
                             if (summary.accountState.isConnected) {
-                                "✓ Connected: ${summary.accountState.email} (Auto-Backup Active)"
+                                "✓ 1. Google Account Connected: ${summary.accountState.email}"
                             } else {
                                 "1. Connect Google Account (গুগল ড্রাইভ যুক্ত করুন)"
                             }
@@ -260,7 +486,7 @@ fun HomeDashboardScreen(
                         onClick = onEnableConsentAndPermissions,
                         modifier = Modifier.fillMaxWidth(),
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = if (summary.accessibleFolderCount > 0) {
+                            containerColor = if (summary.hasStoragePermission) {
                                 MaterialTheme.colorScheme.secondary
                             } else {
                                 MaterialTheme.colorScheme.primary
@@ -268,8 +494,8 @@ fun HomeDashboardScreen(
                         )
                     ) {
                         Text(
-                            if (summary.accessibleFolderCount > 0) {
-                                "✓ Phone Storage Access Active (${summary.accessibleFolderCount} Folders Backing Up)"
+                            if (summary.hasStoragePermission) {
+                                "✓ 2. Phone Storage Permission Granted (${summary.accessibleFolderCount} Accessible Folders)"
                             } else {
                                 "2. Grant All-Files Storage Permission (সব ফোল্ডার ব্যাকআপ পারমিশন দিন)"
                             }
@@ -279,7 +505,13 @@ fun HomeDashboardScreen(
                         onClick = onRequestBatteryUnrestricted,
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Text("3. Allow 24/7 Unrestricted Background Run (Never Stop in Background)")
+                        Text(
+                            if (summary.isBatteryOptimizationIgnored) {
+                                "✓ 3. Unrestricted Background Battery Mode Active"
+                            } else {
+                                "3. Allow Unrestricted Background Run (ব্যাটারি অপটিমাইজেশন বন্ধ করুন)"
+                            }
+                        )
                     }
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -310,49 +542,67 @@ fun HomeDashboardScreen(
                     verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     Text(
-                        text = "📂 Phone Folders Auto-Backing Up to Google Drive",
+                        text = "📂 Discovered Phone Folders",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
                     )
-                    Text(
-                        text = "Every phone folder below is automatically mirrored into 'My Drive / $rootDriveName / <Folder>' (Append-Only, Zero Deletion):",
-                        style = MaterialTheme.typography.bodySmall
-                    )
                     val visibleFolders = folderCoverage.filter {
-                        it.accessStatus != FolderAccessStatus.RESTRICTED_BY_ANDROID_OS
+                        it.accessStatus == FolderAccessStatus.ACCESSIBLE
                     }
-                    if (visibleFolders.isEmpty()) {
-                        Text(
-                            text = "• Phone: /storage/emulated/0/DCIM  ➔  Google Drive: My Drive / $rootDriveName / DCIM\n" +
-                                "• Phone: /storage/emulated/0/Pictures  ➔  Google Drive: My Drive / $rootDriveName / Pictures\n" +
-                                "• Phone: /storage/emulated/0/Movies  ➔  Google Drive: My Drive / $rootDriveName / Movies\n" +
-                                "• Phone: /storage/emulated/0/Download  ➔  Google Drive: My Drive / $rootDriveName / Download\n" +
-                                "• Phone: /storage/emulated/0/Documents  ➔  Google Drive: My Drive / $rootDriveName / Documents\n" +
-                                "• Phone: /storage/emulated/0/Music  ➔  Google Drive: My Drive / $rootDriveName / Music\n" +
-                                "• Phone: /storage/emulated/0/Android/media  ➔  Google Drive: My Drive / $rootDriveName / Android/media",
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                    } else {
-                        visibleFolders.forEach { folder ->
-                            HorizontalDivider(modifier = Modifier.padding(vertical = 2.dp))
+                    when {
+                        summary.isDashboardLoading || summary.isScanningPhoneStorage -> {
                             Text(
-                                text = "📁 ${folder.folderName} (${if (folder.backupEnabled) "Auto-Backup ON" else "Paused"})",
-                                fontWeight = FontWeight.Bold,
-                                style = MaterialTheme.typography.bodyMedium
-                            )
-                            Text(
-                                text = "From Phone: /storage/emulated/0/${folder.relativePath.trimStart('/')}",
-                                style = MaterialTheme.typography.bodySmall
-                            )
-                            Text(
-                                text = "To Google Drive: My Drive / $rootDriveName / ${folder.relativePath.trimStart('/')}",
+                                text = "Loading... Please wait while all files and folders are being loaded...",
                                 style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.primary
+                                fontWeight = FontWeight.SemiBold
                             )
+                        }
+                        !summary.hasStoragePermission -> {
                             Text(
-                                text = "Backed Up: ${folder.backedUpFileCount} / ${folder.discoveredFileCount} files (${(folder.completenessFraction * 100).toInt()}%)",
+                                text = "Phone storage permission is not granted yet. Grant storage permission above to scan and list your actual phone folders.",
                                 style = MaterialTheme.typography.bodySmall
                             )
+                        }
+                        visibleFolders.isEmpty() -> {
+                            Text(
+                                text = "No accessible phone folders with files discovered yet. Tap 'Refresh Status' or 'Phone Folders' to inspect local storage.",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
+                        else -> {
+                            Text(
+                                text = if (summary.isDriveRootFolderCreated) {
+                                    "Backing up enabled phone folders into created Google Drive folder 'My Drive / $rootDriveName':"
+                                } else {
+                                    "Phone folders discovered locally (Google Drive folder '$rootDriveName' is not created yet):"
+                                },
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                            visibleFolders.forEach { folder ->
+                                HorizontalDivider(modifier = Modifier.padding(vertical = 2.dp))
+                                Text(
+                                    text = "📁 ${folder.folderName} (${if (folder.backupEnabled) "Auto-Backup ON" else "Auto-Backup OFF"})",
+                                    fontWeight = FontWeight.Bold,
+                                    style = MaterialTheme.typography.bodyMedium
+                                )
+                                Text(
+                                    text = "From Phone: /storage/emulated/0/${folder.relativePath.trimStart('/')}",
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                                Text(
+                                    text = if (summary.isDriveRootFolderCreated) {
+                                        "To Google Drive: My Drive / $rootDriveName / ${folder.relativePath.trimStart('/')}"
+                                    } else {
+                                        "Target (once Drive folder is created): My Drive / $rootDriveName / ${folder.relativePath.trimStart('/')}"
+                                    },
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                                Text(
+                                    text = "Backed Up: ${folder.backedUpFileCount} / ${folder.discoveredFileCount} files (${(folder.completenessFraction * 100).toInt()}%)",
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
                         }
                     }
                 }
@@ -367,49 +617,69 @@ fun HomeDashboardScreen(
                     verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     Text(
-                        text = "📄 Files Backing Up from Phone to Google Drive",
+                        text = "📄 Queued & Recently Backed Up Files",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
                     )
                     val combinedFiles = (activeQueue + recentRecords)
                         .distinctBy { it.id }
                         .take(10)
-                    if (combinedFiles.isEmpty()) {
-                        Text(
-                            text = if (summary.accessibleFolderCount == 0) {
-                                "Grant Phone Storage Permission above so the auto-backup engine can scan and upload your phone files."
-                            } else {
-                                "Auto-backup scanner is active. New or existing files in DCIM, Pictures, Downloads, Documents, Music, and Videos will appear here with their exact Phone and Google Drive paths."
-                            },
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                    } else {
-                        combinedFiles.forEach { file ->
-                            val subDir = file.relativePath.replace('\\', '/').substringBeforeLast('/', "")
-                            val driveDest = if (subDir.isNotBlank()) {
-                                "My Drive / $rootDriveName / $subDir / ${file.driveStoredName}"
-                            } else {
-                                "My Drive / $rootDriveName / ${file.driveStoredName}"
-                            }
-                            HorizontalDivider(modifier = Modifier.padding(vertical = 2.dp))
+                    when {
+                        summary.isDashboardLoading || summary.isScanningPhoneStorage -> {
                             Text(
-                                text = "📄 ${file.driveStoredName} (v${file.backupVersion}) — ${file.uploadStatus}",
-                                fontWeight = FontWeight.Bold,
-                                style = MaterialTheme.typography.bodyMedium
-                            )
-                            Text(
-                                text = "From Phone: /storage/emulated/0/${file.relativePath.trimStart('/')}",
-                                style = MaterialTheme.typography.bodySmall
-                            )
-                            Text(
-                                text = "To Google Drive: $driveDest",
+                                text = "Loading... Please wait while all files are being loaded...",
                                 style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.primary
+                                fontWeight = FontWeight.SemiBold
                             )
+                        }
+                        combinedFiles.isEmpty() -> {
+                            val emptyMessage = when {
+                                !summary.hasStoragePermission ->
+                                    "No files loaded because Phone Storage Permission has not been granted yet."
+                                !summary.accountState.isConnected ->
+                                    "No files backed up yet (${summary.totalDiscoveredFiles} local file(s) discovered). Connect your Google Account to start backing up."
+                                !summary.isDriveRootFolderCreated ->
+                                    "No files backed up yet (${summary.totalDiscoveredFiles} local file(s) discovered). Tap 'Run Backup Now' or 'Create $rootDriveName Now' to begin."
+                                else ->
+                                    "No files have been queued or uploaded yet (${summary.totalDiscoveredFiles} local file(s) discovered)."
+                            }
                             Text(
-                                text = "Size: ${formatBytes(file.uploadedBytes)} / ${formatBytes(file.fileSize)}",
+                                text = emptyMessage,
                                 style = MaterialTheme.typography.bodySmall
                             )
+                        }
+                        else -> {
+                            combinedFiles.forEach { file ->
+                                val subDir = file.relativePath.replace('\\', '/').substringBeforeLast('/', "")
+                                val driveDest = if (subDir.isNotBlank()) {
+                                    "My Drive / $rootDriveName / $subDir / ${file.driveStoredName}"
+                                } else {
+                                    "My Drive / $rootDriveName / ${file.driveStoredName}"
+                                }
+                                HorizontalDivider(modifier = Modifier.padding(vertical = 2.dp))
+                                Text(
+                                    text = "📄 ${file.driveStoredName} (v${file.backupVersion}) — ${file.uploadStatus}",
+                                    fontWeight = FontWeight.Bold,
+                                    style = MaterialTheme.typography.bodyMedium
+                                )
+                                Text(
+                                    text = "From Phone: /storage/emulated/0/${file.relativePath.trimStart('/')}",
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                                Text(
+                                    text = if (file.driveFileId != null || summary.isDriveRootFolderCreated) {
+                                        "To Google Drive: $driveDest"
+                                    } else {
+                                        "Target (pending folder creation): $driveDest"
+                                    },
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                                Text(
+                                    text = "Size: ${formatBytes(file.uploadedBytes)} / ${formatBytes(file.fileSize)}",
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
                         }
                     }
                 }
@@ -430,7 +700,7 @@ fun HomeDashboardScreen(
                         fontWeight = FontWeight.Bold
                     )
                     Text(
-                        text = "Append-Only & Non-Destructive Backup to 'My Drive / $rootDriveName'. Local file delete, folder delete, rename, move, or modification NEVER deletes or overwrites previous cloud versions.",
+                        text = "Append-Only & Non-Destructive Backup Policy. Local file delete, folder delete, rename, move, or modification NEVER deletes or overwrites previous cloud versions on Google Drive.",
                         style = MaterialTheme.typography.bodySmall
                     )
                 }
@@ -480,20 +750,45 @@ fun HomeDashboardScreen(
                     )
                     MetricRow(
                         "Connected Google Account",
-                        if (summary.accountState.isConnected) summary.accountState.email else "Auto-Connecting..."
+                        if (summary.accountState.isConnected) summary.accountState.email else "Not Connected"
                     )
-                    MetricRow("Google Drive Backup Folder", "My Drive / $rootDriveName")
-                    MetricRow("Background Auto-Backup", if (settings.backgroundSyncPaused) "Paused" else "Active 24/7 (Never Stops)")
+                    MetricRow(
+                        "Google Drive Backup Folder",
+                        if (summary.isDriveRootFolderCreated) {
+                            "Created: My Drive / $rootDriveName"
+                        } else {
+                            "Not Created Yet (Target: $rootDriveName)"
+                        }
+                    )
+                    val autoBackupStateLabel = when {
+                        settings.backgroundSyncPaused -> "Paused by User"
+                        !summary.accountState.isConnected -> "Inactive (Account Not Connected)"
+                        !summary.hasStoragePermission -> "Inactive (Storage Permission Required)"
+                        !summary.isDriveRootFolderCreated -> "Waiting (Drive Folder Not Created Yet)"
+                        summary.isContinuousAutoBackupServiceActive ->
+                            "Active (${summary.watchedFolderCount} folders watched)"
+                        else -> "Standby"
+                    }
+                    MetricRow("Background Auto-Backup", autoBackupStateLabel)
                     MetricRow("Background Sync Status", summary.backgroundSyncStatus.label)
                     MetricRow(
                         "Google Drive Storage Used",
-                        formatBytes(summary.driveQuota.usageBytes)
+                        if (summary.driveQuota.isLoaded) {
+                            formatBytes(summary.driveQuota.usageBytes)
+                        } else {
+                            "Not loaded yet"
+                        }
                     )
                     MetricRow(
                         "Google Drive Storage Available",
-                        "${formatBytes(summary.driveQuota.availableBytes)} of ${formatBytes(summary.driveQuota.limitBytes)}"
+                        if (summary.driveQuota.isLoaded) {
+                            "${formatBytes(summary.driveQuota.availableBytes)} of ${formatBytes(summary.driveQuota.limitBytes)}"
+                        } else {
+                            "Not loaded yet"
+                        }
                     )
                     MetricRow("Last Successful Sync", formatTimestamp(summary.lastSuccessfulBackupMs))
+                    MetricRow("Next Scheduled Sync", formatTimestamp(summary.nextScheduledBackupMs))
                     MetricRow("Current Upload Speed", "${formatBytes(summary.currentUploadSpeedBps)}/s")
                     MetricRow("Total Uploaded Data", formatBytes(summary.totalUploadedBytes))
                     MetricRow("Successfully Backed Up Versions", summary.successfullyBackedUpFiles.toString())
@@ -532,7 +827,7 @@ fun HomeDashboardScreen(
                     onClick = onBackupNow,
                     modifier = Modifier.weight(1f)
                 ) {
-                    Text(if (summary.isBackupRunning) "Auto-Backup Running..." else "Run Backup Now")
+                    Text(if (summary.isBackupRunning) "Backup Running..." else "Run Backup Now")
                 }
                 OutlinedButton(
                     onClick = onRefresh,
@@ -562,6 +857,10 @@ fun MyDriveExplorerScreen(
     isGridView: Boolean,
     previewSnippet: Pair<String, String>?,
     hasNextPage: Boolean = false,
+    isLoadingCloudDrive: Boolean = false,
+    cloudDriveErrorMessage: String? = null,
+    rootDriveFolderName: String = "Android_Permanent_Backup",
+    isDriveRootFolderCreated: Boolean = false,
     onSelectFilter: (DriveViewFilter) -> Unit,
     onSelectSort: (DriveSortOrder) -> Unit,
     onSearchQueryChange: (String) -> Unit,
@@ -576,14 +875,27 @@ fun MyDriveExplorerScreen(
     onTogglePinOffline: (CloudBrowseItem) -> Unit,
     onShareFileLink: (CloudBrowseItem) -> Unit,
     onCreateFolder: (String) -> Unit = {},
+    onCreateOrRenameBackupFolder: (String) -> Unit = {},
     onUploadDirectFiles: () -> Unit = {},
     onLoadMore: () -> Unit = {},
     onRequestFullDriveReadScope: () -> Unit,
     onRefresh: () -> Unit
 ) {
+    val activeRootName = rootDriveFolderName.ifBlank { "Android_Permanent_Backup" }
     var selectedMetadataItem by remember { mutableStateOf<CloudBrowseItem?>(null) }
     var showCreateFolderDialog by remember { mutableStateOf(false) }
+    var showBackupRootRenameDialog by remember { mutableStateOf(false) }
     var newFolderNameText by remember { mutableStateOf("") }
+
+    if (showBackupRootRenameDialog) {
+        CreateOrRenameBackupFolderDialog(
+            currentFolderName = activeRootName,
+            isConnected = accountConnected,
+            isFolderAlreadyCreated = isDriveRootFolderCreated,
+            onDismiss = { showBackupRootRenameDialog = false },
+            onConfirmFolderName = onCreateOrRenameBackupFolder
+        )
+    }
 
     if (showCreateFolderDialog) {
         AlertDialog(
@@ -688,7 +1000,11 @@ fun MyDriveExplorerScreen(
                             fontSize = 12.sp
                         )
                         Text(
-                            "Showing files inside 'Android_Permanent_Backup'. Grant 'drive.readonly' to browse all non-app My Drive files.",
+                            if (isDriveRootFolderCreated) {
+                                "Showing app-managed files in '$activeRootName'. Grant 'drive.readonly' to browse all non-app My Drive files."
+                            } else {
+                                "Folder '$activeRootName' is not created on Google Drive yet. Grant 'drive.readonly' to browse existing non-app My Drive files."
+                            },
                             style = MaterialTheme.typography.bodySmall,
                             fontSize = 11.sp
                         )
@@ -717,11 +1033,11 @@ fun MyDriveExplorerScreen(
                 Text(if (isGridView) "List" else "Grid")
             }
             OutlinedButton(onClick = onRefresh) {
-                Text("Sync")
+                Text(if (isLoadingCloudDrive) "Loading..." else "Sync")
             }
         }
 
-        // Direct Cloud Actions: + New Folder & Upload File
+        // Direct Cloud Actions: + New Folder, Rename Backup Folder & Upload File
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -732,11 +1048,17 @@ fun MyDriveExplorerScreen(
             ) {
                 Text("+ New Folder", fontSize = 12.sp)
             }
+            OutlinedButton(
+                onClick = { showBackupRootRenameDialog = true },
+                modifier = Modifier.weight(1f)
+            ) {
+                Text("Backup Folder", fontSize = 12.sp)
+            }
             Button(
                 onClick = onUploadDirectFiles,
                 modifier = Modifier.weight(1f)
             ) {
-                Text("Upload File to Drive", fontSize = 12.sp)
+                Text("Upload File", fontSize = 12.sp)
             }
         }
 
@@ -746,7 +1068,16 @@ fun MyDriveExplorerScreen(
                 FilterChip(
                     selected = currentFilter == filter,
                     onClick = { onSelectFilter(filter) },
-                    label = { Text(filter.title, fontSize = 12.sp) }
+                    label = {
+                        Text(
+                            if (filter == DriveViewFilter.BACKUP_ROOT) {
+                                "Backup Folder ($activeRootName)"
+                            } else {
+                                filter.title
+                            },
+                            fontSize = 12.sp
+                        )
+                    }
                 )
             }
         }
@@ -779,19 +1110,57 @@ fun MyDriveExplorerScreen(
             }
         }
 
-        if (items.isEmpty()) {
+        if (isLoadingCloudDrive) {
+            LoadingStateCard(
+                message = "Loading... Please wait while all files are being loaded...",
+                detail = "Querying Google Drive API for '${currentFilter.title}'..."
+            )
+        }
+
+        cloudDriveErrorMessage?.takeIf { it.isNotBlank() }?.let { err ->
+            AlertBanner(
+                title = "Google Drive Load Error",
+                message = err,
+                actionLabel = "Retry Sync",
+                onAction = onRefresh
+            )
+        }
+
+        if (!isLoadingCloudDrive && items.isEmpty()) {
             Card(modifier = Modifier.fillMaxWidth()) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Text(
-                        if (!accountConnected) {
-                            "Connect your Google Account in the 'Accounts' tab to browse Google Drive files."
-                        } else {
-                            "No files found in this view yet. Run a backup or tap Sync to refresh."
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    if (!accountConnected) {
+                        Text(
+                            "Google Account is not connected. Connect your Google Account in the 'Accounts' tab to browse Google Drive files."
+                        )
+                    } else if (currentFilter == DriveViewFilter.BACKUP_ROOT && !isDriveRootFolderCreated && breadcrumbs.isEmpty()) {
+                        Text(
+                            text = "Folder '$activeRootName' is NOT created on your Google Drive yet.",
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = "A folder named '$activeRootName' will be created when you run a backup, or you can create it now or rename it below.",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(onClick = { onCreateOrRenameBackupFolder(activeRootName) }) {
+                                Text("Create '$activeRootName' Now", fontSize = 12.sp)
+                            }
+                            OutlinedButton(onClick = { showBackupRootRenameDialog = true }) {
+                                Text("Rename / Create New Folder", fontSize = 12.sp)
+                            }
                         }
-                    )
+                    } else {
+                        Text(
+                            "No files found in this folder/view yet. Run a backup, upload a file, or tap Sync to refresh."
+                        )
+                    }
                 }
             }
-        } else if (isGridView) {
+        } else if (items.isNotEmpty() && isGridView) {
             LazyVerticalGrid(
                 columns = GridCells.Fixed(2),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -819,7 +1188,7 @@ fun MyDriveExplorerScreen(
                     }
                 }
             }
-        } else {
+        } else if (items.isNotEmpty()) {
             LazyColumn(
                 verticalArrangement = Arrangement.spacedBy(8.dp),
                 modifier = Modifier.fillMaxSize()
@@ -1010,6 +1379,10 @@ fun PhoneStorageExplorerScreen(
     currentPath: String,
     localItems: List<LocalBrowseItem>,
     coverageItems: List<FolderCoverageItem>,
+    isLoadingLocalBrowser: Boolean = false,
+    hasStoragePermission: Boolean = false,
+    rootDriveFolderName: String = "Android_Permanent_Backup",
+    isDriveRootFolderCreated: Boolean = false,
     onNavigateFolder: (String) -> Unit,
     onNavigateUp: () -> Unit,
     onGrantAllFilesAccess: () -> Unit,
@@ -1018,6 +1391,7 @@ fun PhoneStorageExplorerScreen(
     onToggleSubfolderAutoBackup: (LocalBrowseItem, Boolean) -> Unit = { _, _ -> },
     onBackupSingleFile: (LocalBrowseItem) -> Unit = {}
 ) {
+    val activeRootName = rootDriveFolderName.ifBlank { "Android_Permanent_Backup" }
     var showCoverageTab by remember { mutableStateOf(false) }
 
     Column(
@@ -1050,6 +1424,13 @@ fun PhoneStorageExplorerScreen(
             }
         }
 
+        if (isLoadingLocalBrowser) {
+            LoadingStateCard(
+                message = "Loading... Please wait while all files are being loaded...",
+                detail = "Scanning /storage/emulated/0/${currentPath.ifBlank { "" }}..."
+            )
+        }
+
         if (!showCoverageTab) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -1069,16 +1450,22 @@ fun PhoneStorageExplorerScreen(
                 }
             }
 
-            if (localItems.isEmpty()) {
+            if (!isLoadingLocalBrowser && localItems.isEmpty()) {
                 Card(modifier = Modifier.fillMaxWidth()) {
                     Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text("No accessible files in this directory or storage permission required.")
-                        Button(onClick = onGrantAllFilesAccess) {
-                            Text("Grant Storage Access")
+                        if (!hasStoragePermission) {
+                            Text(
+                                "Phone storage permission is not granted yet. Grant storage permission below to load your local folders and files."
+                            )
+                            Button(onClick = onGrantAllFilesAccess) {
+                                Text("Grant Storage Access")
+                            }
+                        } else {
+                            Text("This folder is empty (0 files or subdirectories found).")
                         }
                     }
                 }
-            } else {
+            } else if (localItems.isNotEmpty()) {
                 LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     itemsIndexed(localItems, key = { idx, it -> "local_${idx}_${it.relativePath}" }) { _, item ->
                         Card(
@@ -1100,11 +1487,16 @@ fun PhoneStorageExplorerScreen(
                                         text = if (item.isDirectory) "📁 ${item.name}" else "📄 ${item.name}",
                                         fontWeight = FontWeight.Bold
                                     )
+                                    val driveTargetHint = if (isDriveRootFolderCreated) {
+                                        "Drive: My Drive/$activeRootName/${item.relativePath}"
+                                    } else {
+                                        "Target (when Drive folder is created): My Drive/$activeRootName/${item.relativePath}"
+                                    }
                                     Text(
                                         text = if (item.isRestrictedByOs) {
                                             "Restricted by Android OS Sandbox (Never read or claimed)"
                                         } else if (item.isDirectory) {
-                                            "Phone: /storage/emulated/0/${item.relativePath}  ➔  Drive: My Drive/Android_Permanent_Backup/${item.relativePath} • ${item.childCount} items"
+                                            "Phone: /storage/emulated/0/${item.relativePath}  ➔  $driveTargetHint • ${item.childCount} items"
                                         } else {
                                             "Phone: /storage/emulated/0/${item.relativePath} • ${formatBytes(item.sizeBytes)}"
                                         },
@@ -1137,7 +1529,7 @@ fun PhoneStorageExplorerScreen(
         } else {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(onClick = onGrantAllFilesAccess) {
-                    Text("Grant All-Files Permission")
+                    Text(if (hasStoragePermission) "Storage Permission Granted ✓" else "Grant All-Files Permission")
                 }
                 OutlinedButton(onClick = onSelectSafTree) {
                     Text("Add SAF Folder")
@@ -1146,6 +1538,7 @@ fun PhoneStorageExplorerScreen(
             LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 itemsIndexed(coverageItems, key = { idx, it -> "cov_${idx}_${it.folderName}_${it.relativePath}" }) { _, item ->
                     val isRestricted = item.accessStatus == com.permanentbackup.gdrive.domain.model.FolderAccessStatus.RESTRICTED_BY_ANDROID_OS
+                    val isNotPresent = item.accessStatus == com.permanentbackup.gdrive.domain.model.FolderAccessStatus.NOT_PRESENT_ON_DEVICE
                     Card(modifier = Modifier.fillMaxWidth()) {
                         Column(modifier = Modifier.padding(12.dp)) {
                             Row(
@@ -1156,17 +1549,21 @@ fun PhoneStorageExplorerScreen(
                                 Column(modifier = Modifier.weight(1f)) {
                                     Text(item.folderName, fontWeight = FontWeight.Bold)
                                     Text("From Phone: /storage/emulated/0/${item.relativePath}", style = MaterialTheme.typography.bodySmall)
-                                    if (!isRestricted) {
+                                    if (!isRestricted && !isNotPresent) {
                                         Text(
-                                            "To Google Drive: My Drive / Android_Permanent_Backup / ${item.relativePath}",
+                                            if (isDriveRootFolderCreated) {
+                                                "To Google Drive: My Drive / $activeRootName / ${item.relativePath}"
+                                            } else {
+                                                "Target (once Drive folder is created): My Drive / $activeRootName / ${item.relativePath}"
+                                            },
                                             style = MaterialTheme.typography.bodySmall,
                                             color = MaterialTheme.colorScheme.primary
                                         )
                                     }
                                 }
                                 Switch(
-                                    checked = item.backupEnabled && !isRestricted,
-                                    enabled = !isRestricted,
+                                    checked = item.backupEnabled && !isRestricted && !isNotPresent,
+                                    enabled = !isRestricted && !isNotPresent,
                                     onCheckedChange = { enabled ->
                                         onToggleFolderBackup(item, enabled)
                                     }
@@ -1194,11 +1591,15 @@ fun BackupVersionHistoryScreen(
     actionFeedback: String?,
     selectedFileVersions: List<BackupFileEntity> = emptyList(),
     accountBackupVersions: List<BackupVersionEntity> = emptyList(),
+    isLoading: Boolean = false,
+    rootDriveFolderName: String = "Android_Permanent_Backup",
     onInspectAllVersions: (String) -> Unit = {},
     onDismissVersionsDialog: () -> Unit = {},
     onRestoreVersion: (BackupFileEntity) -> Unit,
     onRestoreAccountVersion: (BackupVersionEntity) -> Unit = {}
 ) {
+    val activeRootName = rootDriveFolderName.ifBlank { "Android_Permanent_Backup" }
+
     if (selectedFileVersions.isNotEmpty()) {
         val sample = selectedFileVersions.first()
         AlertDialog(
@@ -1211,7 +1612,7 @@ fun BackupVersionHistoryScreen(
                             Column(modifier = Modifier.padding(10.dp)) {
                                 Text("Version v${ver.backupVersion}: ${ver.driveStoredName}", fontWeight = FontWeight.Bold)
                                 Text("From Phone: /storage/emulated/0/${ver.relativePath.trimStart('/')}", style = MaterialTheme.typography.bodySmall)
-                                Text("To Google Drive: My Drive / Android_Permanent_Backup / ${ver.relativePath.replace('\\', '/').substringBeforeLast('/', "")} / ${ver.driveStoredName}", style = MaterialTheme.typography.bodySmall)
+                                Text("To Google Drive: My Drive / $activeRootName / ${ver.relativePath.replace('\\', '/').substringBeforeLast('/', "")} / ${ver.driveStoredName}", style = MaterialTheme.typography.bodySmall)
                                 Text("Account: ${ver.accountId} • Size: ${formatBytes(ver.fileSize)}", style = MaterialTheme.typography.bodySmall)
                                 Text("SHA-256: ${ver.sha256Hash?.take(20) ?: "Verified"}...", style = MaterialTheme.typography.bodySmall)
                                 OutlinedButton(onClick = { onRestoreVersion(ver) }) {
@@ -1245,6 +1646,12 @@ fun BackupVersionHistoryScreen(
             text = "Every file modification creates a new immutable version (v1, v2, ...). Restoring a version NEVER overwrites existing local files.",
             style = MaterialTheme.typography.bodySmall
         )
+        if (isLoading) {
+            LoadingStateCard(
+                message = "Loading... Please wait while all files are being loaded...",
+                detail = "Loading backup version history..."
+            )
+        }
         actionFeedback?.let { msg ->
             Card(
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
@@ -1253,13 +1660,22 @@ fun BackupVersionHistoryScreen(
                 Text(msg, modifier = Modifier.padding(10.dp), style = MaterialTheme.typography.bodySmall)
             }
         }
+        if (!isLoading && verifiedHistory.isEmpty() && accountBackupVersions.isEmpty()) {
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text(
+                        "No verified cloud backups yet. Once files are backed up to Google Drive, their immutable version history (v1, v2, ...) and SHA-256 checksums will appear here."
+                    )
+                }
+            }
+        }
         LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             itemsIndexed(verifiedHistory, key = { idx, it -> "ver_hist_${idx}_${it.id}" }) { _, item ->
                 val subFolder = item.relativePath.replace('\\', '/').substringBeforeLast('/', "")
                 val drivePath = if (subFolder.isNotBlank()) {
-                    "My Drive / Android_Permanent_Backup / $subFolder / ${item.driveStoredName}"
+                    "My Drive / $activeRootName / $subFolder / ${item.driveStoredName}"
                 } else {
-                    "My Drive / Android_Permanent_Backup / ${item.driveStoredName}"
+                    "My Drive / $activeRootName / ${item.driveStoredName}"
                 }
                 Card(modifier = Modifier.fillMaxWidth()) {
                     Column(modifier = Modifier.padding(12.dp)) {
@@ -1314,7 +1730,7 @@ fun BackupVersionHistoryScreen(
                                 style = MaterialTheme.typography.bodySmall
                             )
                             Text(
-                                text = "To Google Drive: My Drive / Android_Permanent_Backup / ${ver.relativePath.replace('\\', '/').substringBeforeLast('/', "")} / ${ver.driveStoredName}",
+                                text = "To Google Drive: My Drive / $activeRootName / ${ver.relativePath.replace('\\', '/').substringBeforeLast('/', "")} / ${ver.driveStoredName}",
                                 style = MaterialTheme.typography.bodySmall
                             )
                             Text(
@@ -1343,8 +1759,12 @@ fun BackupVersionHistoryScreen(
 fun RecentActivityScreen(
     recentRecords: List<BackupFileEntity>,
     syncEvents: List<SyncEventEntity>,
+    isLoading: Boolean = false,
+    rootDriveFolderName: String = "Android_Permanent_Backup",
     onRestoreRecord: (BackupFileEntity) -> Unit
 ) {
+    val activeRootName = rootDriveFolderName.ifBlank { "Android_Permanent_Backup" }
+
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
@@ -1358,18 +1778,42 @@ fun RecentActivityScreen(
                 fontWeight = FontWeight.Bold
             )
         }
+        if (isLoading) {
+            item {
+                LoadingStateCard(
+                    message = "Loading... Please wait while all files are being loaded...",
+                    detail = "Loading recent file records and sync events..."
+                )
+            }
+        }
+        if (!isLoading && recentRecords.isEmpty() && syncEvents.isEmpty()) {
+            item {
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Text("No recent file transfers or sync events recorded yet.")
+                    }
+                }
+            }
+        }
         itemsIndexed(recentRecords.take(50), key = { idx, it -> "rec_${idx}_${it.id}" }) { _, rec ->
             val subFolder = rec.relativePath.replace('\\', '/').substringBeforeLast('/', "")
             val driveTarget = if (subFolder.isNotBlank()) {
-                "My Drive / Android_Permanent_Backup / $subFolder / ${rec.driveStoredName}"
+                "My Drive / $activeRootName / $subFolder / ${rec.driveStoredName}"
             } else {
-                "My Drive / Android_Permanent_Backup / ${rec.driveStoredName}"
+                "My Drive / $activeRootName / ${rec.driveStoredName}"
             }
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(12.dp)) {
                     Text("${rec.driveStoredName} (v${rec.backupVersion})", fontWeight = FontWeight.Bold)
                     Text("From Phone: /storage/emulated/0/${rec.relativePath.trimStart('/')}")
-                    Text("To Google Drive: $driveTarget", color = MaterialTheme.colorScheme.primary)
+                    Text(
+                        text = if (rec.driveFileId != null) {
+                            "To Google Drive: $driveTarget"
+                        } else {
+                            "Target (pending upload): $driveTarget"
+                        },
+                        color = MaterialTheme.colorScheme.primary
+                    )
                     Text("Status: ${rec.uploadStatus} • ${formatBytes(rec.fileSize)} • ${formatTimestamp(rec.createdAtMs)}")
                     if (rec.driveFileId != null) {
                         Spacer(modifier = Modifier.height(4.dp))
@@ -1434,6 +1878,15 @@ fun TransferManagerScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
+        if (summary.isDashboardLoading || summary.isScanningPhoneStorage) {
+            item {
+                LoadingStateCard(
+                    message = "Loading... Please wait while all files are being loaded...",
+                    detail = summary.currentScanningOrUploadingFile ?: "Scanning files and transfer queue..."
+                )
+            }
+        }
+
         item {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -1519,7 +1972,14 @@ fun TransferManagerScreen(
                     Column(modifier = Modifier.padding(12.dp)) {
                         Text("${item.driveStoredName} (v${item.backupVersion})", fontWeight = FontWeight.Bold)
                         Text("From Phone: /storage/emulated/0/${item.relativePath.trimStart('/')}")
-                        Text("To Google Drive: $driveDest", color = MaterialTheme.colorScheme.primary)
+                        Text(
+                            text = if (summary.isDriveRootFolderCreated) {
+                                "To Google Drive: $driveDest"
+                            } else {
+                                "Target (when Drive folder is created): $driveDest"
+                            },
+                            color = MaterialTheme.colorScheme.primary
+                        )
                         Text("Size: ${formatBytes(item.fileSize)} | Uploaded: ${formatBytes(item.uploadedBytes)} ($pct%)")
                         Text("State: ${item.uploadStatus} | Speed: ${formatBytes(summary.currentUploadSpeedBps)}/s")
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1567,7 +2027,7 @@ fun TransferManagerScreen(
                 Column(modifier = Modifier.padding(12.dp)) {
                     Text("${item.driveStoredName} (v${item.backupVersion})", fontWeight = FontWeight.Bold)
                     Text("From Phone: /storage/emulated/0/${item.relativePath.trimStart('/')}")
-                    Text("To Google Drive: $driveDest")
+                    Text("Target Google Drive Path: $driveDest")
                     Text("Reason: ${item.failureReason}")
                     item.failureDetail?.let { Text("Detail: $it", style = MaterialTheme.typography.bodySmall) }
                     Text("Saved Byte Offset: ${formatBytes(item.uploadedBytes)} / ${formatBytes(item.fileSize)}")
@@ -1922,18 +2382,47 @@ fun GoogleAccountScreen(
     savedAccounts: List<GoogleAccountEntity>,
     oauthDiagnostics: OAuthDiagnosticReport,
     signInFeedbackMessage: String? = null,
+    isAuthorizingAccount: Boolean = false,
+    isCreatingOrRenamingDriveFolder: Boolean = false,
     onLaunchGoogleSignIn: () -> Unit,
     onGrantFullDriveReadScope: () -> Unit,
     onSwitchSavedAccount: (String) -> Unit,
     onVerifyCloudConnection: () -> Unit,
+    onCreateOrRenameBackupFolder: (String) -> Unit = {},
     onDisconnect: () -> Unit
 ) {
+    val rootDriveName = summary.accountState.rootDriveFolderName.ifBlank { "Android_Permanent_Backup" }
+    var showFolderDialog by remember { mutableStateOf(false) }
+
+    if (showFolderDialog) {
+        CreateOrRenameBackupFolderDialog(
+            currentFolderName = rootDriveName,
+            isConnected = summary.accountState.isConnected,
+            isFolderAlreadyCreated = summary.isDriveRootFolderCreated,
+            onDismiss = { showFolderDialog = false },
+            onConfirmFolderName = onCreateOrRenameBackupFolder
+        )
+    }
+
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
+        if (isAuthorizingAccount || isCreatingOrRenamingDriveFolder || summary.isVerifyingOrCreatingDriveFolder) {
+            item {
+                LoadingStateCard(
+                    message = "Loading... Please wait while Google Drive account & folder state are being verified...",
+                    detail = if (isCreatingOrRenamingDriveFolder || summary.isVerifyingOrCreatingDriveFolder) {
+                        "Creating / verifying folder '$rootDriveName' on Google Drive..."
+                    } else {
+                        "Connecting to Google Drive API..."
+                    }
+                )
+            }
+        }
+
         item {
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(
@@ -1946,7 +2435,7 @@ fun GoogleAccountScreen(
                         fontWeight = FontWeight.Bold
                     )
                     Text(
-                        text = "Status: ${if (summary.accountState.isConnected) "Connected ✓ (${summary.accountState.authState})" else "Disconnected"}",
+                        text = "Status: ${if (summary.accountState.isConnected) "Connected ✓ (${summary.accountState.authState})" else "Disconnected (Not Signed In)"}",
                         fontWeight = FontWeight.SemiBold,
                         color = if (summary.accountState.isConnected) {
                             MaterialTheme.colorScheme.primary
@@ -1956,11 +2445,34 @@ fun GoogleAccountScreen(
                     )
                     Text("Active Email: ${summary.accountState.email.ifBlank { "Not signed in" }}")
                     Text("Display Name: ${summary.accountState.displayName.ifBlank { "N/A" }}")
-                    Text("Granted Scopes: ${summary.accountState.grantedScope}")
-                    Text("Account Backup Root: ${summary.accountState.rootDriveFolderName} (${summary.accountState.rootDriveFolderId ?: "Auto-created on sync"})")
+                    Text(
+                        "Granted Scopes: ${
+                            if (summary.accountState.isConnected) {
+                                summary.accountState.grantedScope.ifBlank { "https://www.googleapis.com/auth/drive.file" }
+                            } else {
+                                "None (Not signed in)"
+                            }
+                        }"
+                    )
+                    Text(
+                        text = if (summary.isDriveRootFolderCreated) {
+                            "Google Drive Backup Folder: ✓ Created ('My Drive / $rootDriveName', ID: ${summary.accountState.rootDriveFolderId})"
+                        } else if (summary.accountState.isConnected) {
+                            "Google Drive Backup Folder: NOT created on Google Drive yet (Target: '$rootDriveName' — will be created on sync or tap below)"
+                        } else {
+                            "Google Drive Backup Folder: Not created yet (Connect account first; target folder name: '$rootDriveName')"
+                        },
+                        fontWeight = FontWeight.SemiBold
+                    )
                     Text("Last Token Refresh: ${formatTimestamp(summary.accountState.lastTokenRefreshMs)} (${summary.accountState.lastTokenRefreshStatus})")
                     Text(
-                        "Available Drive Storage: ${formatBytes(summary.driveQuota.availableBytes)} free of ${formatBytes(summary.driveQuota.limitBytes)}"
+                        "Available Drive Storage: ${
+                            if (summary.driveQuota.isLoaded) {
+                                "${formatBytes(summary.driveQuota.availableBytes)} free of ${formatBytes(summary.driveQuota.limitBytes)}"
+                            } else {
+                                "Not loaded yet (Connect account or tap 'Verify Drive Quota')"
+                            }
+                        }"
                     )
                     summary.accountState.connectionError?.let { err ->
                         Text("Notice: $err", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
@@ -1981,6 +2493,32 @@ fun GoogleAccountScreen(
                             }
                         )
                     }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        if (summary.accountState.isConnected && !summary.isDriveRootFolderCreated) {
+                            Button(
+                                onClick = { onCreateOrRenameBackupFolder(rootDriveName) },
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("Create '$rootDriveName' Now", fontSize = 12.sp)
+                            }
+                        }
+                        OutlinedButton(
+                            onClick = { showFolderDialog = true },
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text(
+                                if (summary.isDriveRootFolderCreated) {
+                                    "Rename / Create New Backup Folder"
+                                } else {
+                                    "Change / Set Backup Folder Name"
+                                },
+                                fontSize = 12.sp
+                            )
+                        }
+                    }
                     if (summary.accountState.isConnected && !summary.accountState.hasFullDriveReadScope) {
                         OutlinedButton(
                             onClick = onGrantFullDriveReadScope,
@@ -1997,7 +2535,7 @@ fun GoogleAccountScreen(
                             onClick = onVerifyCloudConnection,
                             modifier = Modifier.weight(1f)
                         ) {
-                            Text("Verify Drive Quota")
+                            Text("Verify Drive & Folder")
                         }
                         if (summary.accountState.isConnected) {
                             OutlinedButton(
@@ -2036,7 +2574,7 @@ fun GoogleAccountScreen(
                                         fontWeight = if (acc.isActive) FontWeight.Bold else FontWeight.Normal
                                     )
                                     Text(
-                                        text = "Root ID: ${acc.backupRootFolderId ?: "Pending"} • State: ${acc.authorizationState}",
+                                        text = "Folder ID: ${acc.backupRootFolderId ?: "Not created yet"} • State: ${acc.authorizationState}",
                                         style = MaterialTheme.typography.bodySmall
                                     )
                                 }

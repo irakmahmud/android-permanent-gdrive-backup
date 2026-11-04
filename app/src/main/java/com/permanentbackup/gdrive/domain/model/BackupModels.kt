@@ -113,13 +113,14 @@ data class DriveQuotaInfo(
     val limitBytes: Long = 15L * 1024 * 1024 * 1024,
     val usageBytes: Long = 0L,
     val usageInDriveBytes: Long = 0L,
-    val usageInTrashBytes: Long = 0L
+    val usageInTrashBytes: Long = 0L,
+    val isLoaded: Boolean = false
 ) {
     val availableBytes: Long
         get() = (limitBytes - usageBytes).coerceAtLeast(0L)
 
     val isQuotaFull: Boolean
-        get() = limitBytes > 0L && availableBytes <= 0L
+        get() = isLoaded && limitBytes > 0L && availableBytes <= 0L
 }
 
 data class GoogleAccountState(
@@ -129,7 +130,7 @@ data class GoogleAccountState(
     val displayName: String = "",
     val selectedAccountRef: String = "",
     val authState: AccountAuthState = AccountAuthState.DISCONNECTED,
-    val grantedScope: String = "https://www.googleapis.com/auth/drive.file",
+    val grantedScope: String = "",
     val hasFullDriveReadScope: Boolean = false,
     val rootDriveFolderId: String? = null,
     val rootDriveFolderName: String = "Android_Permanent_Backup",
@@ -166,8 +167,6 @@ data class FolderCoverageItem(
     val completenessFraction: Float
         get() = if (discoveredFileCount > 0) {
             (backedUpFileCount.toFloat() / discoveredFileCount.toFloat()).coerceIn(0f, 1f)
-        } else if (accessStatus == FolderAccessStatus.ACCESSIBLE) {
-            1f
         } else {
             0f
         }
@@ -266,7 +265,7 @@ data class DashboardSummary(
     val nextScheduledBackupMs: Long? = null,
     val driveQuota: DriveQuotaInfo = DriveQuotaInfo(),
     val accessibleFolderCount: Int = 0,
-    val restrictedFolderCount: Int = 3,
+    val restrictedFolderCount: Int = 0,
     val currentlyUploading: ActiveUploadProgress? = null,
     val backgroundSyncStatus: BackgroundSyncStatus = BackgroundSyncStatus.WAITING_FOR_ANDROID_SCHEDULER,
     val offlinePinnedCount: Int = 0,
@@ -277,10 +276,18 @@ data class DashboardSummary(
     val networkFailureMessage: String? = null,
     val isBackupRunning: Boolean = false,
     val dbIntegrityOk: Boolean = true,
-    val currentPhoneSourcePath: String = "/storage/emulated/0/{DCIM, Pictures, Videos, Downloads, Documents, WhatsApp, Telegram}",
-    val currentDriveTargetPath: String = "My Drive / Android_Permanent_Backup/",
+    val currentPhoneSourcePath: String = "",
+    val currentDriveTargetPath: String = "",
     val currentScanningOrUploadingFile: String? = null,
-    val isContinuousAutoBackupServiceActive: Boolean = true
+    val isContinuousAutoBackupServiceActive: Boolean = false,
+    val isDashboardLoading: Boolean = true,
+    val isScanningPhoneStorage: Boolean = false,
+    val isVerifyingOrCreatingDriveFolder: Boolean = false,
+    val hasStoragePermission: Boolean = false,
+    val hasManageAllFilesPermission: Boolean = false,
+    val isBatteryOptimizationIgnored: Boolean = false,
+    val isDriveRootFolderCreated: Boolean = false,
+    val watchedFolderCount: Int = 0
 )
 
 class NeverDeletePolicyViolationException(message: String) : SecurityException(message)

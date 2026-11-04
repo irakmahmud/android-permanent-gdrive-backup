@@ -123,6 +123,14 @@ class PermanentBackupEngine(
     private val _currentScanActivity = MutableStateFlow<String?>(null)
     val currentScanActivity: StateFlow<String?> = _currentScanActivity.asStateFlow()
 
+    /** True while verifying or creating the root backup folder on Google Drive. */
+    private val _isVerifyingOrCreatingDriveFolder = MutableStateFlow(false)
+    val isVerifyingOrCreatingDriveFolder: StateFlow<Boolean> = _isVerifyingOrCreatingDriveFolder.asStateFlow()
+
+    fun activeRootFolderName(): String {
+        return authManager.accountState.value.rootDriveFolderName.trim().ifBlank { ROOT_DRIVE_FOLDER_NAME }
+    }
+
     /**
      * Optional callback invoked during incremental cloud changes sync when a pinned offline file
      * has been updated on Google Drive (or a new file appeared inside a pinned offline folder)
@@ -246,42 +254,83 @@ class PermanentBackupEngine(
 
     /**
      * Connects to Google Drive API v3, refreshes storage quota info, and ensures
-     * the root backup folder ("Android_Permanent_Backup") exists.
+     * the active root backup folder exists on Google Drive.
      */
     suspend fun refreshRemoteQuotaAndRootFolder(): Boolean {
         if (!authManager.accountState.value.isConnected) return false
+        _isVerifyingOrCreatingDriveFolder.value = true
         return try {
-            val token = authManager.getValidAccessToken()
-            val quota = driveApiClient.fetchDriveQuota(token)
+            var token = authManager.getValidAccessToken()
+            val quota = try {
+                driveApiClient.fetchDriveQuota(token)
+            } catch (e: AuthTokenExpiredException) {
+                token = authManager.invalidateAndRefreshTokenOn401()
+                driveApiClient.fetchDriveQuota(token)
+            }
             _latestQuotaInfo.value = quota
             _quotaFullState.value = quota.isQuotaFull
 
             val currentRoot = authManager.accountState.value.rootDriveFolderId
             if (currentRoot.isNullOrBlank()) {
+                val rootName = activeRootFolderName()
                 val rootId = driveApiClient.ensureFolderExists(
                     accessToken = token,
-                    folderName = ROOT_DRIVE_FOLDER_NAME,
+                    folderName = rootName,
                     parentFolderId = null
                 )
-                authManager.setRootDriveFolderId(rootId)
+                authManager.setRootDriveFolderName(rootName, rootId)
             }
             _lastNetworkError.value = null
             true
-        } catch (e: AuthTokenExpiredException) {
-            try {
-                val refreshedToken = authManager.invalidateAndRefreshTokenOn401()
-                val quota = driveApiClient.fetchDriveQuota(refreshedToken)
-                _latestQuotaInfo.value = quota
-                _quotaFullState.value = quota.isQuotaFull
-                _lastNetworkError.value = null
-                true
-            } catch (inner: Exception) {
-                _lastNetworkError.value = inner.message
-                false
-            }
         } catch (e: Exception) {
             _lastNetworkError.value = e.message
             false
+        } finally {
+            _isVerifyingOrCreatingDriveFolder.value = false
+        }
+    }
+
+    /**
+     * Explicitly creates or switches/renames the target Google Drive backup folder.
+     * - When connected to Google Drive, immediately creates/resolves the folder on Drive and stores its real folder ID.
+     * - When not yet connected, saves the chosen folder name with `rootDriveFolderId = null` so it will be created upon connection.
+     */
+    suspend fun createOrSwitchRootBackupFolder(newFolderName: String): Result<String> {
+        val cleanName = newFolderName.trim()
+            .replace("/", "_")
+            .replace("\\", "_")
+            .ifBlank { ROOT_DRIVE_FOLDER_NAME }
+        if (!authManager.accountState.value.isConnected) {
+            authManager.setRootDriveFolderName(cleanName, null)
+            return Result.success("")
+        }
+        _isVerifyingOrCreatingDriveFolder.value = true
+        return try {
+            var token = authManager.getValidAccessToken()
+            val rootId = try {
+                driveApiClient.ensureFolderExists(
+                    accessToken = token,
+                    folderName = cleanName,
+                    parentFolderId = null
+                )
+            } catch (e: AuthTokenExpiredException) {
+                token = authManager.invalidateAndRefreshTokenOn401()
+                driveApiClient.ensureFolderExists(
+                    accessToken = token,
+                    folderName = cleanName,
+                    parentFolderId = null
+                )
+            }
+            authManager.setRootDriveFolderName(cleanName, rootId)
+            _lastNetworkError.value = null
+            _currentScanActivity.value =
+                "✓ Google Drive folder '$cleanName' is created & ready at My Drive/$cleanName"
+            Result.success(rootId)
+        } catch (e: Exception) {
+            _lastNetworkError.value = e.message
+            Result.failure(e)
+        } finally {
+            _isVerifyingOrCreatingDriveFolder.value = false
         }
     }
 
@@ -607,12 +656,19 @@ class PermanentBackupEngine(
             var skippedUnchanged = 0
             val discoveredIdentities = HashSet<String>(4096)
 
+            val rootFolderName = activeRootFolderName()
+            val isDriveFolderCreated = authManager.accountState.value.isConnected &&
+                !authManager.accountState.value.rootDriveFolderId.isNullOrBlank()
+
             for (discovered in storageSource.scanFilesSequence(computeHashes = false)) {
                 scannedCount++
                 discoveredIdentities.add(discovered.sourceFileIdentity)
                 if (scannedCount == 1 || scannedCount % 10 == 0) {
-                    _currentScanActivity.value =
-                        "From Phone: /storage/emulated/0/${discovered.relativePath} → To Google Drive: My Drive/$ROOT_DRIVE_FOLDER_NAME/${discovered.relativePath}"
+                    _currentScanActivity.value = if (isDriveFolderCreated) {
+                        "From Phone: /storage/emulated/0/${discovered.relativePath} → To Google Drive: My Drive/$rootFolderName/${discovered.relativePath}"
+                    } else {
+                        "Scanning Phone: /storage/emulated/0/${discovered.relativePath} (Google Drive folder '$rootFolderName' will be created on upload)"
+                    }
                 }
 
                 val normalizedRelPath = discovered.relativePath.replace('\\', '/').trim('/').lowercase()
@@ -626,16 +682,22 @@ class PermanentBackupEngine(
                 val queued = evaluateAndQueueDiscoveredFile(discovered)
                 if (queued) {
                     newlyQueued++
-                    _currentScanActivity.value =
-                        "Queued from Phone: /storage/emulated/0/${discovered.relativePath} → To Google Drive: My Drive/$ROOT_DRIVE_FOLDER_NAME/${discovered.relativePath}"
+                    _currentScanActivity.value = if (isDriveFolderCreated) {
+                        "Queued from Phone: /storage/emulated/0/${discovered.relativePath} → To Google Drive: My Drive/$rootFolderName/${discovered.relativePath}"
+                    } else {
+                        "Queued from Phone: /storage/emulated/0/${discovered.relativePath} (Waiting to create Google Drive folder '$rootFolderName')"
+                    }
                 } else {
                     skippedUnchanged++
                 }
             }
 
             if (scannedCount > 0 && newlyQueued == 0) {
-                _currentScanActivity.value =
-                    "Verified $scannedCount phone files in /storage/emulated/0/{DCIM, Pictures, Videos, Downloads, Documents} → Google Drive: My Drive/$ROOT_DRIVE_FOLDER_NAME/ (100% Up to Date)"
+                _currentScanActivity.value = if (isDriveFolderCreated) {
+                    "Verified $scannedCount phone files → Google Drive: My Drive/$rootFolderName/ (100% Up to Date)"
+                } else {
+                    "Scanned $scannedCount phone files (Google Drive folder '$rootFolderName' not created yet)"
+                }
             }
 
             // Step 3: Reconcile locally deleted files — NEVER delete from Google Drive!
@@ -943,7 +1005,8 @@ class PermanentBackupEngine(
             // Proceed to upload if quota endpoint is temporarily unreachable
         }
 
-        // Ensure "Android_Permanent_Backup" root folder exists
+        // Ensure active root backup folder exists on Google Drive
+        val activeRootName = activeRootFolderName()
         val rootFolderId = try {
             val cachedRoot = authManager.accountState.value.rootDriveFolderId
             if (!cachedRoot.isNullOrBlank()) {
@@ -951,14 +1014,14 @@ class PermanentBackupEngine(
             } else {
                 val createdId = driveApiClient.ensureFolderExists(
                     accessToken = accessToken,
-                    folderName = ROOT_DRIVE_FOLDER_NAME,
+                    folderName = activeRootName,
                     parentFolderId = null
                 )
-                authManager.setRootDriveFolderId(createdId)
+                authManager.setRootDriveFolderName(activeRootName, createdId)
                 createdId
             }
         } catch (e: Exception) {
-            _lastNetworkError.value = "Failed to verify root folder '$ROOT_DRIVE_FOLDER_NAME': ${e.message}"
+            _lastNetworkError.value = "Failed to verify root folder '$activeRootName': ${e.message}"
             return 0 to 0
         }
 
@@ -1132,11 +1195,12 @@ class PermanentBackupEngine(
         settings: BackupSettings
     ): Boolean {
         val accountId = currentAccountId()
+        val activeRootName = activeRootFolderName()
         val driveParentSubPath = initialRecord.relativePath.substringBeforeLast('/', "")
         val driveFullTarget = if (driveParentSubPath.isBlank()) {
-            "My Drive/$ROOT_DRIVE_FOLDER_NAME/${initialRecord.driveStoredName}"
+            "My Drive/$activeRootName/${initialRecord.driveStoredName}"
         } else {
-            "My Drive/$ROOT_DRIVE_FOLDER_NAME/$driveParentSubPath/${initialRecord.driveStoredName}"
+            "My Drive/$activeRootName/$driveParentSubPath/${initialRecord.driveStoredName}"
         }
         _currentScanActivity.value =
             "Backing up Phone: /storage/emulated/0/${initialRecord.relativePath} → Google Drive: $driveFullTarget"
@@ -1854,11 +1918,12 @@ class PermanentBackupEngine(
         )
 
         _lastNetworkError.value = null
+        val activeRootName = activeRootFolderName()
         val verifiedParentSubPath = record.relativePath.substringBeforeLast('/', "")
         val verifiedDriveTarget = if (verifiedParentSubPath.isBlank()) {
-            "My Drive/$ROOT_DRIVE_FOLDER_NAME/${record.driveStoredName}"
+            "My Drive/$activeRootName/${record.driveStoredName}"
         } else {
-            "My Drive/$ROOT_DRIVE_FOLDER_NAME/$verifiedParentSubPath/${record.driveStoredName}"
+            "My Drive/$activeRootName/$verifiedParentSubPath/${record.driveStoredName}"
         }
         _currentScanActivity.value =
             "✓ Backed up Phone: /storage/emulated/0/${record.relativePath} → Google Drive: $verifiedDriveTarget"
@@ -1879,9 +1944,10 @@ class PermanentBackupEngine(
     }
 
     /**
-     * Preserves the phone's folder hierarchy inside "Android_Permanent_Backup"
-     * (e.g. "DCIM/Camera/IMG_001.jpg" -> creates/reuses "Android_Permanent_Backup/DCIM/Camera").
-     * Uses account-scoped cache key so switching accounts never mixes folder IDs across accounts!
+     * Preserves the phone's folder hierarchy inside the active Google Drive backup root folder
+     * (e.g. "DCIM/Camera/IMG_001.jpg" -> creates/reuses "<rootDriveFolderName>/DCIM/Camera").
+     * Uses account-scoped (and custom root-scoped) cache key so switching accounts or renaming
+     * the root backup folder never mixes folder IDs!
      */
     private suspend fun resolveDriveSubFolderHierarchy(
         accessToken: String,
@@ -1894,7 +1960,12 @@ class PermanentBackupEngine(
 
         return folderCreationMutex.withLock {
             val accountPrefix = currentAccountId()
-            val scopedParentKey = "$accountPrefix:$parentPath"
+            val rootScope = if (activeRootFolderName() == ROOT_DRIVE_FOLDER_NAME) {
+                accountPrefix
+            } else {
+                "$accountPrefix:$rootFolderId"
+            }
+            val scopedParentKey = "$rootScope:$parentPath"
             backupDao.getCachedDriveFolder(scopedParentKey)?.let { return@withLock it.driveFolderId }
 
             val segments = parentPath.split('/').filter { it.isNotBlank() }
@@ -1905,7 +1976,7 @@ class PermanentBackupEngine(
                 if (pathBuilder.isNotEmpty()) pathBuilder.append('/')
                 pathBuilder.append(segment)
                 val partialPath = pathBuilder.toString()
-                val scopedKey = "$accountPrefix:$partialPath"
+                val scopedKey = "$rootScope:$partialPath"
 
                 val cached = backupDao.getCachedDriveFolder(scopedKey)
                 if (cached != null) {

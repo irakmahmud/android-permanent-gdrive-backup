@@ -114,6 +114,11 @@ class MainActivity : ComponentActivity() {
                 val previewSnippet by viewModel.previewSnippet.collectAsState()
                 val selectedFileVersions by viewModel.selectedFileVersions.collectAsState()
                 val accountBackupVersions by viewModel.accountBackupVersions.collectAsState()
+                val isLoadingCloudDrive by viewModel.isLoadingCloudDrive.collectAsState()
+                val cloudDriveErrorMessage by viewModel.cloudDriveErrorMessage.collectAsState()
+                val isLoadingLocalBrowser by viewModel.isLoadingLocalBrowser.collectAsState()
+                val isCreatingOrRenamingDriveFolder by viewModel.isCreatingOrRenamingDriveFolder.collectAsState()
+                val isAuthorizingAccount by viewModel.isAuthorizingAccount.collectAsState()
 
                 val runtimePermissionsLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.RequestMultiplePermissions()
@@ -233,7 +238,7 @@ class MainActivity : ComponentActivity() {
                         val selectedEmail = result.data
                             ?.getStringExtra(AccountManager.KEY_ACCOUNT_NAME)
                             .orEmpty()
-                            .ifBlank { summary.accountState.email.ifBlank { "irakiroan@gmail.com" } }
+                            .ifBlank { summary.accountState.email }
                         pendingSelectedEmail = selectedEmail
                         viewModel.onNativeGoogleAccountSelected(
                             context = this@MainActivity,
@@ -345,6 +350,7 @@ class MainActivity : ComponentActivity() {
                                 activeQueue = activeQueue,
                                 recentRecords = recentRecords,
                                 actionFeedback = actionFeedbackMessage,
+                                isCreatingOrRenamingDriveFolder = isCreatingOrRenamingDriveFolder,
                                 onBackupNow = { viewModel.triggerManualBackupNow() },
                                 onConnectOrManageAccount = {
                                     currentScreen = AppScreen.ACCOUNTS
@@ -367,6 +373,9 @@ class MainActivity : ComponentActivity() {
                                 onRequestBatteryUnrestricted = {
                                     requestIgnoreBatteryOptimizations()
                                 },
+                                onCreateOrRenameBackupFolder = { folderName ->
+                                    viewModel.createOrRenameRootBackupFolder(folderName)
+                                },
                                 onRefresh = { viewModel.refreshDashboardAndCoverage(fetchRemoteQuota = true) }
                             )
                             AppScreen.MY_DRIVE -> MyDriveExplorerScreen(
@@ -380,6 +389,10 @@ class MainActivity : ComponentActivity() {
                                 isGridView = isDriveGridView,
                                 previewSnippet = previewSnippet,
                                 hasNextPage = !cloudNextPageToken.isNullOrBlank(),
+                                isLoadingCloudDrive = isLoadingCloudDrive,
+                                cloudDriveErrorMessage = cloudDriveErrorMessage,
+                                rootDriveFolderName = summary.accountState.rootDriveFolderName,
+                                isDriveRootFolderCreated = summary.isDriveRootFolderCreated,
                                 onSelectFilter = { viewModel.setDriveFilter(it) },
                                 onSelectSort = { viewModel.setDriveSortOrder(it) },
                                 onSearchQueryChange = { viewModel.setDriveSearchQuery(it) },
@@ -394,6 +407,9 @@ class MainActivity : ComponentActivity() {
                                 onTogglePinOffline = { viewModel.toggleCloudFileOfflinePin(it) },
                                 onShareFileLink = { shareCloudFileLink(it) },
                                 onCreateFolder = { viewModel.createNewCloudFolder(it) },
+                                onCreateOrRenameBackupFolder = { folderName ->
+                                    viewModel.createOrRenameRootBackupFolder(folderName)
+                                },
                                 onUploadDirectFiles = { runCatching { directFileUploadLauncher.launch(arrayOf("*/*")) } },
                                 onLoadMore = { viewModel.loadMoreCloudDriveFiles() },
                                 onRequestFullDriveReadScope = authorizeAdditionalDriveReadScope,
@@ -403,6 +419,10 @@ class MainActivity : ComponentActivity() {
                                 currentPath = currentLocalPath,
                                 localItems = localPhoneItems,
                                 coverageItems = folderCoverage,
+                                isLoadingLocalBrowser = isLoadingLocalBrowser,
+                                hasStoragePermission = summary.hasStoragePermission,
+                                rootDriveFolderName = summary.accountState.rootDriveFolderName,
+                                isDriveRootFolderCreated = summary.isDriveRootFolderCreated,
                                 onNavigateFolder = { viewModel.refreshLocalPhoneBrowser(it) },
                                 onNavigateUp = { viewModel.navigateUpLocalFolder() },
                                 onGrantAllFilesAccess = {
@@ -425,6 +445,8 @@ class MainActivity : ComponentActivity() {
                                 actionFeedback = actionFeedbackMessage,
                                 selectedFileVersions = selectedFileVersions,
                                 accountBackupVersions = accountBackupVersions,
+                                isLoading = summary.isDashboardLoading || summary.isScanningPhoneStorage,
+                                rootDriveFolderName = summary.accountState.rootDriveFolderName,
                                 onInspectAllVersions = { viewModel.inspectAllVersionsForFile(it) },
                                 onDismissVersionsDialog = { viewModel.dismissVersionsDialog() },
                                 onRestoreVersion = { viewModel.restoreBackupVersion(it) },
@@ -433,6 +455,8 @@ class MainActivity : ComponentActivity() {
                             AppScreen.RECENT -> RecentActivityScreen(
                                 recentRecords = recentRecords,
                                 syncEvents = recentSyncEvents,
+                                isLoading = summary.isDashboardLoading || summary.isScanningPhoneStorage,
+                                rootDriveFolderName = summary.accountState.rootDriveFolderName,
                                 onRestoreRecord = { viewModel.restoreBackupVersion(it) }
                             )
                             AppScreen.TRANSFERS -> TransferManagerScreen(
@@ -464,6 +488,8 @@ class MainActivity : ComponentActivity() {
                                 savedAccounts = savedAccounts,
                                 oauthDiagnostics = oauthDiagnostics,
                                 signInFeedbackMessage = signInFeedbackMessage,
+                                isAuthorizingAccount = isAuthorizingAccount,
+                                isCreatingOrRenamingDriveFolder = isCreatingOrRenamingDriveFolder,
                                 onLaunchGoogleSignIn = { launchNativeGoogleAccountPicker(false) },
                                 onGrantFullDriveReadScope = authorizeAdditionalDriveReadScope,
                                 onSwitchSavedAccount = { email ->
@@ -471,6 +497,9 @@ class MainActivity : ComponentActivity() {
                                     viewModel.switchActiveSavedAccount(this@MainActivity, email)
                                 },
                                 onVerifyCloudConnection = { viewModel.verifyAndRefreshCloudConnection() },
+                                onCreateOrRenameBackupFolder = { folderName ->
+                                    viewModel.createOrRenameRootBackupFolder(folderName)
+                                },
                                 onDisconnect = { viewModel.disconnectGoogleAccount() }
                             )
                         }
