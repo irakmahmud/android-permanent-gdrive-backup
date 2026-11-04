@@ -78,6 +78,7 @@ object BackupWorkScheduler {
         return Constraints.Builder()
             .setRequiredNetworkType(networkType)
             .setRequiresCharging(settings.chargingOnly)
+            .setRequiresBatteryNotLow(settings.chargingOnly)
             .build()
     }
 
