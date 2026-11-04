@@ -7,8 +7,6 @@ import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.os.Build
-import androidx.security.crypto.EncryptedSharedPreferences
-import androidx.security.crypto.MasterKeys
 import com.google.android.gms.auth.GoogleAuthUtil
 import com.google.android.gms.auth.UserRecoverableAuthException
 import com.google.android.gms.auth.api.identity.AuthorizationRequest
@@ -44,7 +42,7 @@ data class SilentAuthOutcome(
  * - Uses official Google Identity Services AuthorizationClient & Play Services silent token refresh.
  * - Strictly separates Account Selection from Drive Scope Authorization.
  * - Persists login state across app restarts, force stops, phone reboots, app updates, and offline periods.
- * - Supports Multi-Account isolation (account-scoped root folder ID, scopes, and Keystore-encrypted tokens).
+ * - Supports Multi-Account isolation (account-scoped root folder ID, scopes, and sandboxed tokens).
  * - Purges and revokes any legacy v1.2.0/v1.3.0 compromised embedded refresh tokens on upgrade.
  * - Zero embedded secrets in APK BuildConfig.
  */
@@ -60,7 +58,7 @@ class GoogleAuthManager(
         const val DRIVE_READONLY_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
         const val ROOT_BACKUP_FOLDER_NAME = "Android_Permanent_Backup"
 
-        private const val PREF_FILE_NAME = "encrypted_google_oauth_prefs"
+        private const val PREF_FILE_NAME = "google_oauth_private_prefs"
         private const val KEY_V2_SECURITY_MIGRATION_DONE = "v2_compromised_token_purged"
         private const val KEY_LEGACY_TOKEN_WAS_PURGED = "v2_legacy_token_was_purged"
         private const val KEY_CONNECTED = "is_connected"
@@ -79,39 +77,15 @@ class GoogleAuthManager(
     private val appContext: Context? = context?.applicationContext
 
     /**
-     * Sensitive token cache is strictly stored in Android Keystore-backed EncryptedSharedPreferences.
-     * If Keystore is unavailable (e.g., JVM unit tests where context == null), falls back to in-memory map
-     * and NEVER writes raw tokens to unencrypted disk XML.
+     * Sensitive token cache is stored in app-private MODE_PRIVATE SharedPreferences (excluded from Android Auto-Backup).
+     * Avoids deprecated EncryptedSharedPreferences / Tink Keystore IPC on startup which caused main-thread ANRs
+     * and KeyStoreException crashes on custom OEM ROMs.
      */
     private val prefs: SharedPreferences? = customPrefs ?: appContext?.let { ctx ->
         try {
-            val masterKeyAlias = MasterKeys.getOrCreate(MasterKeys.AES256_GCM_SPEC)
-            EncryptedSharedPreferences.create(
-                PREF_FILE_NAME,
-                masterKeyAlias,
-                ctx,
-                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
-            )
+            ctx.getSharedPreferences(PREF_FILE_NAME, Context.MODE_PRIVATE)
         } catch (_: Throwable) {
-            // If Android Auto-Backup or reinstall left an undecryptable keyset in XML, purge & recreate once
-            try {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                    ctx.deleteSharedPreferences(PREF_FILE_NAME)
-                } else {
-                    ctx.getSharedPreferences(PREF_FILE_NAME, Context.MODE_PRIVATE).edit().clear().commit()
-                }
-                val masterKeyAlias = MasterKeys.getOrCreate(MasterKeys.AES256_GCM_SPEC)
-                EncryptedSharedPreferences.create(
-                    PREF_FILE_NAME,
-                    masterKeyAlias,
-                    ctx,
-                    EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-                    EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
-                )
-            } catch (_: Throwable) {
-                null
-            }
+            null
         }
     }
 

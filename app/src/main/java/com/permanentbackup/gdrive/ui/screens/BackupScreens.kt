@@ -329,7 +329,7 @@ fun HomeDashboardScreen(
                                 "• Phone: /storage/emulated/0/Download  ➔  Google Drive: My Drive / $rootDriveName / Download\n" +
                                 "• Phone: /storage/emulated/0/Documents  ➔  Google Drive: My Drive / $rootDriveName / Documents\n" +
                                 "• Phone: /storage/emulated/0/Music  ➔  Google Drive: My Drive / $rootDriveName / Music\n" +
-                                "• Phone: /storage/emulated/0/Android/media/com.whatsapp/WhatsApp/Media  ➔  Google Drive: My Drive / $rootDriveName / WhatsApp",
+                                "• Phone: /storage/emulated/0/Android/media  ➔  Google Drive: My Drive / $rootDriveName / Android/media",
                             style = MaterialTheme.typography.bodySmall
                         )
                     } else {

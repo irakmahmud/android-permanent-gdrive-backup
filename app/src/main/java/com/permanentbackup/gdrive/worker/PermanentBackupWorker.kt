@@ -41,7 +41,9 @@ class PermanentBackupWorker(
             val currentSettings = app.repository.settings.value
             // Re-arm one-time ContentUriTrigger observer for continuous real-time MediaStore watching
             BackupWorkScheduler.scheduleContentUriTriggeredBackup(applicationContext, currentSettings)
-            runCatching { PermanentBackupForegroundService.startManualBackupService(applicationContext) }
+            if (!PermanentBackupForegroundService.wakeUpIfRunning() && app.isProcessInForeground()) {
+                runCatching { PermanentBackupForegroundService.startManualBackupService(applicationContext) }
+            }
 
             // Automatic trigger: respect each failed file's exponential retry backoff window
             val summary = app.repository.runBackupNow(respectRetryBackoff = true)
@@ -76,7 +78,6 @@ object BackupWorkScheduler {
         return Constraints.Builder()
             .setRequiredNetworkType(networkType)
             .setRequiresCharging(settings.chargingOnly)
-            .setRequiresBatteryNotLow(true)
             .build()
     }
 
@@ -118,12 +119,11 @@ object BackupWorkScheduler {
             val constraints = Constraints.Builder()
                 .setRequiredNetworkType(networkType)
                 .setRequiresCharging(settings.chargingOnly)
-                .setRequiresBatteryNotLow(true)
                 .addContentUriTrigger(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, true)
                 .addContentUriTrigger(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, true)
                 .addContentUriTrigger(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, true)
-                .setTriggerContentUpdateDelay(10, TimeUnit.SECONDS)
-                .setTriggerContentMaxDelay(60, TimeUnit.SECONDS)
+                .setTriggerContentUpdateDelay(5, TimeUnit.SECONDS)
+                .setTriggerContentMaxDelay(30, TimeUnit.SECONDS)
                 .build()
 
             val request = OneTimeWorkRequestBuilder<PermanentBackupWorker>()
@@ -150,7 +150,7 @@ object BackupWorkScheduler {
 
             WorkManager.getInstance(context).enqueueUniqueWork(
                 IMMEDIATE_RETRY_WORK_NAME,
-                ExistingWorkPolicy.KEEP,
+                ExistingWorkPolicy.REPLACE,
                 request
             )
         } catch (_: Throwable) {
@@ -297,7 +297,9 @@ class BootCompletedReceiver : BroadcastReceiver() {
             val settings = app?.repository?.settings?.value ?: BackupSettings()
             BackupWorkScheduler.schedulePeriodicBackup(context, settings)
             BackupWorkScheduler.enqueueImmediateRetryWork(context, settings)
-            runCatching { PermanentBackupForegroundService.startManualBackupService(context) }
+            if (!PermanentBackupForegroundService.wakeUpIfRunning() && app?.isProcessInForeground() == true) {
+                runCatching { PermanentBackupForegroundService.startManualBackupService(context) }
+            }
         }
     }
 }

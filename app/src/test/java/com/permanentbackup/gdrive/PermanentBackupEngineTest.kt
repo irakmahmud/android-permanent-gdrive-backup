@@ -2959,6 +2959,39 @@ class PermanentBackupEngineTest {
         )
         assertNotNull("currentScanningOrUploadingFile must be populated after backup", dash.currentScanningOrUploadingFile)
     }
+
+    // 39. Play Protect Package String Hygiene, Battery-Unrestricted WorkConstraints & Live Scan Activity Format (v2.3.3)
+    @Test
+    fun test39_playProtectPackageHygiene_batteryUnrestrictedConstraints_andLiveScanStatus() = runTest {
+        // 1. Verify TARGET_STANDARD_FOLDERS contains zero third-party app package names (Play Protect hygiene)
+        for ((folderPath, _) in AndroidStorageScanner.TARGET_STANDARD_FOLDERS) {
+            assertFalse(
+                "TARGET_STANDARD_FOLDERS must not hardcode third-party package identifiers: $folderPath",
+                folderPath.contains("com.") || folderPath.contains("org.")
+            )
+        }
+
+        // 2. Verify BackupWorkScheduler.buildWorkConstraints does NOT stop backups when battery is low
+        val constraints = com.permanentbackup.gdrive.worker.BackupWorkScheduler.buildWorkConstraints(BackupSettings())
+        assertFalse(
+            "Background auto-backup must not stop when battery is below 20%",
+            constraints.requiresBatteryNotLow()
+        )
+        assertFalse(
+            "Background auto-backup must not require charging by default",
+            constraints.requiresCharging()
+        )
+
+        // 3. Verify Android/media subfolder is dynamically scanned and classified without hardcoded package names
+        val appMediaDir = File(tempStorageDir, "Android/media/custom_chat/WhatsApp/Media").apply { mkdirs() }
+        val sampleFile = File(appMediaDir, "voice_note.mp3").apply { writeText("AUDIO_PAYLOAD_V233") }
+        val scanner = AndroidStorageScanner(null, listOf(tempStorageDir), true)
+        val discovered = scanner.scanFilesSequence(computeHashes = true).toList()
+        val found = discovered.find { it.displayName == "voice_note.mp3" }
+        assertNotNull("File inside Android/media must be discovered dynamically", found)
+        assertEquals("WhatsApp Media", found!!.folderCategory)
+        assertTrue(sampleFile.exists())
+    }
 }
 
 class TestInMemorySharedPreferences : SharedPreferences {

@@ -593,6 +593,9 @@ abstract class PermanentBackupDatabase : RoomDatabase() {
 
         private fun buildAndVerifyDatabase(appContext: Context): PermanentBackupDatabase {
             val candidate = buildDatabase(appContext)
+            if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+                return candidate
+            }
             return try {
                 candidate.openHelper.writableDatabase
                 candidate

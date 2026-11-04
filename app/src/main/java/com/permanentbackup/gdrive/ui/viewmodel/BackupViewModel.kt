@@ -158,6 +158,12 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    @Volatile
+    private var lastCoverageScanMs: Long = 0L
+    @Volatile
+    private var hasVerifiedDbIntegrityOnce: Boolean = false
+    private var dashboardRefreshJob: kotlinx.coroutines.Job? = null
+
     init {
         viewModelScope.launch(vmExceptionHandler) {
             withContext(Dispatchers.IO) {
@@ -167,12 +173,13 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
                 runCatching { BackupWorkScheduler.scheduleContentUriTriggeredBackup(getApplication(), settings.value) }
                 runCatching { ensureAutoBackupRunning() }
             }
-            refreshDashboardAndCoverage(fetchRemoteQuota = true)
+            refreshDashboardAndCoverage(fetchRemoteQuota = true, forceCoverage = true)
             refreshLocalPhoneBrowser("")
         }
 
         // Real-time stream of active scan/upload activity so the UI immediately shows which phone folder/file is backing up
         viewModelScope.launch(Dispatchers.IO + vmExceptionHandler) {
+            var wasRunning = false
             combine(
                 repository.backupEngine.activeUploadProgress,
                 repository.backupEngine.currentScanActivity,
@@ -181,9 +188,20 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
                 Triple(progress, scanActivity, running)
             }.collectLatest { (progress, scanActivity, running) ->
                 val current = _dashboardSummary.value
-                val phoneSource = progress?.let { "/storage/emulated/0/${it.relativePath.trimStart('/')}" }
-                    ?: current.currentPhoneSourcePath
                 val rootFolderName = current.accountState.rootDriveFolderName.ifBlank { "Android_Permanent_Backup" }
+                val parsedFromScanPhone = scanActivity
+                    ?.substringAfter("From Phone: ", "")
+                    ?.substringBefore(" →", "")
+                    ?.trim()
+                    ?.takeIf { it.isNotBlank() }
+                val parsedFromScanDrive = scanActivity
+                    ?.substringAfter("To Google Drive: ", "")
+                    ?.trim()
+                    ?.takeIf { it.isNotBlank() }
+
+                val phoneSource = progress?.let { "/storage/emulated/0/${it.relativePath.trimStart('/')}" }
+                    ?: parsedFromScanPhone
+                    ?: current.currentPhoneSourcePath
                 val driveTarget = progress?.let {
                     val parentFolder = it.relativePath.replace('\\', '/').substringBeforeLast('/', "")
                     if (parentFolder.isNotBlank()) {
@@ -191,7 +209,8 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
                     } else {
                         "My Drive / $rootFolderName / ${it.fileName}"
                     }
-                } ?: current.currentDriveTargetPath
+                } ?: parsedFromScanDrive ?: current.currentDriveTargetPath
+
                 _dashboardSummary.value = current.copy(
                     isBackupRunning = running,
                     currentlyUploading = progress,
@@ -200,6 +219,11 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
                     currentScanningOrUploadingFile = scanActivity ?: current.currentScanningOrUploadingFile,
                     isContinuousAutoBackupServiceActive = !settings.value.backgroundSyncPaused
                 )
+
+                if (wasRunning && !running) {
+                    refreshDashboardAndCoverage(fetchRemoteQuota = false, forceCoverage = true)
+                }
+                wasRunning = running
             }
         }
     }
@@ -217,9 +241,17 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    fun onStoragePermissionsGranted() {
+        viewModelScope.launch(Dispatchers.IO + vmExceptionHandler) {
+            runCatching { fileObserverManager.startWatching() }
+            runCatching { ensureAutoBackupRunning() }
+            refreshDashboardAndCoverage(fetchRemoteQuota = false, forceCoverage = true)
+            refreshLocalPhoneBrowser(_currentLocalPath.value)
+        }
+    }
+
     fun onAppResumed() {
-        ensureAutoBackupRunning()
-        refreshDashboardAndCoverage(fetchRemoteQuota = false)
+        onStoragePermissionsGranted()
     }
 
     override fun onCleared() {
@@ -227,18 +259,38 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
         super.onCleared()
     }
 
-    fun refreshDashboardAndCoverage(fetchRemoteQuota: Boolean = false) {
-        viewModelScope.launch(vmExceptionHandler) {
+    fun refreshDashboardAndCoverage(
+        fetchRemoteQuota: Boolean = false,
+        forceCoverage: Boolean = false
+    ) {
+        if (!fetchRemoteQuota && !forceCoverage && dashboardRefreshJob?.isActive == true) {
+            return
+        }
+        dashboardRefreshJob = viewModelScope.launch(vmExceptionHandler) {
             withContext(Dispatchers.IO) {
                 if (fetchRemoteQuota && repository.authManager.accountState.value.isConnected) {
                     runCatching { repository.backupEngine.refreshRemoteQuotaAndRootFolder() }
                     runCatching { repository.backupEngine.syncCloudChangesIncremental() }
                     runCatching { repository.persistCurrentAccountToDatabase() }
                 }
-                val dbOk = runCatching {
-                    app.database.checkDatabaseIntegrity() || app.database.attemptNonDestructiveRecovery()
-                }.getOrDefault(true)
-                val coverage = runCatching { repository.getFolderCoverageItems() }.getOrDefault(emptyList())
+                val dbOk = if (!hasVerifiedDbIntegrityOnce) {
+                    hasVerifiedDbIntegrityOnce = true
+                    runCatching {
+                        app.database.checkDatabaseIntegrity() || app.database.attemptNonDestructiveRecovery()
+                    }.getOrDefault(true)
+                } else {
+                    _dashboardSummary.value.dbIntegrityOk
+                }
+                val now = System.currentTimeMillis()
+                val coverage = if (forceCoverage ||
+                    _folderCoverage.value.isEmpty() ||
+                    now - lastCoverageScanMs > 15_000L
+                ) {
+                    lastCoverageScanMs = now
+                    runCatching { repository.getFolderCoverageItems() }.getOrDefault(_folderCoverage.value)
+                } else {
+                    _folderCoverage.value
+                }
                 val summary = runCatching {
                     repository.buildDashboardSummary(precomputedCoverage = coverage).copy(dbIntegrityOk = dbOk)
                 }.getOrDefault(DashboardSummary(dbIntegrityOk = dbOk))
@@ -252,7 +304,9 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
                 _accountBackupVersions.value = versions
                 _oauthDiagnostics.value = diag
             }
-            refreshCloudDriveExplorer()
+            if (fetchRemoteQuota) {
+                refreshCloudDriveExplorer()
+            }
         }
     }
 

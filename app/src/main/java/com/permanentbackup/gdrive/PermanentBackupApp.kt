@@ -46,14 +46,27 @@ class PermanentBackupApp : Application() {
             runCatching { repository.syncPersistedAccountOnStartup() }
             runCatching { BackupWorkScheduler.schedulePeriodicBackup(this@PermanentBackupApp, repository.settings.value) }
             runCatching { BackupWorkScheduler.enqueueImmediateRetryWork(this@PermanentBackupApp, repository.settings.value) }
-            runCatching { PermanentBackupForegroundService.startManualBackupService(this@PermanentBackupApp) }
+            if (isProcessInForeground()) {
+                runCatching { PermanentBackupForegroundService.startManualBackupService(this@PermanentBackupApp) }
+            }
+        }
+    }
+
+    fun isProcessInForeground(): Boolean {
+        return try {
+            val appProcessInfo = android.app.ActivityManager.RunningAppProcessInfo()
+            android.app.ActivityManager.getMyMemoryState(appProcessInfo)
+            appProcessInfo.importance <= android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND_SERVICE
+        } catch (_: Throwable) {
+            false
         }
     }
 
     /**
      * Global crash shield ensuring the app never crashes on any click or background operation:
      * - Catches uncaught exceptions on background threads without terminating the process.
-     * - Recovers the Android Main Looper if an unexpected UI exception ever reaches the top level.
+     * - Recovers the Android Main Looper if an unexpected transient UI exception ever reaches the top level,
+     *   with rate-limiting so corrupted Choreographer frames never cause a 100% CPU freeze.
      */
     private fun installGlobalCrashShield() {
         try {
@@ -65,6 +78,8 @@ class PermanentBackupApp : Application() {
                     false
                 }
                 if (isMainThread) {
+                    var consecutiveFastCrashes = 0
+                    var lastCrashMs = System.currentTimeMillis()
                     while (true) {
                         try {
                             Looper.loop()
@@ -73,6 +88,20 @@ class PermanentBackupApp : Application() {
                                 previousHandler?.uncaughtException(thread, inner)
                                 break
                             }
+                            val now = System.currentTimeMillis()
+                            if (now - lastCrashMs < 300L) {
+                                consecutiveFastCrashes++
+                                if (consecutiveFastCrashes > 5) {
+                                    try {
+                                        Thread.sleep(500L)
+                                    } catch (_: Throwable) {
+                                    }
+                                    consecutiveFastCrashes = 0
+                                }
+                            } else {
+                                consecutiveFastCrashes = 0
+                            }
+                            lastCrashMs = now
                         }
                     }
                 } else {

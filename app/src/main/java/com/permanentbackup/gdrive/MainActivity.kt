@@ -317,7 +317,15 @@ class MainActivity : ComponentActivity() {
                                 currentScreen = currentScreen,
                                 onSelectScreen = { selected ->
                                     currentScreen = selected
-                                    viewModel.refreshDashboardAndCoverage()
+                                    when (selected) {
+                                        AppScreen.HOME -> viewModel.refreshDashboardAndCoverage(
+                                            fetchRemoteQuota = false,
+                                            forceCoverage = false
+                                        )
+                                        AppScreen.MY_DRIVE -> viewModel.refreshCloudDriveExplorer()
+                                        AppScreen.PHONE_STORAGE -> viewModel.refreshLocalPhoneBrowser(currentLocalPath)
+                                        else -> {}
+                                    }
                                 }
                             )
                             HorizontalDivider()

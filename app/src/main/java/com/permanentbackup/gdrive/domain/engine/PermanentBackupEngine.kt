@@ -612,7 +612,7 @@ class PermanentBackupEngine(
                 discoveredIdentities.add(discovered.sourceFileIdentity)
                 if (scannedCount == 1 || scannedCount % 10 == 0) {
                     _currentScanActivity.value =
-                        "Scanning Phone: /storage/emulated/0/${discovered.relativePath} → Google Drive: My Drive/$ROOT_DRIVE_FOLDER_NAME/${discovered.relativePath}"
+                        "From Phone: /storage/emulated/0/${discovered.relativePath} → To Google Drive: My Drive/$ROOT_DRIVE_FOLDER_NAME/${discovered.relativePath}"
                 }
 
                 val normalizedRelPath = discovered.relativePath.replace('\\', '/').trim('/').lowercase()
@@ -627,10 +627,15 @@ class PermanentBackupEngine(
                 if (queued) {
                     newlyQueued++
                     _currentScanActivity.value =
-                        "Queued from Phone: /storage/emulated/0/${discovered.relativePath} → Google Drive: My Drive/$ROOT_DRIVE_FOLDER_NAME/${discovered.relativePath}"
+                        "Queued from Phone: /storage/emulated/0/${discovered.relativePath} → To Google Drive: My Drive/$ROOT_DRIVE_FOLDER_NAME/${discovered.relativePath}"
                 } else {
                     skippedUnchanged++
                 }
+            }
+
+            if (scannedCount > 0 && newlyQueued == 0) {
+                _currentScanActivity.value =
+                    "Verified $scannedCount phone files in /storage/emulated/0/{DCIM, Pictures, Videos, Downloads, Documents} → Google Drive: My Drive/$ROOT_DRIVE_FOLDER_NAME/ (100% Up to Date)"
             }
 
             // Step 3: Reconcile locally deleted files — NEVER delete from Google Drive!

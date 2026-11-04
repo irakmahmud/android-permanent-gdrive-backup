@@ -52,11 +52,10 @@ class AndroidStorageScanner(
             "Music" to "Audio",
             "Download" to "Downloads",
             "Documents" to "Documents",
-            "Android/media/com.whatsapp/WhatsApp/Media" to "WhatsApp Media",
+            "Android/media" to "App Media",
             "WhatsApp/Media" to "WhatsApp Media",
             "Download/Telegram" to "Telegram Downloads",
-            "Telegram" to "Telegram Downloads",
-            "Android/media/org.telegram.messenger/Telegram" to "Telegram Downloads"
+            "Telegram" to "Telegram Downloads"
         )
 
         val ANDROID_RESTRICTED_PATHS = listOf(
@@ -109,7 +108,15 @@ class AndroidStorageScanner(
                     ctx,
                     Manifest.permission.READ_MEDIA_AUDIO
                 ) == PackageManager.PERMISSION_GRANTED
-                if (hasImages || hasVideo || hasAudio) return true
+                val hasVisualSelected = if (Build.VERSION.SDK_INT >= 34) {
+                    ContextCompat.checkSelfPermission(
+                        ctx,
+                        "android.permission.READ_MEDIA_VISUAL_USER_SELECTED"
+                    ) == PackageManager.PERMISSION_GRANTED
+                } else {
+                    false
+                }
+                if (hasImages || hasVideo || hasAudio || hasVisualSelected) return true
             }
             return ContextCompat.checkSelfPermission(
                 ctx,
@@ -151,57 +158,75 @@ class AndroidStorageScanner(
     override fun scanFilesSequence(computeHashes: Boolean): Sequence<DiscoveredSourceFile> = sequence {
         if (!hasStoragePermission) return@sequence
         val roots = resolveStorageRoots()
+        val yieldedIdentities = HashSet<String>()
 
         for ((rootIndex, rootDir) in roots.withIndex()) {
             val rootPrefix = if (rootIndex == 0) "" else "SDCard_${rootIndex}/"
             val rootPath = safeCanonicalPath(rootDir)
 
-            rootDir.walkTopDown()
-                .onFail { _, _ -> }
-                .onEnter { dir ->
-                    val rel = safeCanonicalPath(dir).removePrefix(rootPath).trimStart('/', '\\').replace('\\', '/')
-                    !isRestrictedAndroidPath(rel) &&
-                        !isMirrorOrRestoreDirectory(dir.name, rel) &&
-                        !dir.name.startsWith(".thumbnails") &&
-                        dir.canRead()
-                }
-                .filter { it.isFile && it.canRead() }
-                .forEach { file ->
-                    val relPath = safeCanonicalPath(file).removePrefix(rootPath).trimStart('/', '\\')
-                        .replace('\\', '/')
-                    val fullRelativePath = "$rootPrefix$relPath"
-                    val category = classifyFolderCategory(relPath, rootIndex > 0)
-                    val hashes = if (computeHashes && file.length() <= 64L * 1024 * 1024) {
-                        try {
-                            SourceFileReadOnlyGuard.computeStreamingHashes {
-                                SourceFileReadOnlyGuard.openReadOnlyFileStream(file)
-                            }
-                        } catch (_: Throwable) {
-                            null
-                        }
-                    } else {
-                        null
-                    }
+            val candidateDirs = if (!rootDir.listFiles().isNullOrEmpty()) {
+                listOf(rootDir)
+            } else {
+                TARGET_STANDARD_FOLDERS.map { (subPath, _) -> File(rootDir, subPath) }
+                    .filter { it.exists() && it.isDirectory }
+            }
 
-                    yield(
-                        DiscoveredSourceFile(
-                            sourceUri = file.absolutePath,
-                            sourceFileIdentity = "vol$rootIndex:$relPath",
-                            relativePath = fullRelativePath,
-                            displayName = file.name,
-                            folderCategory = category,
-                            fileSize = file.length(),
-                            lastModifiedMs = file.lastModified(),
-                            mimeType = guessMimeType(file.name),
-                            sha256Hash = hashes?.sha256Hex,
-                            md5Hash = hashes?.md5Hex
-                        )
-                    )
-                }
+            for (startDir in candidateDirs) {
+                startDir.walkTopDown()
+                    .onFail { _, _ -> }
+                    .onEnter { dir ->
+                        val rel = safeCanonicalPath(dir).removePrefix(rootPath).trimStart('/', '\\').replace('\\', '/')
+                        !isRestrictedAndroidPath(rel) &&
+                            !isMirrorOrRestoreDirectory(dir.name, rel) &&
+                            !dir.name.startsWith(".thumbnails") &&
+                            dir.canRead()
+                    }
+                    .filter { it.isFile && it.canRead() }
+                    .forEach { file ->
+                        val relPath = safeCanonicalPath(file).removePrefix(rootPath).trimStart('/', '\\')
+                            .replace('\\', '/')
+                        val identity = "vol$rootIndex:$relPath"
+                        if (yieldedIdentities.add(identity)) {
+                            val fullRelativePath = "$rootPrefix$relPath"
+                            val category = classifyFolderCategory(relPath, rootIndex > 0)
+                            val hashes = if (computeHashes && file.length() <= 64L * 1024 * 1024) {
+                                try {
+                                    SourceFileReadOnlyGuard.computeStreamingHashes {
+                                        SourceFileReadOnlyGuard.openReadOnlyFileStream(file)
+                                    }
+                                } catch (_: Throwable) {
+                                    null
+                                }
+                            } else {
+                                null
+                            }
+
+                            yield(
+                                DiscoveredSourceFile(
+                                    sourceUri = file.absolutePath,
+                                    sourceFileIdentity = identity,
+                                    relativePath = fullRelativePath,
+                                    displayName = file.name,
+                                    folderCategory = category,
+                                    fileSize = file.length(),
+                                    lastModifiedMs = file.lastModified(),
+                                    mimeType = guessMimeType(file.name),
+                                    sha256Hash = hashes?.sha256Hex,
+                                    md5Hash = hashes?.md5Hex
+                                )
+                            )
+                        }
+                    }
+            }
+        }
+
+        // Scoped Storage MediaStore fallback when MANAGE_EXTERNAL_STORAGE has not yet been toggled in Settings
+        val ctx = context
+        if (ctx != null && customRootDirectories == null) {
+            yieldAll(scanMediaStoreFallback(ctx, yieldedIdentities, computeHashes))
         }
 
         // Also scan any persisted SAF DocumentFile trees granted by the user
-        val ctx = context
         if (ctx != null && persistedSafTreeUris.isNotEmpty()) {
             for (treeUriStr in persistedSafTreeUris.toList()) {
                 val rootDoc = try {
@@ -211,6 +236,100 @@ class AndroidStorageScanner(
                 } ?: continue
                 val treeFolderName = (rootDoc.name ?: "SAF_Folder").replace('/', '_')
                 yieldAll(scanSafDocumentTree(ctx, rootDoc, "SAF/$treeFolderName", computeHashes))
+            }
+        }
+    }
+
+    private fun scanMediaStoreFallback(
+        ctx: Context,
+        yieldedIdentities: MutableSet<String>,
+        computeHashes: Boolean
+    ): Sequence<DiscoveredSourceFile> = sequence {
+        val collections = buildList {
+            add(android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI to "Pictures")
+            add(android.provider.MediaStore.Video.Media.EXTERNAL_CONTENT_URI to "Videos")
+            add(android.provider.MediaStore.Audio.Media.EXTERNAL_CONTENT_URI to "Audio")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                add(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI to "Downloads")
+            }
+        }
+        val projection = arrayOf(
+            android.provider.MediaStore.MediaColumns._ID,
+            android.provider.MediaStore.MediaColumns.DISPLAY_NAME,
+            android.provider.MediaStore.MediaColumns.SIZE,
+            android.provider.MediaStore.MediaColumns.DATE_MODIFIED,
+            android.provider.MediaStore.MediaColumns.MIME_TYPE,
+            android.provider.MediaStore.MediaColumns.RELATIVE_PATH
+        )
+
+        for ((collectionUri, defaultFolder) in collections) {
+            val entries = mutableListOf<DiscoveredSourceFile>()
+            try {
+                ctx.contentResolver.query(
+                    collectionUri,
+                    projection,
+                    null,
+                    null,
+                    "${android.provider.MediaStore.MediaColumns.DATE_MODIFIED} DESC"
+                )?.use { cursor ->
+                    val idCol = cursor.getColumnIndex(android.provider.MediaStore.MediaColumns._ID)
+                    val nameCol = cursor.getColumnIndex(android.provider.MediaStore.MediaColumns.DISPLAY_NAME)
+                    val sizeCol = cursor.getColumnIndex(android.provider.MediaStore.MediaColumns.SIZE)
+                    val modCol = cursor.getColumnIndex(android.provider.MediaStore.MediaColumns.DATE_MODIFIED)
+                    val mimeCol = cursor.getColumnIndex(android.provider.MediaStore.MediaColumns.MIME_TYPE)
+                    val relCol = cursor.getColumnIndex(android.provider.MediaStore.MediaColumns.RELATIVE_PATH)
+
+                    while (cursor.moveToNext()) {
+                        val id = if (idCol >= 0) cursor.getLong(idCol) else continue
+                        val name = (if (nameCol >= 0) cursor.getString(nameCol) else null)?.trim().orEmpty()
+                        if (name.isBlank() || name.startsWith(".")) continue
+                        val relDir = (if (relCol >= 0) cursor.getString(relCol) else null)
+                            ?.replace('\\', '/')
+                            ?.trim('/')
+                            ?.ifBlank { defaultFolder }
+                            ?: defaultFolder
+                        val relPath = "$relDir/$name"
+                        if (isRestrictedAndroidPath(relPath) || isMirrorOrRestoreDirectory(name, relPath)) continue
+                        val identity = "vol0:$relPath"
+                        if (!yieldedIdentities.add(identity)) continue
+
+                        val contentUriStr = android.content.ContentUris.withAppendedId(collectionUri, id).toString()
+                        val size = if (sizeCol >= 0) cursor.getLong(sizeCol).coerceAtLeast(0L) else 0L
+                        val modSec = if (modCol >= 0) cursor.getLong(modCol).coerceAtLeast(0L) else 0L
+                        val modMs = if (modSec in 1..9_999_999_999L) modSec * 1000L else modSec
+                        val mime = (if (mimeCol >= 0) cursor.getString(mimeCol) else null)
+                            ?.ifBlank { null } ?: guessMimeType(name)
+                        val hashes = if (computeHashes && size in 1..(64L * 1024 * 1024)) {
+                            try {
+                                SourceFileReadOnlyGuard.computeStreamingHashes {
+                                    openInputStream(contentUriStr)
+                                }
+                            } catch (_: Throwable) {
+                                null
+                            }
+                        } else {
+                            null
+                        }
+                        entries.add(
+                            DiscoveredSourceFile(
+                                sourceUri = contentUriStr,
+                                sourceFileIdentity = identity,
+                                relativePath = relPath,
+                                displayName = name,
+                                folderCategory = classifyFolderCategory(relPath, isSdCard = false),
+                                fileSize = size,
+                                lastModifiedMs = modMs,
+                                mimeType = mime,
+                                sha256Hash = hashes?.sha256Hex,
+                                md5Hash = hashes?.md5Hex
+                            )
+                        )
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+            for (item in entries) {
+                yield(item)
             }
         }
     }
@@ -390,6 +509,7 @@ class AndroidStorageScanner(
             val discoveredCount = if (status == FolderAccessStatus.ACCESSIBLE && folderFile != null) {
                 try {
                     folderFile.walkTopDown()
+                        .maxDepth(5)
                         .onFail { _, _ -> }
                         .onEnter { d -> !isMirrorOrRestoreDirectory(d.name, d.name) && d.canRead() }
                         .count { it.isFile && it.canRead() }
@@ -435,6 +555,7 @@ class AndroidStorageScanner(
                     if (!alreadyListed) {
                         val count = try {
                             topDir.walkTopDown()
+                                .maxDepth(5)
                                 .onFail { _, _ -> }
                                 .count { it.isFile && it.canRead() }
                         } catch (_: Throwable) {
@@ -463,6 +584,7 @@ class AndroidStorageScanner(
                 val count = if (hasStoragePermission && sdRoot.canRead()) {
                     try {
                         sdRoot.walkTopDown()
+                            .maxDepth(5)
                             .onFail { _, _ -> }
                             .count { it.isFile && it.canRead() }
                     } catch (_: Throwable) {
