@@ -253,10 +253,13 @@ class PermanentBackupEngine(
     }
 
     /**
-     * Connects to Google Drive API v3, refreshes storage quota info, and ensures
-     * the active root backup folder exists on Google Drive.
+     * Connects to Google Drive API v3, refreshes storage quota info, and verifies whether
+     * the active root backup folder actually exists on Google Drive (or creates it if
+     * [createFolderIfMissing] is true). If the folder does not exist on Google Drive and
+     * [createFolderIfMissing] is false, clears any stale `rootDriveFolderId` so the UI
+     * never falsely claims the folder is created.
      */
-    suspend fun refreshRemoteQuotaAndRootFolder(): Boolean {
+    suspend fun refreshRemoteQuotaAndRootFolder(createFolderIfMissing: Boolean = false): Boolean {
         if (!authManager.accountState.value.isConnected) return false
         _isVerifyingOrCreatingDriveFolder.value = true
         return try {
@@ -270,16 +273,21 @@ class PermanentBackupEngine(
             _latestQuotaInfo.value = quota
             _quotaFullState.value = quota.isQuotaFull
 
-            val currentRoot = authManager.accountState.value.rootDriveFolderId
-            if (currentRoot.isNullOrBlank()) {
-                val rootName = activeRootFolderName()
-                val rootId = driveApiClient.ensureFolderExists(
+            val rootName = activeRootFolderName()
+            val verifiedRootId = if (createFolderIfMissing) {
+                driveApiClient.ensureFolderExists(
                     accessToken = token,
                     folderName = rootName,
                     parentFolderId = null
                 )
-                authManager.setRootDriveFolderName(rootName, rootId)
+            } else {
+                driveApiClient.findFolderByName(
+                    accessToken = token,
+                    folderName = rootName,
+                    parentFolderId = null
+                )
             }
+            authManager.setRootDriveFolderName(rootName, verifiedRootId)
             _lastNetworkError.value = null
             true
         } catch (e: Exception) {
@@ -1960,10 +1968,10 @@ class PermanentBackupEngine(
 
         return folderCreationMutex.withLock {
             val accountPrefix = currentAccountId()
-            val rootScope = if (activeRootFolderName() == ROOT_DRIVE_FOLDER_NAME) {
-                accountPrefix
-            } else {
+            val rootScope = if (rootFolderId.isNotBlank()) {
                 "$accountPrefix:$rootFolderId"
+            } else {
+                accountPrefix
             }
             val scopedParentKey = "$rootScope:$parentPath"
             backupDao.getCachedDriveFolder(scopedParentKey)?.let { return@withLock it.driveFolderId }

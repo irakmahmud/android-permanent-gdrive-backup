@@ -422,23 +422,19 @@ class BackupRepository(
             val effectiveParent = when {
                 !parentFolderId.isNullOrBlank() -> parentFolderId
                 filter == DriveViewFilter.BACKUP_ROOT -> {
-                    val cachedRoot = authManager.accountState.value.rootDriveFolderId
-                    if (!cachedRoot.isNullOrBlank()) {
-                        cachedRoot
+                    val activeRootName = backupEngine.activeRootFolderName()
+                    val existingRoot = driveApiClient.findFolderByName(
+                        accessToken = token,
+                        folderName = activeRootName,
+                        parentFolderId = null
+                    )
+                    if (!existingRoot.isNullOrBlank()) {
+                        authManager.setRootDriveFolderName(activeRootName, existingRoot)
+                        existingRoot
                     } else {
-                        val activeRootName = backupEngine.activeRootFolderName()
-                        val existingRoot = driveApiClient.findFolderByName(
-                            accessToken = token,
-                            folderName = activeRootName,
-                            parentFolderId = null
-                        )
-                        if (!existingRoot.isNullOrBlank()) {
-                            authManager.setRootDriveFolderName(activeRootName, existingRoot)
-                            existingRoot
-                        } else {
-                            _cloudNextPageToken.value = null
-                            return emptyList()
-                        }
+                        authManager.setRootDriveFolderName(activeRootName, null)
+                        _cloudNextPageToken.value = null
+                        return emptyList()
                     }
                 }
                 else -> null
@@ -1061,7 +1057,9 @@ class BackupRepository(
 
     suspend fun getFolderCoverageItems(): List<FolderCoverageItem> {
         val accountId = currentAccountId()
+        val accState = authManager.accountState.value
         val activeRootName = backupEngine.activeRootFolderName()
+        val isRootCreated = accState.isConnected && !accState.rootDriveFolderId.isNullOrBlank()
         val baseItems = storageSource.getFolderCoverageReport(emptyMap())
         val savedFolders = backupDao.getBackupFoldersForAccount(accountId)
         val savedByPath = savedFolders.associateBy { it.relativePath }
@@ -1078,9 +1076,19 @@ class BackupRepository(
             } else {
                 item.backupEnabled
             }
+            val dynamicExplanation = when {
+                item.accessStatus == FolderAccessStatus.RESTRICTED_BY_ANDROID_OS -> item.restrictionExplanation
+                item.accessStatus == FolderAccessStatus.PERMISSION_REQUIRED -> item.restrictionExplanation
+                item.accessStatus == FolderAccessStatus.NOT_PRESENT_ON_DEVICE -> item.restrictionExplanation
+                !enabled -> "Auto-Backup disabled by user for ${item.relativePath}"
+                !accState.isConnected -> "Auto-Backup enabled locally (${item.relativePath}) — waiting for Google Account connection"
+                !isRootCreated -> "Auto-Backup enabled (${item.relativePath}) — Drive folder '$activeRootName' will be created when backup runs"
+                else -> "Full Read-Only Backup Active -> My Drive/$activeRootName/${item.relativePath}"
+            }
             item.copy(
                 backedUpFileCount = backedUp,
-                backupEnabled = enabled
+                backupEnabled = enabled,
+                restrictionExplanation = dynamicExplanation
             )
         }
         val existingPaths = standardMerged.map { it.relativePath.lowercase() }.toSet()
@@ -1088,6 +1096,12 @@ class BackupRepository(
         val customExtras = savedFolders.filter { sf ->
             sf.relativePath.lowercase() !in existingPaths && sf.folderName.lowercase() !in existingNames
         }.map { sf ->
+            val customExplanation = when {
+                !sf.backupEnabled -> "Custom subfolder rule disabled by user (${sf.relativePath})"
+                !accState.isConnected -> "Custom subfolder rule (${sf.relativePath}) — waiting for Google Account connection"
+                !isRootCreated -> "Custom subfolder rule (${sf.relativePath}) — Drive folder '$activeRootName' will be created when backup runs"
+                else -> "Custom subfolder rule -> My Drive/$activeRootName/${sf.relativePath}"
+            }
             FolderCoverageItem(
                 folderName = "Custom: ${sf.folderName}",
                 relativePath = sf.relativePath,
@@ -1095,7 +1109,7 @@ class BackupRepository(
                     .getOrDefault(FolderAccessStatus.ACCESSIBLE),
                 discoveredFileCount = sf.discoveredFileCount,
                 backedUpFileCount = sf.backedUpFileCount,
-                restrictionExplanation = "Custom subfolder rule -> $activeRootName/${sf.relativePath}",
+                restrictionExplanation = customExplanation,
                 backupEnabled = sf.backupEnabled,
                 lastScanTimeMs = sf.lastScanTimeMs
             )

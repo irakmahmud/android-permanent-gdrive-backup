@@ -844,7 +844,7 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
                 val folderStatus = if (!state.rootDriveFolderId.isNullOrBlank()) {
                     "✓ Folder '$folderName' is created on Google Drive (My Drive/$folderName)."
                 } else {
-                    "Folder '$folderName' could not be created yet (${repository.backupEngine.lastNetworkError.value ?: "will retry on sync"})."
+                    "Folder '$folderName' is not created on Google Drive yet (it will be created when backup runs, or tap 'Create Folder Now' / 'Rename' to create it now)."
                 }
                 _signInStatusMessage.value =
                     "✓ Google Account (${state.email}) Connected! $folderStatus"
@@ -893,7 +893,7 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
                         repository.authManager.authorizeViaCloudDriveBridge("")
                     }
                 }
-                val quotaOk = repository.backupEngine.refreshRemoteQuotaAndRootFolder()
+                val quotaOk = repository.backupEngine.refreshRemoteQuotaAndRootFolder(createFolderIfMissing = true)
                 if (quotaOk) {
                     repository.persistCurrentAccountToDatabase()
                 }

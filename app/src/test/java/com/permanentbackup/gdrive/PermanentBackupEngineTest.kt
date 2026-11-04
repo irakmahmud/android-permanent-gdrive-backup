@@ -3037,10 +3037,39 @@ class PermanentBackupEngineTest {
             authManager = authManager,
             customSettingsPrefs = prefs
         )
-        authManager.setRootDriveFolderId(null)
+        val docsDir = File(tempStorageDir, "Documents").apply { mkdirs() }
+        File(docsDir, "custom_folder_test.txt").writeText("CUSTOM_DRIVE_FOLDER_CONTENT_2026")
+
+        // Even if a stale rootDriveFolderId was cached locally, refreshRemoteQuotaAndRootFolder(createFolderIfMissing = false)
+        // and browseCloudDriveFiles(BACKUP_ROOT) must verify with Google Drive and clear it when the folder does not exist on Drive!
+        authManager.setRootDriveFolderName("My_Custom_Phone_Backup_2026", "stale_deleted_folder_id")
+        assertTrue(repository.backupEngine.refreshRemoteQuotaAndRootFolder(createFolderIfMissing = false))
+        assertEquals(
+            "Stale rootDriveFolderId must be cleared when folder is not found on Google Drive",
+            null,
+            authManager.accountState.value.rootDriveFolderId
+        )
+
+        authManager.setRootDriveFolderName("My_Custom_Phone_Backup_2026", "stale_deleted_folder_id_2")
+        val preCreateCloudFiles = repository.browseCloudDriveFiles(filter = DriveViewFilter.BACKUP_ROOT)
+        assertTrue("Browsing uncreated BACKUP_ROOT must return emptyList", preCreateCloudFiles.isEmpty())
+        assertEquals(
+            "browseCloudDriveFiles(BACKUP_ROOT) must clear stale rootDriveFolderId when folder is missing on Drive",
+            null,
+            authManager.accountState.value.rootDriveFolderId
+        )
+
         val preCreateDash = repository.buildDashboardSummary()
         assertFalse("Drive folder must be reported as NOT created when rootDriveFolderId is null", preCreateDash.isDriveRootFolderCreated)
         assertEquals("Drive target path must be empty when folder is not created yet", "", preCreateDash.currentDriveTargetPath)
+
+        val preCreateCoverage = repository.getFolderCoverageItems()
+        val preCreateDocsItem = preCreateCoverage.first { it.folderName == "Documents" }
+        assertTrue(
+            "Coverage explanation before folder creation must state folder will be created when backup runs, got: ${preCreateDocsItem.restrictionExplanation}",
+            preCreateDocsItem.restrictionExplanation.contains("will be created when backup runs") &&
+                preCreateDocsItem.restrictionExplanation.contains("My_Custom_Phone_Backup_2026")
+        )
 
         // 3. User renames / creates a custom backup folder on Google Drive
         val customFolderResult = repository.createOrRenameRootBackupFolder("My_Custom_Phone_Backup_2026")
@@ -3049,8 +3078,6 @@ class PermanentBackupEngineTest {
         assertNotNull("rootDriveFolderId must be populated after explicit creation", authManager.accountState.value.rootDriveFolderId)
 
         // 4. Run backup and verify files back up into the user's custom folder
-        val docsDir = File(tempStorageDir, "Documents").apply { mkdirs() }
-        File(docsDir, "custom_folder_test.txt").writeText("CUSTOM_DRIVE_FOLDER_CONTENT_2026")
         val cycle = repository.runBackupNow()
         assertEquals(1, cycle.uploadedAndVerifiedFiles)
 
@@ -3059,6 +3086,13 @@ class PermanentBackupEngineTest {
         assertTrue(
             "Drive target path must use the user's custom folder name, got: ${postCreateDash.currentDriveTargetPath}",
             postCreateDash.currentDriveTargetPath.contains("My_Custom_Phone_Backup_2026")
+        )
+
+        val postCreateCoverage = repository.getFolderCoverageItems()
+        val postCreateDocsItem = postCreateCoverage.first { it.folderName == "Documents" }
+        assertTrue(
+            "Coverage explanation after folder creation must reference My Drive/My_Custom_Phone_Backup_2026/Documents, got: ${postCreateDocsItem.restrictionExplanation}",
+            postCreateDocsItem.restrictionExplanation.contains("My Drive/My_Custom_Phone_Backup_2026/Documents")
         )
     }
 }
