@@ -888,24 +888,43 @@ class BackupRepository(
         )
 
         val activeUpload = backupEngine.activeUploadProgress.value
-        val activePhoneSource = if (activeUpload != null) {
-            "/storage/emulated/0/${activeUpload.relativePath}"
+        val latestRecord = if (activeUpload == null) {
+            runCatching {
+                backupDao.getPendingRecordsForAccountPaged(accountId, 1, 0).firstOrNull()
+                    ?: backupDao.getVerifiedBackupsForAccountPaged(accountId, 1, 0).firstOrNull()
+            }.getOrNull()
         } else {
-            val enabledFolderNames = coverage
-                .filter { it.accessStatus == FolderAccessStatus.ACCESSIBLE && it.backupEnabled }
-                .joinToString(", ") { it.relativePath }
-                .ifBlank { "DCIM, Pictures, Videos, Downloads, Documents, WhatsApp/Media, Telegram" }
-            "/storage/emulated/0/{$enabledFolderNames}"
+            null
         }
-        val activeDriveTarget = if (activeUpload != null) {
-            val parentFolder = activeUpload.relativePath.substringBeforeLast('/', "")
-            if (parentFolder.isBlank()) {
-                "My Drive / ${accountState.rootDriveFolderName} / ${activeUpload.fileName}"
-            } else {
-                "My Drive / ${accountState.rootDriveFolderName} / $parentFolder / ${activeUpload.fileName}"
+        val enabledFolderNames = coverage
+            .filter { it.accessStatus == FolderAccessStatus.ACCESSIBLE && it.backupEnabled }
+            .joinToString(", ") { it.relativePath }
+            .ifBlank { "DCIM, Pictures, Videos, Downloads, Documents, WhatsApp/Media, Telegram" }
+
+        val activePhoneSource = when {
+            activeUpload != null -> "/storage/emulated/0/${activeUpload.relativePath}"
+            latestRecord != null -> "/storage/emulated/0/${latestRecord.relativePath} (Monitored: /storage/emulated/0/{$enabledFolderNames})"
+            else -> "/storage/emulated/0/{$enabledFolderNames}"
+        }
+        val activeDriveTarget = when {
+            activeUpload != null -> {
+                val parentFolder = activeUpload.relativePath.substringBeforeLast('/', "")
+                if (parentFolder.isBlank()) {
+                    "My Drive / ${accountState.rootDriveFolderName} / ${activeUpload.fileName}"
+                } else {
+                    "My Drive / ${accountState.rootDriveFolderName} / $parentFolder / ${activeUpload.fileName}"
+                }
             }
-        } else {
-            "My Drive / ${accountState.rootDriveFolderName} / <Phone_Folder_Name> / <File_Name>"
+            latestRecord != null -> {
+                val parentFolder = latestRecord.relativePath.substringBeforeLast('/', "")
+                val targetName = latestRecord.driveTargetFileName.ifBlank { latestRecord.displayName }
+                if (parentFolder.isBlank()) {
+                    "My Drive / ${accountState.rootDriveFolderName} / $targetName"
+                } else {
+                    "My Drive / ${accountState.rootDriveFolderName} / $parentFolder / $targetName"
+                }
+            }
+            else -> "My Drive / ${accountState.rootDriveFolderName} / <Phone_Folder_Name> / <File_Name>"
         }
 
         return DashboardSummary(
