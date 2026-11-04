@@ -380,9 +380,14 @@ class AndroidStorageScanner(
                 else -> FolderAccessStatus.NOT_PRESENT_ON_DEVICE
             }
             val discoveredCount = if (status == FolderAccessStatus.ACCESSIBLE && folderFile != null) {
-                folderFile.walkTopDown()
-                    .onEnter { d -> !isMirrorOrRestoreDirectory(d.name, d.name) }
-                    .count { it.isFile && it.canRead() }
+                try {
+                    folderFile.walkTopDown()
+                        .onFail { _, _ -> }
+                        .onEnter { d -> !isMirrorOrRestoreDirectory(d.name, d.name) && d.canRead() }
+                        .count { it.isFile && it.canRead() }
+                } catch (_: Throwable) {
+                    0
+                }
             } else {
                 0
             }
@@ -420,7 +425,13 @@ class AndroidStorageScanner(
                         it.first.equals(topDir.name, ignoreCase = true)
                     }
                     if (!alreadyListed) {
-                        val count = topDir.walkTopDown().count { it.isFile && it.canRead() }
+                        val count = try {
+                            topDir.walkTopDown()
+                                .onFail { _, _ -> }
+                                .count { it.isFile && it.canRead() }
+                        } catch (_: Throwable) {
+                            0
+                        }
                         items.add(
                             FolderCoverageItem(
                                 folderName = "Dynamic Folder: ${topDir.name}",
@@ -442,7 +453,13 @@ class AndroidStorageScanner(
             for (sdIdx in 1 until roots.size) {
                 val sdRoot = roots[sdIdx]
                 val count = if (hasStoragePermission && sdRoot.canRead()) {
-                    sdRoot.walkTopDown().count { it.isFile && it.canRead() }
+                    try {
+                        sdRoot.walkTopDown()
+                            .onFail { _, _ -> }
+                            .count { it.isFile && it.canRead() }
+                    } catch (_: Throwable) {
+                        0
+                    }
                 } else {
                     0
                 }

@@ -41,24 +41,32 @@ class PermanentBackupForegroundService : Service() {
         const val ACTION_UPLOAD_QUEUE = "com.permanentbackup.gdrive.action.UPLOAD_QUEUE"
 
         fun startManualBackupService(context: Context) {
-            val intent = Intent(context, PermanentBackupForegroundService::class.java).apply {
-                action = ACTION_START_BACKUP
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
+            try {
+                val intent = Intent(context, PermanentBackupForegroundService::class.java).apply {
+                    action = ACTION_START_BACKUP
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
+                }
+            } catch (_: Throwable) {
+                BackupWorkScheduler.enqueueImmediateRetryWork(context)
             }
         }
 
         fun startUploadQueueService(context: Context) {
-            val intent = Intent(context, PermanentBackupForegroundService::class.java).apply {
-                action = ACTION_UPLOAD_QUEUE
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
+            try {
+                val intent = Intent(context, PermanentBackupForegroundService::class.java).apply {
+                    action = ACTION_UPLOAD_QUEUE
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
+                }
+            } catch (_: Throwable) {
+                BackupWorkScheduler.enqueueImmediateRetryWork(context)
             }
         }
     }
@@ -96,14 +104,17 @@ class PermanentBackupForegroundService : Service() {
             progressPercent = null,
             isPaused = app?.repository?.backupEngine?.isPaused?.value == true
         )
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIFICATION_ID,
-                initialNotification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-            )
-        } else {
-            startForeground(NOTIFICATION_ID, initialNotification)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    initialNotification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, initialNotification)
+            }
+        } catch (_: Throwable) {
         }
 
         if (app != null) {

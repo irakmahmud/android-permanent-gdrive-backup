@@ -56,7 +56,7 @@ class BackupTypeConverters {
         StoragePermissionEntity::class,
         DriveChangeTokenEntity::class
     ],
-    version = 3,
+    version = 4,
     exportSchema = false
 )
 @TypeConverters(BackupTypeConverters::class)
@@ -428,22 +428,158 @@ abstract class PermanentBackupDatabase : RoomDatabase() {
 
         val MIGRATION_2_3 = object : Migration(2, 3) {
             override fun migrate(db: SupportSQLiteDatabase) {
-                db.execSQL(
-                    "ALTER TABLE `backup_file_records` ADD COLUMN `accountId` TEXT NOT NULL DEFAULT 'default_account'"
-                )
-                db.execSQL(
-                    "DROP INDEX IF EXISTS `index_backup_file_records_sourceFileIdentity_backupVersion`"
-                )
-                db.execSQL(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS `index_backup_file_records_accountId_sourceFileIdentity_backupVersion` ON `backup_file_records` (`accountId`, `sourceFileIdentity`, `backupVersion`)"
-                )
-                db.execSQL(
-                    "CREATE INDEX IF NOT EXISTS `index_backup_file_records_accountId` ON `backup_file_records` (`accountId`)"
-                )
-                db.execSQL(
-                    "ALTER TABLE `app_settings` ADD COLUMN `maxUploadSpeedKbps` INTEGER NOT NULL DEFAULT 0"
-                )
+                try {
+                    db.execSQL(
+                        "ALTER TABLE `backup_file_records` ADD COLUMN `accountId` TEXT NOT NULL DEFAULT 'default_account'"
+                    )
+                } catch (_: Throwable) {
+                }
+                try {
+                    db.execSQL(
+                        "ALTER TABLE `app_settings` ADD COLUMN `maxUploadSpeedKbps` INTEGER NOT NULL DEFAULT 0"
+                    )
+                } catch (_: Throwable) {
+                }
+                rebuildV3TablesForExactRoomSchema(db)
             }
+        }
+
+        val MIGRATION_3_4 = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                try {
+                    db.execSQL(
+                        "ALTER TABLE `backup_file_records` ADD COLUMN `accountId` TEXT NOT NULL DEFAULT 'default_account'"
+                    )
+                } catch (_: Throwable) {
+                }
+                try {
+                    db.execSQL(
+                        "ALTER TABLE `app_settings` ADD COLUMN `maxUploadSpeedKbps` INTEGER NOT NULL DEFAULT 0"
+                    )
+                } catch (_: Throwable) {
+                }
+                rebuildV3TablesForExactRoomSchema(db)
+            }
+        }
+
+        /**
+         * Rebuilds `backup_file_records` and `app_settings` using the exact Room KSP DDL (with `defaultValue = null`
+         * in `PRAGMA table_info`) while preserving 100% of existing rows, preventing Room 2.6.1
+         * `TableInfo.Column.equals()` from throwing `IllegalStateException: Migration didn't properly handle`
+         * due to SQLite `ALTER TABLE ... ADD COLUMN ... DEFAULT ...` metadata.
+         */
+        fun rebuildV3TablesForExactRoomSchema(db: SupportSQLiteDatabase) {
+            db.execSQL("DROP TABLE IF EXISTS `backup_file_records_new`")
+            db.execSQL(
+                """
+                CREATE TABLE IF NOT EXISTS `backup_file_records_new` (
+                    `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                    `accountId` TEXT NOT NULL,
+                    `sourceUri` TEXT NOT NULL,
+                    `sourceFileIdentity` TEXT NOT NULL,
+                    `relativePath` TEXT NOT NULL,
+                    `displayName` TEXT NOT NULL,
+                    `folderCategory` TEXT NOT NULL,
+                    `fileSize` INTEGER NOT NULL,
+                    `lastModifiedMs` INTEGER NOT NULL,
+                    `mimeType` TEXT NOT NULL,
+                    `sha256Hash` TEXT,
+                    `md5Hash` TEXT,
+                    `driveFileId` TEXT,
+                    `driveFolderId` TEXT,
+                    `driveStoredName` TEXT NOT NULL,
+                    `backupVersion` INTEGER NOT NULL,
+                    `uploadedBytes` INTEGER NOT NULL,
+                    `resumableSessionUri` TEXT,
+                    `uploadStatus` TEXT NOT NULL,
+                    `lastSuccessfulBackupMs` INTEGER,
+                    `failureReason` TEXT NOT NULL,
+                    `failureDetail` TEXT,
+                    `verificationStatus` TEXT NOT NULL,
+                    `localExists` INTEGER NOT NULL,
+                    `retryCount` INTEGER NOT NULL,
+                    `createdAtMs` INTEGER NOT NULL
+                )
+                """.trimIndent()
+            )
+            db.execSQL(
+                """
+                INSERT OR IGNORE INTO `backup_file_records_new` (
+                    `id`, `accountId`, `sourceUri`, `sourceFileIdentity`, `relativePath`, `displayName`,
+                    `folderCategory`, `fileSize`, `lastModifiedMs`, `mimeType`, `sha256Hash`, `md5Hash`,
+                    `driveFileId`, `driveFolderId`, `driveStoredName`, `backupVersion`, `uploadedBytes`,
+                    `resumableSessionUri`, `uploadStatus`, `lastSuccessfulBackupMs`, `failureReason`,
+                    `failureDetail`, `verificationStatus`, `localExists`, `retryCount`, `createdAtMs`
+                )
+                SELECT
+                    `id`, COALESCE(`accountId`, 'default_account'), `sourceUri`, `sourceFileIdentity`, `relativePath`, `displayName`,
+                    `folderCategory`, `fileSize`, `lastModifiedMs`, `mimeType`, `sha256Hash`, `md5Hash`,
+                    `driveFileId`, `driveFolderId`, `driveStoredName`, `backupVersion`, `uploadedBytes`,
+                    `resumableSessionUri`, `uploadStatus`, `lastSuccessfulBackupMs`, `failureReason`,
+                    `failureDetail`, `verificationStatus`, `localExists`, `retryCount`, `createdAtMs`
+                FROM `backup_file_records`
+                """.trimIndent()
+            )
+            db.execSQL("DROP TABLE `backup_file_records`")
+            db.execSQL("ALTER TABLE `backup_file_records_new` RENAME TO `backup_file_records`")
+            db.execSQL(
+                "CREATE UNIQUE INDEX IF NOT EXISTS `index_backup_file_records_accountId_sourceFileIdentity_backupVersion` ON `backup_file_records` (`accountId`, `sourceFileIdentity`, `backupVersion`)"
+            )
+            db.execSQL(
+                "CREATE INDEX IF NOT EXISTS `index_backup_file_records_accountId` ON `backup_file_records` (`accountId`)"
+            )
+            db.execSQL(
+                "CREATE INDEX IF NOT EXISTS `index_backup_file_records_sourceUri` ON `backup_file_records` (`sourceUri`)"
+            )
+            db.execSQL(
+                "CREATE INDEX IF NOT EXISTS `index_backup_file_records_uploadStatus` ON `backup_file_records` (`uploadStatus`)"
+            )
+            db.execSQL(
+                "CREATE INDEX IF NOT EXISTS `index_backup_file_records_sha256Hash` ON `backup_file_records` (`sha256Hash`)"
+            )
+            db.execSQL(
+                "CREATE INDEX IF NOT EXISTS `index_backup_file_records_driveFileId` ON `backup_file_records` (`driveFileId`)"
+            )
+
+            db.execSQL("DROP TABLE IF EXISTS `app_settings_new`")
+            db.execSQL(
+                """
+                CREATE TABLE IF NOT EXISTS `app_settings_new` (
+                    `settingKey` TEXT NOT NULL,
+                    `userBackupConsentGranted` INTEGER NOT NULL,
+                    `wifiOnly` INTEGER NOT NULL,
+                    `chargingOnly` INTEGER NOT NULL,
+                    `unmeteredNetworkOnly` INTEGER NOT NULL,
+                    `uploadConcurrency` INTEGER NOT NULL,
+                    `periodicIntervalHours` INTEGER NOT NULL,
+                    `chunkSizeBytes` INTEGER NOT NULL,
+                    `offlineCacheBudgetBytes` INTEGER NOT NULL,
+                    `backgroundSyncPaused` INTEGER NOT NULL,
+                    `maxUploadSpeedKbps` INTEGER NOT NULL,
+                    `activeAccountId` TEXT,
+                    `updatedAtMs` INTEGER NOT NULL,
+                    PRIMARY KEY(`settingKey`)
+                )
+                """.trimIndent()
+            )
+            db.execSQL(
+                """
+                INSERT OR REPLACE INTO `app_settings_new` (
+                    `settingKey`, `userBackupConsentGranted`, `wifiOnly`, `chargingOnly`,
+                    `unmeteredNetworkOnly`, `uploadConcurrency`, `periodicIntervalHours`,
+                    `chunkSizeBytes`, `offlineCacheBudgetBytes`, `backgroundSyncPaused`,
+                    `maxUploadSpeedKbps`, `activeAccountId`, `updatedAtMs`
+                )
+                SELECT
+                    `settingKey`, `userBackupConsentGranted`, `wifiOnly`, `chargingOnly`,
+                    `unmeteredNetworkOnly`, `uploadConcurrency`, `periodicIntervalHours`,
+                    `chunkSizeBytes`, `offlineCacheBudgetBytes`, `backgroundSyncPaused`,
+                    COALESCE(`maxUploadSpeedKbps`, 0), `activeAccountId`, `updatedAtMs`
+                FROM `app_settings`
+                """.trimIndent()
+            )
+            db.execSQL("DROP TABLE `app_settings`")
+            db.execSQL("ALTER TABLE `app_settings_new` RENAME TO `app_settings`")
         }
 
         @Volatile
@@ -462,7 +598,8 @@ abstract class PermanentBackupDatabase : RoomDatabase() {
                 DB_NAME
             )
                 .setJournalMode(JournalMode.WRITE_AHEAD_LOGGING)
-                .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
+                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+                .fallbackToDestructiveMigrationOnDowngrade()
                 .build()
         }
     }

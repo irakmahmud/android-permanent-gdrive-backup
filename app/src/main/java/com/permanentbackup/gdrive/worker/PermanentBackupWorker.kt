@@ -74,22 +74,25 @@ object BackupWorkScheduler {
     }
 
     fun schedulePeriodicBackup(context: Context, settings: BackupSettings) {
-        val constraints = buildWorkConstraints(settings)
-        val intervalHours = settings.periodicIntervalHours.toLong().coerceAtLeast(1L)
+        try {
+            val constraints = buildWorkConstraints(settings)
+            val intervalHours = settings.periodicIntervalHours.toLong().coerceAtLeast(1L)
 
-        val request = PeriodicWorkRequestBuilder<PermanentBackupWorker>(
-            intervalHours,
-            TimeUnit.HOURS
-        )
-            .setConstraints(constraints)
-            .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 15, TimeUnit.MINUTES)
-            .build()
+            val request = PeriodicWorkRequestBuilder<PermanentBackupWorker>(
+                intervalHours,
+                TimeUnit.HOURS
+            )
+                .setConstraints(constraints)
+                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 15, TimeUnit.MINUTES)
+                .build()
 
-        WorkManager.getInstance(context).enqueueUniquePeriodicWork(
-            PERIODIC_BACKUP_WORK_NAME,
-            ExistingPeriodicWorkPolicy.UPDATE,
-            request
-        )
+            WorkManager.getInstance(context).enqueueUniquePeriodicWork(
+                PERIODIC_BACKUP_WORK_NAME,
+                ExistingPeriodicWorkPolicy.UPDATE,
+                request
+            )
+        } catch (_: Throwable) {
+        }
         scheduleContentUriTriggeredBackup(context, settings)
     }
 
@@ -131,17 +134,20 @@ object BackupWorkScheduler {
     }
 
     fun enqueueImmediateRetryWork(context: Context, settings: BackupSettings = BackupSettings()) {
-        val constraints = buildWorkConstraints(settings)
-        val request = OneTimeWorkRequestBuilder<PermanentBackupWorker>()
-            .setConstraints(constraints)
-            .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 5, TimeUnit.MINUTES)
-            .build()
+        try {
+            val constraints = buildWorkConstraints(settings)
+            val request = OneTimeWorkRequestBuilder<PermanentBackupWorker>()
+                .setConstraints(constraints)
+                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 5, TimeUnit.MINUTES)
+                .build()
 
-        WorkManager.getInstance(context).enqueueUniqueWork(
-            IMMEDIATE_RETRY_WORK_NAME,
-            ExistingWorkPolicy.KEEP,
-            request
-        )
+            WorkManager.getInstance(context).enqueueUniqueWork(
+                IMMEDIATE_RETRY_WORK_NAME,
+                ExistingWorkPolicy.KEEP,
+                request
+            )
+        } catch (_: Throwable) {
+        }
     }
 }
 
@@ -161,6 +167,7 @@ class LocalStorageFileObserverManager(
     companion object {
         private val EXCLUDED_DIR_NAMES = setOf("restored_from_drive", "drive_mirror")
         private const val MAX_WATCH_DEPTH = 3
+        private const val MAX_OBSERVER_COUNT = 64
 
         fun isExcludedRelativePath(relPath: String): Boolean {
             val segments = relPath.replace('\\', '/').lowercase().split('/')
@@ -206,7 +213,7 @@ class LocalStorageFileObserverManager(
         currentDepth: Int,
         eventMask: Int
     ) {
-        if (currentDepth > MAX_WATCH_DEPTH) return
+        if (currentDepth > MAX_WATCH_DEPTH || activeObservers.size >= MAX_OBSERVER_COUNT) return
         if (!dir.exists() || !dir.isDirectory || !dir.canRead()) return
         if (isExcludedRelativePath(relativePrefix)) return
         if (!watchedPaths.add(relativePrefix)) return

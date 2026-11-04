@@ -246,7 +246,7 @@ fun HomeDashboardScreen(
                         )
                         Spacer(modifier = Modifier.height(6.dp))
                         LinearProgressIndicator(
-                            progress = { active.fraction },
+                            progress = { active.fraction.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: 0f },
                             modifier = Modifier.fillMaxWidth()
                         )
                     }
@@ -294,7 +294,7 @@ fun HomeDashboardScreen(
                         "${summary.accessibleFolderCount} accessible folders (${(summary.overallProgressFraction * 100).toInt()}%)"
                     )
                     LinearProgressIndicator(
-                        progress = { summary.overallProgressFraction },
+                        progress = { summary.overallProgressFraction.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: 0f },
                         modifier = Modifier.fillMaxWidth()
                     )
                     MetricRow(
@@ -1227,7 +1227,7 @@ fun TransferManagerScreen(
                             }"
                         )
                         LinearProgressIndicator(
-                            progress = { active.fraction },
+                            progress = { active.fraction.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: 0f },
                             modifier = Modifier.fillMaxWidth()
                         )
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {

@@ -94,7 +94,24 @@ class GoogleAuthManager(
                 EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
             )
         } catch (_: Throwable) {
-            null
+            // If Android Auto-Backup or reinstall left an undecryptable keyset in XML, purge & recreate once
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                    ctx.deleteSharedPreferences(PREF_FILE_NAME)
+                } else {
+                    ctx.getSharedPreferences(PREF_FILE_NAME, Context.MODE_PRIVATE).edit().clear().commit()
+                }
+                val masterKeyAlias = MasterKeys.getOrCreate(MasterKeys.AES256_GCM_SPEC)
+                EncryptedSharedPreferences.create(
+                    PREF_FILE_NAME,
+                    masterKeyAlias,
+                    ctx,
+                    EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                    EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+                )
+            } catch (_: Throwable) {
+                null
+            }
         }
     }
 
@@ -510,16 +527,20 @@ class GoogleAuthManager(
         val savedRefresh = getAccountScopedString(accountId, KEY_REFRESH_TOKEN, "")
             .ifBlank { getString(KEY_REFRESH_TOKEN, "") }
         if (savedRefresh.isNotBlank()) {
-            val refreshedToken = refreshAccessToken(savedRefresh)
-            onAccountAuthorized(
-                email = cleanEmail,
-                displayName = derivedName,
-                accessToken = refreshedToken,
-                refreshToken = savedRefresh,
-                expiresInSeconds = 3600L,
-                grantedScopes = grantedScopes
-            )
-            return true
+            try {
+                val refreshedToken = refreshAccessToken(savedRefresh)
+                onAccountAuthorized(
+                    email = cleanEmail,
+                    displayName = derivedName,
+                    accessToken = refreshedToken,
+                    refreshToken = savedRefresh,
+                    expiresInSeconds = 3600L,
+                    grantedScopes = grantedScopes
+                )
+                return true
+            } catch (_: Throwable) {
+                // Saved refresh token expired/revoked or device offline — fall through safely without crashing
+            }
         }
 
         // On Android device runtime, fallback to Cloud Drive OAuth Bridge if configured
@@ -665,7 +686,12 @@ class GoogleAuthManager(
         val refreshToken = getAccountScopedString(accountId, KEY_REFRESH_TOKEN, "")
             .ifBlank { getString(KEY_REFRESH_TOKEN, "") }
         if (refreshToken.isNotBlank()) {
-            return refreshAccessToken(refreshToken)
+            try {
+                return refreshAccessToken(refreshToken)
+            } catch (authEx: AuthTokenExpiredException) {
+                if (appContext == null) throw authEx
+                // On Android device runtime, fall through to Cloud Drive OAuth Bridge if stored token expired
+            }
         }
 
         // 3. Fallback to Cloud Drive OAuth Bridge on Android device runtime
@@ -876,26 +902,47 @@ class GoogleAuthManager(
     }
 
     private fun getString(key: String, default: String): String =
-        prefs?.getString(key, default) ?: (memoryStore[key] as? String ?: default)
+        try {
+            prefs?.getString(key, default) ?: (memoryStore[key] as? String ?: default)
+        } catch (_: Throwable) {
+            memoryStore[key] as? String ?: default
+        }
 
     private fun putString(key: String, value: String) {
         memoryStore[key] = value
-        prefs?.edit()?.putString(key, value)?.apply()
+        try {
+            prefs?.edit()?.putString(key, value)?.apply()
+        } catch (_: Throwable) {
+        }
     }
 
     private fun getBoolean(key: String, default: Boolean): Boolean =
-        prefs?.getBoolean(key, default) ?: (memoryStore[key] as? Boolean ?: default)
+        try {
+            prefs?.getBoolean(key, default) ?: (memoryStore[key] as? Boolean ?: default)
+        } catch (_: Throwable) {
+            memoryStore[key] as? Boolean ?: default
+        }
 
     private fun putBoolean(key: String, value: Boolean) {
         memoryStore[key] = value
-        prefs?.edit()?.putBoolean(key, value)?.apply()
+        try {
+            prefs?.edit()?.putBoolean(key, value)?.apply()
+        } catch (_: Throwable) {
+        }
     }
 
     private fun getLong(key: String, default: Long): Long =
-        prefs?.getLong(key, default) ?: (memoryStore[key] as? Long ?: default)
+        try {
+            prefs?.getLong(key, default) ?: (memoryStore[key] as? Long ?: default)
+        } catch (_: Throwable) {
+            memoryStore[key] as? Long ?: default
+        }
 
     private fun putLong(key: String, value: Long) {
         memoryStore[key] = value
-        prefs?.edit()?.putLong(key, value)?.apply()
+        try {
+            prefs?.edit()?.putLong(key, value)?.apply()
+        } catch (_: Throwable) {
+        }
     }
 }

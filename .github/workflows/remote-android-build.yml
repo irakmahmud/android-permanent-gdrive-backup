@@ -1,4 +1,4 @@
-name: Remote Cloud Android Build & Verification (Permanent Drive v2.3.0)
+name: Remote Cloud Android Build & Verification (Permanent Drive v2.3.1)
 
 on:
   push:
@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   remote-android-apk-build:
-    name: Remote Cloud Build, Lint, 36 Unit/Integration Tests, Secret Scan & v2.2.0 Release
+    name: Remote Cloud Build, Lint, 37 Unit/Integration Tests, Secret Scan & v2.3.1 Release
     runs-on: ubuntu-latest
     env:
       CLOUD_BRIDGE_PAYLOAD: ${{ secrets.CLOUD_BRIDGE_PAYLOAD }}
@@ -42,7 +42,7 @@ jobs:
         run: |
           ./gradlew :app:lintDebug --no-daemon
 
-      - name: "Stage 8, 9 & 10: Execute 36 Unit, Integration & 3-Layer Never-Delete Policy Tests"
+      - name: "Stage 8, 9 & 10: Execute 37 Unit, Integration & 3-Layer Never-Delete Policy Tests"
         run: |
           ./gradlew :app:testDebugUnitTest --info --no-daemon
 
@@ -75,7 +75,7 @@ jobs:
       - name: "Stage 14a: Upload Downloadable APK & Reports Artifact"
         uses: actions/upload-artifact@v4
         with:
-          name: Permanent-Drive-v2.3.0-Debug-APK
+          name: Permanent-Drive-v2.3.1-Debug-APK
           path: |
             app/build/outputs/apk/debug/app-debug.apk
             app/build/outputs/apk/debug/app-debug.apk.sha256
@@ -83,25 +83,20 @@ jobs:
             app/build/reports/tests/testDebugUnitTest/
             app/build/reports/lint-results-debug.html
 
-      - name: "Stage 14b: Publish Direct Downloadable APK to GitHub Releases (v2.3.0)"
+      - name: "Stage 14b: Publish Direct Downloadable APK to GitHub Releases (v2.3.1)"
         if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.3.0
-          name: "Permanent Drive v2.3.0 — Google Drive Desktop Parity Gaps Closed (Zero-Deletion)"
+          tag_name: v2.3.1
+          name: "Permanent Drive v2.3.1 — Startup Crash Fixes & Desktop Parity (Zero-Deletion)"
           body: |
-            Automated Remote Cloud Build of **Permanent Drive v2.3.0** (`com.permanentbackup.gdrive`, `versionCode = 8`).
-            - **v2.3.0 Desktop Parity Gap Fixes**:
-              1. Engine-level "Wi-Fi only" / "Charging only" enforcement for manual, share-sheet, watcher and provider runs (`DeviceConditionsProvider`).
-              2. GLOBAL upload bandwidth cap shared by all parallel streams (`GlobalBandwidthLimiter`).
-              3. SHA-256 content dedup: moved/duplicated files materialized by server-side Drive copy (`files.copy`) instead of re-upload.
-              4. Exponential retry backoff respected by automatic runs; Resume/Retry clears backoff and uploads immediately; starvation-free queue paging.
-              5. Upload-only runs (`runUploadQueueOnly`) for share-sheet, Upload File, single-file backup, Retry and Resume (no full rescan) + coalesced re-run.
-              6. Changes API `removed`/`trashed` hygiene for the LOCAL cache only + auto-pin of new files inside "Keep Folder Offline" folders.
-              7. One-way Mirror folders auto-refresh incrementally on Drive changes (ledger-based, non-overwriting).
-              8. Share-sheet temporary grants staged app-privately and cleaned after VERIFIED upload.
-              9. "Upload File" inside a My Drive folder uploads into that exact Drive folder (`shared:drive:<folderId>/...`).
-              10. Per-account dashboard, queue, history, sync jobs and failures (live switch on account change) + per-worker parallel progress.
+            Automated Remote Cloud Build of **Permanent Drive v2.3.1** (`com.permanentbackup.gdrive`, `versionCode = 9`).
+            - **v2.3.1 Crash Fixes**:
+              1. Fixed uncaught `AuthTokenExpiredException` / `IOException` on startup in `GoogleAuthManager.authorizeSelectedNativeAccount()` and `BackupRepository.syncPersistedAccountOnStartup()`.
+              2. Fixed Room 2.6.1 `IllegalStateException: Migration didn't properly handle: backup_file_records` by rebuilding `backup_file_records` and `app_settings` without SQLite `DEFAULT` column metadata mismatch (`MIGRATION_2_3` & `MIGRATION_3_4`, `version = 4`), preserving 100% of existing rows.
+              3. Moved all `BackupViewModel.refreshDashboardAndCoverage()` database and storage scans off the Main UI thread onto `Dispatchers.IO` with `CoroutineExceptionHandler` and eliminated redundant recursive `walkTopDown()` directory scans.
+              4. Converted `PermanentBackupApp.database` and `PermanentBackupApp.repository` from `lateinit var` to thread-safe `by lazy(LazyThreadSafetyMode.SYNCHRONIZED)` so early `ContentProvider` queries never throw `UninitializedPropertyAccessException`.
+              5. Hardened `EncryptedSharedPreferences` Keystore recovery, `WorkManager` scheduling, `ForegroundService` launch, and Compose progress clamping.
             - **3 Core Rules Strictly Enforced**: Zero Deletion, Immutable Version Preservation, Strict Separation of Backup vs Cloud-to-Local Mirroring.
           files: |
             app/build/outputs/apk/debug/app-debug.apk

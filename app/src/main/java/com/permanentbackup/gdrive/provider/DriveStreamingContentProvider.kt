@@ -125,8 +125,12 @@ class DriveStreamingContentProvider : ContentProvider() {
 
         // 1. Check DB-recorded offlineLocalPath first for seekable ParcelFileDescriptor
         if (app != null) {
-            val dbPinnedPath = kotlinx.coroutines.runBlocking {
-                app.database.backupDao().getCloudFileById(targetId)?.offlineLocalPath
+            val dbPinnedPath = try {
+                kotlinx.coroutines.runBlocking {
+                    app.database.backupDao().getCloudFileById(targetId)?.offlineLocalPath
+                }
+            } catch (_: Throwable) {
+                null
             }
             if (!dbPinnedPath.isNullOrBlank()) {
                 val dbFile = java.io.File(dbPinnedPath)

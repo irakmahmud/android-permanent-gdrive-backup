@@ -10,27 +10,29 @@ import com.permanentbackup.gdrive.worker.BackupWorkScheduler
 
 class PermanentBackupApp : Application() {
 
-    lateinit var database: PermanentBackupDatabase
-        private set
+    val database: PermanentBackupDatabase by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        PermanentBackupDatabase.getInstance(this)
+    }
 
-    lateinit var repository: BackupRepository
-        private set
-
-    override fun onCreate() {
-        super.onCreate()
-        database = PermanentBackupDatabase.getInstance(this)
+    val repository: BackupRepository by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
         val storageScanner = AndroidStorageScanner(this)
         val authManager = GoogleAuthManager(this)
         val driveApiClient = DriveApiClient()
 
-        repository = BackupRepository(
+        BackupRepository(
             context = this,
             backupDao = database.backupDao(),
             storageSource = storageScanner,
             driveApiClient = driveApiClient,
             authManager = authManager
         )
+    }
 
-        BackupWorkScheduler.schedulePeriodicBackup(this, repository.settings.value)
+    override fun onCreate() {
+        super.onCreate()
+        try {
+            BackupWorkScheduler.schedulePeriodicBackup(this, repository.settings.value)
+        } catch (_: Throwable) {
+        }
     }
 }

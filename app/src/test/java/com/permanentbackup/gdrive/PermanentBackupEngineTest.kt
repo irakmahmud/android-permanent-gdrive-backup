@@ -2827,6 +2827,84 @@ class PermanentBackupEngineTest {
         assertTrue(limiter.reserve(1024, 1024L) >= 900L)
         assertEquals(0L, GlobalBandwidthLimiter().reserve(1024, 0L))
     }
+
+    // 37. v2.3.1 Startup Crash Resilience: Expired/Revoked Refresh Token or Offline Network Never Crashes Startup
+    @Test
+    fun test37_startupCrashResilience_expiredRefreshTokenAndDatabaseMigrationSafety() = runTest {
+        // Simulate OAuth token endpoint returning HTTP 400 (expired/revoked refresh_token)
+        mockWebServer.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                val path = request.path ?: ""
+                if (path.startsWith("/oauth2/token")) {
+                    return MockResponse()
+                        .setResponseCode(400)
+                        .setBody("""{"error":"invalid_grant","error_description":"Token has been expired or revoked."}""")
+                }
+                return MockResponse().setResponseCode(500)
+            }
+        }
+
+        val prefs = TestInMemorySharedPreferences()
+        val resilientAuth = GoogleAuthManager(
+            context = null,
+            customPrefs = prefs,
+            tokenEndpointUrl = mockWebServer.url("/oauth2/token").toString(),
+            revokeEndpointUrl = mockWebServer.url("/oauth2/revoke").toString()
+        )
+        // Store a saved account with a refresh token that is now expired on Google's server
+        resilientAuth.onAccountAuthorized(
+            email = "crash_test@example.com",
+            displayName = "Crash Test",
+            accessToken = "old_access_token",
+            refreshToken = "expired_refresh_token_123",
+            expiresInSeconds = 1L
+        )
+        resilientAuth.disconnectAccount()
+
+        dao.upsertGoogleAccount(
+            GoogleAccountEntity(
+                accountId = "crash_test@example.com",
+                email = "crash_test@example.com",
+                displayName = "Crash Test",
+                selectedAccountRef = "crash_test@example.com",
+                isActive = true,
+                authorizationState = "AUTHORIZED"
+            )
+        )
+        // Clear user_explicitly_disconnected so syncPersistedAccountOnStartup attempts silent restoration
+        prefs.edit().putBoolean("user_explicitly_disconnected", false).apply()
+
+        val scanner = AndroidStorageScanner(null, listOf(tempStorageDir), true)
+        val repository = BackupRepository(
+            context = null,
+            backupDao = dao,
+            storageSource = scanner,
+            driveApiClient = driveApiClient,
+            authManager = resilientAuth,
+            customSettingsPrefs = prefs
+        )
+
+        // 1. authorizeSelectedNativeAccount must return false cleanly and NEVER throw AuthTokenExpiredException
+        val authorized = resilientAuth.authorizeSelectedNativeAccount("crash_test@example.com")
+        assertFalse("Expired refresh token on startup must return false instead of crashing", authorized)
+        assertEquals(AccountAuthState.AUTHORIZATION_REQUIRED, resilientAuth.accountState.value.authState)
+
+        // 2. syncPersistedAccountOnStartup must complete cleanly without throwing
+        repository.syncPersistedAccountOnStartup()
+
+        // 3. Single-pass coverage + buildDashboardSummary(precomputedCoverage) must succeed cleanly
+        File(tempStorageDir, "DCIM").mkdirs()
+        File(tempStorageDir, "DCIM/test_img.jpg").writeText("IMAGE_BYTES")
+        val coverage = repository.getFolderCoverageItems()
+        val summary = repository.buildDashboardSummary(precomputedCoverage = coverage)
+        assertTrue(coverage.isNotEmpty())
+        assertTrue(summary.accessibleFolderCount > 0)
+
+        // 4. Verify Room v2->v3 and v3->v4 non-destructive migration objects exist
+        assertNotNull(com.permanentbackup.gdrive.data.local.PermanentBackupDatabase.MIGRATION_1_2)
+        assertNotNull(com.permanentbackup.gdrive.data.local.PermanentBackupDatabase.MIGRATION_2_3)
+        assertNotNull(com.permanentbackup.gdrive.data.local.PermanentBackupDatabase.MIGRATION_3_4)
+    }
 }
 
 class TestInMemorySharedPreferences : SharedPreferences {

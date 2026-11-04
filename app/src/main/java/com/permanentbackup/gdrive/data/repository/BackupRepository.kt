@@ -151,51 +151,55 @@ class BackupRepository(
         activeAccountIdFlow.flatMapLatest { backupDao.observePinnedOfflineFiles(it) }
 
     suspend fun syncPersistedAccountOnStartup() {
-        // 1. Restore persisted AppSettingsEntity from Room if present
-        backupDao.getAppSettingsEntity()?.let { dbSettings ->
-            val restored = BackupSettings(
-                userBackupConsentGranted = dbSettings.userBackupConsentGranted,
-                wifiOnly = dbSettings.wifiOnly,
-                chargingOnly = dbSettings.chargingOnly,
-                unmeteredNetworkOnly = dbSettings.unmeteredNetworkOnly,
-                uploadConcurrency = dbSettings.uploadConcurrency.coerceIn(1, 4),
-                periodicIntervalHours = dbSettings.periodicIntervalHours.coerceAtLeast(1),
-                chunkSizeBytes = dbSettings.chunkSizeBytes,
-                offlineCacheBudgetBytes = dbSettings.offlineCacheBudgetBytes,
-                backgroundSyncPaused = dbSettings.backgroundSyncPaused,
-                maxUploadSpeedKbps = dbSettings.maxUploadSpeedKbps.coerceAtLeast(0)
-            )
-            _settings.value = restored
-            backupEngine.setEnginePaused(restored.backgroundSyncPaused)
-        }
-
-        // 2. Restore persisted SAF Tree URIs into storageSource so custom SAF folders are scanned
-        val savedPerms = backupDao.getAllStoragePermissions()
-        for (perm in savedPerms) {
-            if (perm.granted && !perm.persistedTreeUri.isNullOrBlank()) {
-                storageSource.registerPersistedSafTreeUri(perm.persistedTreeUri)
+        try {
+            // 1. Restore persisted AppSettingsEntity from Room if present
+            backupDao.getAppSettingsEntity()?.let { dbSettings ->
+                val restored = BackupSettings(
+                    userBackupConsentGranted = dbSettings.userBackupConsentGranted,
+                    wifiOnly = dbSettings.wifiOnly,
+                    chargingOnly = dbSettings.chargingOnly,
+                    unmeteredNetworkOnly = dbSettings.unmeteredNetworkOnly,
+                    uploadConcurrency = dbSettings.uploadConcurrency.coerceIn(1, 4),
+                    periodicIntervalHours = dbSettings.periodicIntervalHours.coerceAtLeast(1),
+                    chunkSizeBytes = dbSettings.chunkSizeBytes,
+                    offlineCacheBudgetBytes = dbSettings.offlineCacheBudgetBytes,
+                    backgroundSyncPaused = dbSettings.backgroundSyncPaused,
+                    maxUploadSpeedKbps = dbSettings.maxUploadSpeedKbps.coerceAtLeast(0)
+                )
+                _settings.value = restored
+                backupEngine.setEnginePaused(restored.backgroundSyncPaused)
             }
-        }
 
-        if (authManager.isUserExplicitlyDisconnected()) return
-        val activeDbAccount = backupDao.getActiveGoogleAccount()
-        if (activeDbAccount != null && !authManager.accountState.value.isConnected) {
-            authManager.authorizeSelectedNativeAccount(
-                selectedEmail = activeDbAccount.email,
-                nativePlayServicesToken = null,
-                grantedScopes = activeDbAccount.grantedScopes
-            )
-            activeDbAccount.backupRootFolderId?.let { authManager.setRootDriveFolderId(it) }
-            if (authManager.accountState.value.isConnected) {
+            // 2. Restore persisted SAF Tree URIs into storageSource so custom SAF folders are scanned
+            val savedPerms = backupDao.getAllStoragePermissions()
+            for (perm in savedPerms) {
+                if (perm.granted && !perm.persistedTreeUri.isNullOrBlank()) {
+                    storageSource.registerPersistedSafTreeUri(perm.persistedTreeUri)
+                }
+            }
+
+            if (authManager.isUserExplicitlyDisconnected()) return
+            val activeDbAccount = backupDao.getActiveGoogleAccount()
+            if (activeDbAccount != null && !authManager.accountState.value.isConnected) {
+                authManager.authorizeSelectedNativeAccount(
+                    selectedEmail = activeDbAccount.email,
+                    nativePlayServicesToken = null,
+                    grantedScopes = activeDbAccount.grantedScopes
+                )
+                activeDbAccount.backupRootFolderId?.let { authManager.setRootDriveFolderId(it) }
+                if (authManager.accountState.value.isConnected) {
+                    persistCurrentAccountToDatabase()
+                }
+            } else if (!authManager.accountState.value.isConnected && context != null) {
+                val fallbackEmail = authManager.accountState.value.email.ifBlank { "irakiroan@gmail.com" }
+                if (authManager.authorizeSelectedNativeAccount(selectedEmail = fallbackEmail)) {
+                    persistCurrentAccountToDatabase()
+                }
+            } else if (authManager.accountState.value.isConnected) {
                 persistCurrentAccountToDatabase()
             }
-        } else if (!authManager.accountState.value.isConnected && context != null) {
-            val fallbackEmail = authManager.accountState.value.email.ifBlank { "irakiroan@gmail.com" }
-            if (authManager.authorizeSelectedNativeAccount(selectedEmail = fallbackEmail)) {
-                persistCurrentAccountToDatabase()
-            }
-        } else if (authManager.accountState.value.isConnected) {
-            persistCurrentAccountToDatabase()
+        } catch (_: Throwable) {
+            // Never crash startup if local DB, Keystore, or network is temporarily unavailable
         }
     }
 
@@ -832,7 +836,7 @@ class BackupRepository(
         )
     }
 
-    suspend fun buildDashboardSummary(): DashboardSummary {
+    suspend fun buildDashboardSummary(precomputedCoverage: List<FolderCoverageItem>? = null): DashboardSummary {
         val accountId = currentAccountId()
         val total = backupDao.countAllRecordsForAccount(accountId)
         val verified = backupDao.countVerifiedRecordsForAccount(accountId)
@@ -841,7 +845,7 @@ class BackupRepository(
         val preservedDeleted = backupDao.countPreservedAfterLocalDeleteForAccount(accountId)
         val uploadedBytes = backupDao.sumTotalVerifiedUploadedBytesForAccount(accountId)
         val lastBackup = backupDao.getLastSuccessfulBackupTimestampForAccount(accountId)
-        val coverage = getFolderCoverageItems()
+        val coverage = precomputedCoverage ?: getFolderCoverageItems()
         val accessibleCount = coverage.count { it.accessStatus == FolderAccessStatus.ACCESSIBLE }
         val restrictedCount = coverage.count { it.accessStatus == FolderAccessStatus.RESTRICTED_BY_ANDROID_OS }
         val accountState = authManager.accountState.value
@@ -924,21 +928,25 @@ class BackupRepository(
     suspend fun getFolderCoverageItems(): List<FolderCoverageItem> {
         val accountId = currentAccountId()
         val baseItems = storageSource.getFolderCoverageReport(emptyMap())
-        val backedUpMap = mutableMapOf<String, Int>()
-        for (item in baseItems) {
-            backedUpMap[item.folderName] = backupDao.countVerifiedFilesInCategoryForAccount(accountId, item.folderName)
-        }
         val savedFolders = backupDao.getBackupFoldersForAccount(accountId)
         val savedByPath = savedFolders.associateBy { it.relativePath }
         val savedByName = savedFolders.associateBy { it.folderName }
 
-        val standardMerged = storageSource.getFolderCoverageReport(backedUpMap).map { item ->
+        val standardMerged = baseItems.map { item ->
+            val categoryKey = item.folderName.removePrefix("Dynamic Folder: ").trim()
+            val backedUp = backupDao.countVerifiedFilesInCategoryForAccount(accountId, item.folderName)
+                .takeIf { it > 0 }
+                ?: backupDao.countVerifiedFilesInCategoryForAccount(accountId, categoryKey)
             val saved = savedByPath[item.relativePath] ?: savedByName[item.folderName]
-            if (saved != null && item.accessStatus != FolderAccessStatus.RESTRICTED_BY_ANDROID_OS) {
-                item.copy(backupEnabled = saved.backupEnabled)
+            val enabled = if (saved != null && item.accessStatus != FolderAccessStatus.RESTRICTED_BY_ANDROID_OS) {
+                saved.backupEnabled
             } else {
-                item
+                item.backupEnabled
             }
+            item.copy(
+                backedUpFileCount = backedUp,
+                backupEnabled = enabled
+            )
         }
         val existingPaths = standardMerged.map { it.relativePath.lowercase() }.toSet()
         val existingNames = standardMerged.map { it.folderName.lowercase() }.toSet()

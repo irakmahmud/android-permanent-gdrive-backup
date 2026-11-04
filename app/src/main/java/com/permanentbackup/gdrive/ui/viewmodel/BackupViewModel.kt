@@ -27,6 +27,7 @@ import com.permanentbackup.gdrive.domain.model.OAuthDiagnosticReport
 import com.permanentbackup.gdrive.service.PermanentBackupForegroundService
 import com.permanentbackup.gdrive.worker.BackupWorkScheduler
 import com.permanentbackup.gdrive.worker.LocalStorageFileObserverManager
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -39,6 +40,10 @@ import kotlinx.coroutines.withContext
 class BackupViewModel(application: Application) : AndroidViewModel(application) {
     private val app = application as PermanentBackupApp
     private val repository = app.repository
+
+    private val vmExceptionHandler = CoroutineExceptionHandler { _, throwable ->
+        _actionFeedbackMessage.value = throwable.message ?: "Background sync operation encountered an error."
+    }
 
     private val _dashboardSummary = MutableStateFlow(DashboardSummary())
     val dashboardSummary: StateFlow<DashboardSummary> = _dashboardSummary.asStateFlow()
@@ -119,8 +124,8 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
     val savedAccounts: StateFlow<List<GoogleAccountEntity>> = repository.observeGoogleAccounts()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
-    private val fileObserverManager = LocalStorageFileObserverManager { detectedRelPath ->
-        viewModelScope.launch(Dispatchers.IO) {
+    private val fileObserverManager = LocalStorageFileObserverManager { _ ->
+        viewModelScope.launch(Dispatchers.IO + vmExceptionHandler) {
             if (settings.value.userBackupConsentGranted && !settings.value.backgroundSyncPaused) {
                 // Automatic trigger: failed files keep waiting for their exponential backoff window
                 repository.runBackupNow(respectRetryBackoff = true)
@@ -130,11 +135,11 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     init {
-        viewModelScope.launch {
+        viewModelScope.launch(vmExceptionHandler) {
             withContext(Dispatchers.IO) {
-                repository.syncPersistedAccountOnStartup()
-                fileObserverManager.startWatching()
-                BackupWorkScheduler.scheduleContentUriTriggeredBackup(getApplication(), settings.value)
+                runCatching { repository.syncPersistedAccountOnStartup() }
+                runCatching { fileObserverManager.startWatching() }
+                runCatching { BackupWorkScheduler.scheduleContentUriTriggeredBackup(getApplication(), settings.value) }
             }
             refreshDashboardAndCoverage(fetchRemoteQuota = true)
             refreshLocalPhoneBrowser("")
@@ -147,27 +152,36 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun refreshDashboardAndCoverage(fetchRemoteQuota: Boolean = false) {
-        viewModelScope.launch {
-            if (fetchRemoteQuota && repository.authManager.accountState.value.isConnected) {
-                withContext(Dispatchers.IO) {
-                    repository.backupEngine.refreshRemoteQuotaAndRootFolder()
-                    repository.backupEngine.syncCloudChangesIncremental()
-                    repository.persistCurrentAccountToDatabase()
+        viewModelScope.launch(vmExceptionHandler) {
+            withContext(Dispatchers.IO) {
+                if (fetchRemoteQuota && repository.authManager.accountState.value.isConnected) {
+                    runCatching { repository.backupEngine.refreshRemoteQuotaAndRootFolder() }
+                    runCatching { repository.backupEngine.syncCloudChangesIncremental() }
+                    runCatching { repository.persistCurrentAccountToDatabase() }
                 }
+                val dbOk = runCatching {
+                    app.database.checkDatabaseIntegrity() || app.database.attemptNonDestructiveRecovery()
+                }.getOrDefault(true)
+                val coverage = runCatching { repository.getFolderCoverageItems() }.getOrDefault(emptyList())
+                val summary = runCatching {
+                    repository.buildDashboardSummary(precomputedCoverage = coverage).copy(dbIntegrityOk = dbOk)
+                }.getOrDefault(DashboardSummary(dbIntegrityOk = dbOk))
+                val versions = runCatching {
+                    repository.getAccountBackupVersionsPaged(limit = 200)
+                }.getOrDefault(emptyList())
+                val diag = runCatching { repository.getOAuthDiagnostics() }.getOrDefault(_oauthDiagnostics.value)
+
+                _folderCoverage.value = coverage
+                _dashboardSummary.value = summary
+                _accountBackupVersions.value = versions
+                _oauthDiagnostics.value = diag
             }
-            val dbOk = withContext(Dispatchers.IO) {
-                app.database.checkDatabaseIntegrity() || app.database.attemptNonDestructiveRecovery()
-            }
-            _dashboardSummary.value = repository.buildDashboardSummary().copy(dbIntegrityOk = dbOk)
-            _folderCoverage.value = repository.getFolderCoverageItems()
-            _accountBackupVersions.value = repository.getAccountBackupVersionsPaged(limit = 200)
-            _oauthDiagnostics.value = repository.getOAuthDiagnostics()
             refreshCloudDriveExplorer()
         }
     }
 
     fun refreshCloudDriveExplorer() {
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch(Dispatchers.IO + vmExceptionHandler) {
             val currentFolderId = _driveFolderBreadcrumbs.value.lastOrNull()?.first
             val items = repository.browseCloudDriveFiles(
                 filter = _driveFilter.value,
@@ -182,7 +196,7 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
 
     fun loadMoreCloudDriveFiles() {
         val nextToken = cloudNextPageToken.value ?: return
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch(Dispatchers.IO + vmExceptionHandler) {
             val currentFolderId = _driveFolderBreadcrumbs.value.lastOrNull()?.first
             val nextItems = repository.browseCloudDriveFiles(
                 filter = _driveFilter.value,
@@ -198,7 +212,7 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
 
     fun createNewCloudFolder(folderName: String) {
         if (folderName.isBlank()) return
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch(Dispatchers.IO + vmExceptionHandler) {
             val currentFolderId = _driveFolderBreadcrumbs.value.lastOrNull()?.first
             val createdId = repository.createCloudFolder(folderName.trim(), currentFolderId)
             if (createdId != null) {
@@ -221,7 +235,7 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
         stageTemporaryGrant: Boolean = false
     ) {
         if (uris.isEmpty()) return
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch(Dispatchers.IO + vmExceptionHandler) {
             if (!settings.value.userBackupConsentGranted) {
                 repository.saveSettingsToDatabase(settings.value.copy(userBackupConsentGranted = true))
             }
@@ -269,7 +283,7 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun onSafFolderGranted(treeUri: Uri) {
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch(Dispatchers.IO + vmExceptionHandler) {
             val label = treeUri.lastPathSegment?.substringAfterLast(':')?.substringAfterLast('/')?.ifBlank { "SAF_Custom" }
                 ?: "SAF_Custom"
             repository.registerPersistedSafFolder(treeUri.toString(), label)
@@ -280,7 +294,7 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun toggleLocalSubfolderAutoBackup(item: LocalBrowseItem, enabled: Boolean) {
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch(Dispatchers.IO + vmExceptionHandler) {
             repository.toggleCustomLocalFolderAutoBackup(item, enabled)
             _actionFeedbackMessage.value = if (enabled) {
                 "Added subfolder '${item.relativePath}' to auto-backup."
@@ -328,7 +342,7 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun refreshLocalPhoneBrowser(relativeSubPath: String = _currentLocalPath.value) {
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch(Dispatchers.IO + vmExceptionHandler) {
             _currentLocalPath.value = relativeSubPath
             _localPhoneItems.value = repository.browseLocalPhoneStorage(relativeSubPath)
         }
@@ -341,7 +355,7 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun toggleFolderBackup(item: FolderCoverageItem, enabled: Boolean) {
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch(Dispatchers.IO + vmExceptionHandler) {
             repository.toggleFolderBackupEnabled(item, enabled)
             _actionFeedbackMessage.value = if (enabled) {
                 "Enabled permanent backup for folder '${item.folderName}'."
@@ -353,7 +367,7 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun backupSingleLocalFile(item: LocalBrowseItem) {
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch(Dispatchers.IO + vmExceptionHandler) {
             if (!settings.value.userBackupConsentGranted) {
                 repository.saveSettingsToDatabase(settings.value.copy(userBackupConsentGranted = true))
             }
@@ -383,7 +397,7 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun togglePauseSingleRecord(recordId: Long, pause: Boolean) {
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch(Dispatchers.IO + vmExceptionHandler) {
             repository.backupEngine.pauseSingleRecord(recordId, pause)
             refreshDashboardAndCoverage()
             if (!pause) {
@@ -395,14 +409,14 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun retryFailedUploads() {
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch(Dispatchers.IO + vmExceptionHandler) {
             repository.retryAllFailedUploads()
             refreshDashboardAndCoverage(fetchRemoteQuota = true)
         }
     }
 
     fun retrySingleRecord(recordId: Long) {
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch(Dispatchers.IO + vmExceptionHandler) {
             repository.requeueFailedRecord(recordId)
             repository.runUploadQueueNow()
             refreshDashboardAndCoverage(fetchRemoteQuota = true)
@@ -410,7 +424,7 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun restoreBackupVersion(record: BackupFileEntity) {
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch(Dispatchers.IO + vmExceptionHandler) {
             _actionFeedbackMessage.value = "Restoring '${record.driveStoredName}' (v${record.backupVersion})..."
             val outcome = repository.restoreBackupRecord(record)
             _actionFeedbackMessage.value = outcome.message
@@ -419,7 +433,7 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun restoreAccountBackupVersionEntity(ver: BackupVersionEntity) {
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch(Dispatchers.IO + vmExceptionHandler) {
             _actionFeedbackMessage.value = "Restoring '${ver.driveStoredName}' (v${ver.versionNumber})..."
             val outcome = repository.restoreBackupVersionEntity(ver)
             _actionFeedbackMessage.value = outcome.message
@@ -428,7 +442,7 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun inspectAllVersionsForFile(sourceFileIdentity: String) {
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch(Dispatchers.IO + vmExceptionHandler) {
             _selectedFileVersions.value = repository.getAllVersionsForFile(sourceFileIdentity)
         }
     }
@@ -438,7 +452,7 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun restoreCloudFile(item: CloudBrowseItem) {
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch(Dispatchers.IO + vmExceptionHandler) {
             _actionFeedbackMessage.value = if (item.isFolder) {
                 "Downloading folder '${item.name}' recursively from Google Drive..."
             } else {
@@ -451,7 +465,7 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun mirrorCloudFolderToPhone(item: CloudBrowseItem) {
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch(Dispatchers.IO + vmExceptionHandler) {
             _actionFeedbackMessage.value = "Mirroring folder '${item.name}' (One-Way Cloud -> Phone, Isolated from Backup)..."
             val outcome = repository.mirrorCloudFolderToLocal(item)
             _actionFeedbackMessage.value = outcome.message
@@ -460,7 +474,7 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun toggleCloudFileOfflinePin(item: CloudBrowseItem) {
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch(Dispatchers.IO + vmExceptionHandler) {
             val outcome = repository.toggleOfflinePin(item)
             _actionFeedbackMessage.value = outcome.message
             refreshDashboardAndCoverage()
@@ -468,7 +482,7 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun unpinOfflineEntity(entity: CloudFileEntity) {
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch(Dispatchers.IO + vmExceptionHandler) {
             repository.cloudFileOps.unpinCloudFileOffline(entity.driveFileId)
             _actionFeedbackMessage.value = "Unpinned '${entity.name}' from local offline cache."
             refreshDashboardAndCoverage()
@@ -476,7 +490,7 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun previewCloudFileStream(item: CloudBrowseItem) {
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch(Dispatchers.IO + vmExceptionHandler) {
             val snippet = repository.cloudFileOps.streamPreviewSnippet(
                 driveFileId = item.driveFileId,
                 workspaceMimeType = item.mimeType
@@ -490,7 +504,7 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun updateSettings(newSettings: BackupSettings) {
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch(Dispatchers.IO + vmExceptionHandler) {
             repository.saveSettingsToDatabase(newSettings)
             BackupWorkScheduler.schedulePeriodicBackup(getApplication(), newSettings)
             refreshDashboardAndCoverage()
@@ -510,7 +524,7 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
         onResolutionPendingIntent: (PendingIntent) -> Unit = {},
         onRecoverableConsentIntent: (Intent) -> Unit = {}
     ) {
-        viewModelScope.launch {
+        viewModelScope.launch(vmExceptionHandler) {
             _signInStatusMessage.value = "Authorizing Google Drive access for $selectedEmail..."
             val outcome = withContext(Dispatchers.IO) {
                 val res = repository.authManager.trySilentOrInteractiveAuthorization(
@@ -571,7 +585,7 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun verifyAndRefreshCloudConnection() {
-        viewModelScope.launch {
+        viewModelScope.launch(vmExceptionHandler) {
             _signInStatusMessage.value = "Verifying Google Drive connection & storage quota..."
             val ok = withContext(Dispatchers.IO) {
                 if (!repository.authManager.accountState.value.isConnected) {
@@ -597,7 +611,7 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun disconnectGoogleAccount() {
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch(Dispatchers.IO + vmExceptionHandler) {
             repository.authManager.disconnectAccount()
             repository.persistCurrentAccountToDatabase()
             _signInStatusMessage.value = "Signed out. Tap 'Connect Google Account' when you wish to sign in."

@@ -66,8 +66,11 @@ class PermanentDriveDocumentsProvider : DocumentsProvider() {
     override fun queryRoots(projection: Array<out String>?): Cursor {
         val result = MatrixCursor(projection ?: DEFAULT_ROOT_PROJECTION)
         val app = context?.applicationContext as? PermanentBackupApp
-        val accountEmail = app?.repository?.authManager?.accountState?.value?.email?.ifBlank { null }
-            ?: "Zero-Delete Cloud Vault & Offline Pinned Cache"
+        val accountEmail = try {
+            app?.repository?.authManager?.accountState?.value?.email?.ifBlank { null }
+        } catch (_: Throwable) {
+            null
+        } ?: "Zero-Delete Cloud Vault & Offline Pinned Cache"
 
         result.newRow().apply {
             add(Root.COLUMN_ROOT_ID, ROOT_ID)
@@ -112,26 +115,29 @@ class PermanentDriveDocumentsProvider : DocumentsProvider() {
                         )
                     }
                 } else if (app != null) {
-                    runBlocking {
-                        val isFolderDoc = docId.startsWith("folder:")
-                        val cloudId = docId.removePrefix("folder:").removePrefix("cloud:")
-                        val cached = app.database.backupDao().getCloudFileById(cloudId)
-                        if (cached != null) {
-                            val mime = if (cached.isFolder || isFolderDoc) Document.MIME_TYPE_DIR else cached.mimeType
-                            val resolvedDocId = if (cached.isFolder || isFolderDoc) {
-                                "folder:${cached.driveFileId}"
-                            } else {
-                                "cloud:${cached.driveFileId}"
+                    try {
+                        runBlocking {
+                            val isFolderDoc = docId.startsWith("folder:")
+                            val cloudId = docId.removePrefix("folder:").removePrefix("cloud:")
+                            val cached = app.database.backupDao().getCloudFileById(cloudId)
+                            if (cached != null) {
+                                val mime = if (cached.isFolder || isFolderDoc) Document.MIME_TYPE_DIR else cached.mimeType
+                                val resolvedDocId = if (cached.isFolder || isFolderDoc) {
+                                    "folder:${cached.driveFileId}"
+                                } else {
+                                    "cloud:${cached.driveFileId}"
+                                }
+                                includeFileRow(
+                                    cursor = result,
+                                    documentId = resolvedDocId,
+                                    displayName = cached.name,
+                                    mimeType = mime,
+                                    sizeBytes = cached.sizeBytes,
+                                    lastModifiedMs = cached.modifiedTimeMs
+                                )
                             }
-                            includeFileRow(
-                                cursor = result,
-                                documentId = resolvedDocId,
-                                displayName = cached.name,
-                                mimeType = mime,
-                                sizeBytes = cached.sizeBytes,
-                                lastModifiedMs = cached.modifiedTimeMs
-                            )
                         }
+                    } catch (_: Throwable) {
                     }
                 }
             }
@@ -148,75 +154,78 @@ class PermanentDriveDocumentsProvider : DocumentsProvider() {
         val parentId = parentDocumentId ?: DOC_ID_ROOT
         val app = context?.applicationContext as? PermanentBackupApp ?: return result
 
-        when (parentId) {
-            DOC_ID_ROOT -> {
-                includeDirectoryRow(result, DOC_ID_PINNED_OFFLINE, "Pinned Offline (Seekable Local Cache)", System.currentTimeMillis())
-                includeDirectoryRow(result, DOC_ID_VERIFIED_BACKUPS, "Verified Cloud Backups (Read-Only)", System.currentTimeMillis())
-                runBlocking {
-                    val rootFiles = app.database.backupDao().getCloudFilesByParent("root")
-                    for (item in rootFiles) {
-                        includeFileRow(
-                            cursor = result,
-                            documentId = if (item.isFolder) "folder:${item.driveFileId}" else "cloud:${item.driveFileId}",
-                            displayName = item.name,
-                            mimeType = if (item.isFolder) Document.MIME_TYPE_DIR else item.mimeType,
-                            sizeBytes = item.sizeBytes,
-                            lastModifiedMs = item.modifiedTimeMs
-                        )
+        try {
+            when (parentId) {
+                DOC_ID_ROOT -> {
+                    includeDirectoryRow(result, DOC_ID_PINNED_OFFLINE, "Pinned Offline (Seekable Local Cache)", System.currentTimeMillis())
+                    includeDirectoryRow(result, DOC_ID_VERIFIED_BACKUPS, "Verified Cloud Backups (Read-Only)", System.currentTimeMillis())
+                    runBlocking {
+                        val rootFiles = app.database.backupDao().getCloudFilesByParent("root")
+                        for (item in rootFiles) {
+                            includeFileRow(
+                                cursor = result,
+                                documentId = if (item.isFolder) "folder:${item.driveFileId}" else "cloud:${item.driveFileId}",
+                                displayName = item.name,
+                                mimeType = if (item.isFolder) Document.MIME_TYPE_DIR else item.mimeType,
+                                sizeBytes = item.sizeBytes,
+                                lastModifiedMs = item.modifiedTimeMs
+                            )
+                        }
                     }
                 }
-            }
-            DOC_ID_PINNED_OFFLINE -> {
-                val seenNames = HashSet<String>()
-                for (cacheDir in getCandidateOfflineCacheDirs()) {
-                    if (cacheDir.exists() && cacheDir.isDirectory) {
-                        cacheDir.walkTopDown().filter { it.isFile }.forEach { file ->
-                            if (seenNames.add(file.name)) {
-                                includeFileRow(
-                                    cursor = result,
-                                    documentId = "local_pinned:${file.name}",
-                                    displayName = file.name.substringAfter("_", file.name),
-                                    mimeType = resolveMimeFromExtension(file.name),
-                                    sizeBytes = file.length(),
-                                    lastModifiedMs = file.lastModified()
-                                )
+                DOC_ID_PINNED_OFFLINE -> {
+                    val seenNames = HashSet<String>()
+                    for (cacheDir in getCandidateOfflineCacheDirs()) {
+                        if (cacheDir.exists() && cacheDir.isDirectory) {
+                            cacheDir.walkTopDown().filter { it.isFile }.forEach { file ->
+                                if (seenNames.add(file.name)) {
+                                    includeFileRow(
+                                        cursor = result,
+                                        documentId = "local_pinned:${file.name}",
+                                        displayName = file.name.substringAfter("_", file.name),
+                                        mimeType = resolveMimeFromExtension(file.name),
+                                        sizeBytes = file.length(),
+                                        lastModifiedMs = file.lastModified()
+                                    )
+                                }
                             }
                         }
                     }
                 }
-            }
-            DOC_ID_VERIFIED_BACKUPS -> {
-                runBlocking {
-                    val verified = app.database.backupDao().getVerifiedBackupsPaged(limit = 200, offset = 0)
-                    for (record in verified) {
-                        val driveId = record.driveFileId ?: continue
-                        includeFileRow(
-                            cursor = result,
-                            documentId = "cloud:$driveId",
-                            displayName = "${record.displayName} (v${record.backupVersion})",
-                            mimeType = record.mimeType,
-                            sizeBytes = record.fileSize,
-                            lastModifiedMs = record.lastModifiedMs
-                        )
+                DOC_ID_VERIFIED_BACKUPS -> {
+                    runBlocking {
+                        val verified = app.database.backupDao().getVerifiedBackupsPaged(limit = 200, offset = 0)
+                        for (record in verified) {
+                            val driveId = record.driveFileId ?: continue
+                            includeFileRow(
+                                cursor = result,
+                                documentId = "cloud:$driveId",
+                                displayName = "${record.displayName} (v${record.backupVersion})",
+                                mimeType = record.mimeType,
+                                sizeBytes = record.fileSize,
+                                lastModifiedMs = record.lastModifiedMs
+                            )
+                        }
+                    }
+                }
+                else -> {
+                    val folderDriveId = parentId.removePrefix("folder:").removePrefix("cloud:")
+                    runBlocking {
+                        val children = app.database.backupDao().getCloudFilesByParent(folderDriveId)
+                        for (item in children) {
+                            includeFileRow(
+                                cursor = result,
+                                documentId = if (item.isFolder) "folder:${item.driveFileId}" else "cloud:${item.driveFileId}",
+                                displayName = item.name,
+                                mimeType = if (item.isFolder) Document.MIME_TYPE_DIR else item.mimeType,
+                                sizeBytes = item.sizeBytes,
+                                lastModifiedMs = item.modifiedTimeMs
+                            )
+                        }
                     }
                 }
             }
-            else -> {
-                val folderDriveId = parentId.removePrefix("folder:").removePrefix("cloud:")
-                runBlocking {
-                    val children = app.database.backupDao().getCloudFilesByParent(folderDriveId)
-                    for (item in children) {
-                        includeFileRow(
-                            cursor = result,
-                            documentId = if (item.isFolder) "folder:${item.driveFileId}" else "cloud:${item.driveFileId}",
-                            displayName = item.name,
-                            mimeType = if (item.isFolder) Document.MIME_TYPE_DIR else item.mimeType,
-                            sizeBytes = item.sizeBytes,
-                            lastModifiedMs = item.modifiedTimeMs
-                        )
-                    }
-                }
-            }
+        } catch (_: Throwable) {
         }
         return result
     }
@@ -231,18 +240,21 @@ class PermanentDriveDocumentsProvider : DocumentsProvider() {
         if (searchQuery.isEmpty()) return result
         val app = context?.applicationContext as? PermanentBackupApp ?: return result
 
-        runBlocking {
-            val matches = app.database.backupDao().searchAllCloudFiles(searchQuery)
-            for (item in matches) {
-                includeFileRow(
-                    cursor = result,
-                    documentId = if (item.isFolder) "folder:${item.driveFileId}" else "cloud:${item.driveFileId}",
-                    displayName = item.name,
-                    mimeType = if (item.isFolder) Document.MIME_TYPE_DIR else item.mimeType,
-                    sizeBytes = item.sizeBytes,
-                    lastModifiedMs = item.modifiedTimeMs
-                )
+        try {
+            runBlocking {
+                val matches = app.database.backupDao().searchAllCloudFiles(searchQuery)
+                for (item in matches) {
+                    includeFileRow(
+                        cursor = result,
+                        documentId = if (item.isFolder) "folder:${item.driveFileId}" else "cloud:${item.driveFileId}",
+                        displayName = item.name,
+                        mimeType = if (item.isFolder) Document.MIME_TYPE_DIR else item.mimeType,
+                        sizeBytes = item.sizeBytes,
+                        lastModifiedMs = item.modifiedTimeMs
+                    )
+                }
             }
+        } catch (_: Throwable) {
         }
         return result
     }
