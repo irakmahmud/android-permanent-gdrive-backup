@@ -19,6 +19,7 @@ import androidx.work.WorkerParameters
 import com.permanentbackup.gdrive.PermanentBackupApp
 import com.permanentbackup.gdrive.domain.engine.AndroidStorageScanner
 import com.permanentbackup.gdrive.domain.model.BackupSettings
+import com.permanentbackup.gdrive.service.PermanentBackupForegroundService
 import java.io.File
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
@@ -34,23 +35,29 @@ class PermanentBackupWorker(
 ) : CoroutineWorker(appContext, params) {
 
     override suspend fun doWork(): Result {
-        val app = applicationContext as? PermanentBackupApp ?: return Result.failure()
-        val currentSettings = app.repository.settings.value
-        // Re-arm one-time ContentUriTrigger observer for continuous real-time MediaStore watching
-        BackupWorkScheduler.scheduleContentUriTriggeredBackup(applicationContext, currentSettings)
+        return try {
+            val app = applicationContext as? PermanentBackupApp ?: return Result.failure()
+            runCatching { app.repository.syncPersistedAccountOnStartup() }
+            val currentSettings = app.repository.settings.value
+            // Re-arm one-time ContentUriTrigger observer for continuous real-time MediaStore watching
+            BackupWorkScheduler.scheduleContentUriTriggeredBackup(applicationContext, currentSettings)
+            runCatching { PermanentBackupForegroundService.startManualBackupService(applicationContext) }
 
-        // Automatic trigger: respect each failed file's exponential retry backoff window
-        val summary = app.repository.runBackupNow(respectRetryBackoff = true)
+            // Automatic trigger: respect each failed file's exponential retry backoff window
+            val summary = app.repository.runBackupNow(respectRetryBackoff = true)
 
-        if (summary.quotaFull || summary.permissionDenied) {
-            // Do not endlessly spin retries when storage quota is full or user revoked permission
-            return Result.failure()
-        }
+            if (summary.quotaFull || summary.permissionDenied) {
+                // Do not endlessly spin retries when storage quota is full or user revoked permission
+                return Result.failure()
+            }
 
-        return if (summary.failedUploads > 0) {
+            if (summary.failedUploads > 0) {
+                Result.retry()
+            } else {
+                Result.success()
+            }
+        } catch (_: Throwable) {
             Result.retry()
-        } else {
-            Result.success()
         }
     }
 }
@@ -290,6 +297,8 @@ class BootCompletedReceiver : BroadcastReceiver() {
             val settings = app?.repository?.settings?.value ?: BackupSettings()
             BackupWorkScheduler.schedulePeriodicBackup(context, settings)
             BackupWorkScheduler.enqueueImmediateRetryWork(context, settings)
+            runCatching { PermanentBackupForegroundService.startManualBackupService(context) }
         }
     }
 }
+

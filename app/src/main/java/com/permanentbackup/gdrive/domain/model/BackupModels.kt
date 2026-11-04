@@ -141,10 +141,10 @@ data class GoogleAccountState(
 )
 
 data class BackupSettings(
-    val userBackupConsentGranted: Boolean = false,
-    val wifiOnly: Boolean = true,
+    val userBackupConsentGranted: Boolean = true,
+    val wifiOnly: Boolean = false,
     val chargingOnly: Boolean = false,
-    val unmeteredNetworkOnly: Boolean = true,
+    val unmeteredNetworkOnly: Boolean = false,
     val uploadConcurrency: Int = 1,
     val periodicIntervalHours: Int = 6,
     val chunkSizeBytes: Int = 256 * 1024, // 256 KiB multiple required by Google Drive Resumable Upload API
@@ -276,7 +276,11 @@ data class DashboardSummary(
     val quotaFullAlert: Boolean = false,
     val networkFailureMessage: String? = null,
     val isBackupRunning: Boolean = false,
-    val dbIntegrityOk: Boolean = true
+    val dbIntegrityOk: Boolean = true,
+    val currentPhoneSourcePath: String = "/storage/emulated/0/{DCIM, Pictures, Videos, Downloads, Documents, WhatsApp, Telegram}",
+    val currentDriveTargetPath: String = "My Drive / Android_Permanent_Backup/",
+    val currentScanningOrUploadingFile: String? = null,
+    val isContinuousAutoBackupServiceActive: Boolean = true
 )
 
 class NeverDeletePolicyViolationException(message: String) : SecurityException(message)

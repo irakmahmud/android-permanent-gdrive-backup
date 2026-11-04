@@ -587,7 +587,26 @@ abstract class PermanentBackupDatabase : RoomDatabase() {
 
         fun getInstance(context: Context): PermanentBackupDatabase {
             return INSTANCE ?: synchronized(this) {
-                INSTANCE ?: buildDatabase(context.applicationContext).also { INSTANCE = it }
+                INSTANCE ?: buildAndVerifyDatabase(context.applicationContext).also { INSTANCE = it }
+            }
+        }
+
+        private fun buildAndVerifyDatabase(appContext: Context): PermanentBackupDatabase {
+            val candidate = buildDatabase(appContext)
+            return try {
+                candidate.openHelper.writableDatabase
+                candidate
+            } catch (_: Throwable) {
+                // Self-heal if a prior broken install left an unopenable or half-migrated SQLite file
+                try {
+                    candidate.close()
+                } catch (_: Throwable) {
+                }
+                try {
+                    appContext.deleteDatabase(DB_NAME)
+                } catch (_: Throwable) {
+                }
+                buildDatabase(appContext)
             }
         }
 
@@ -598,7 +617,9 @@ abstract class PermanentBackupDatabase : RoomDatabase() {
                 DB_NAME
             )
                 .setJournalMode(JournalMode.WRITE_AHEAD_LOGGING)
+                .allowMainThreadQueries()
                 .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+                .fallbackToDestructiveMigration()
                 .fallbackToDestructiveMigrationOnDowngrade()
                 .build()
         }

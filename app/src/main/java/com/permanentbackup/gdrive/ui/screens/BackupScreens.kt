@@ -14,8 +14,9 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.itemsIndexed as gridItemsIndexed
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -80,14 +81,20 @@ enum class AppScreen(val title: String) {
 fun HomeDashboardScreen(
     summary: DashboardSummary,
     settings: BackupSettings,
+    folderCoverage: List<FolderCoverageItem> = emptyList(),
+    activeQueue: List<BackupFileEntity> = emptyList(),
+    recentRecords: List<BackupFileEntity> = emptyList(),
     actionFeedback: String?,
     onBackupNow: () -> Unit,
     onConnectOrManageAccount: () -> Unit,
     onOpenPhoneStorageScreen: () -> Unit,
     onOpenMyDriveScreen: () -> Unit,
     onEnableConsentAndPermissions: () -> Unit,
+    onRequestBatteryUnrestricted: () -> Unit = {},
     onRefresh: () -> Unit
 ) {
+    val rootDriveName = summary.accountState.rootDriveFolderName.ifBlank { "Android_Permanent_Backup" }
+
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
@@ -110,6 +117,116 @@ fun HomeDashboardScreen(
             }
         }
 
+        // PROMINENT LIVE AUTO-BACKUP DESTINATION & PHONE SOURCE CARD
+        item {
+            Card(
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.primaryContainer
+                ),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Text(
+                        text = if (settings.backgroundSyncPaused) {
+                            "⏸ AUTO-BACKUP PAUSED BY USER"
+                        } else {
+                            "🟢 24/7 AUTO-BACKUP ACTIVE (NEVER STOPS IN BACKGROUND)"
+                        },
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 2.dp))
+                    Text(
+                        text = "☁️ WHERE IT IS BACKING UP IN GOOGLE DRIVE:",
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        text = summary.currentDriveTargetPath.ifBlank {
+                            "My Drive / $rootDriveName / <Phone_Folder_Name> / <File_Name>"
+                        },
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Text(
+                        text = "Google Account: ${if (summary.accountState.isConnected) summary.accountState.email else "Auto-Connecting (irakiroan@gmail.com)..."} • Root Folder: My Drive / $rootDriveName",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "📱 WHICH FOLDER OR FILE IS BACKING UP FROM PHONE:",
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        text = summary.currentPhoneSourcePath.ifBlank {
+                            "/storage/emulated/0/{DCIM, Pictures, Movies, Download, Documents, Music, WhatsApp, Telegram}"
+                        },
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Text(
+                        text = "Live Engine Status: ${
+                            summary.currentScanningOrUploadingFile
+                                ?: if (summary.isBackupRunning) {
+                                    "Scanning phone folders & uploading new/modified files to My Drive / $rootDriveName..."
+                                } else {
+                                    "24/7 Real-Time Watcher Active — Monitoring all phone folders for new or modified files"
+                                }
+                        }",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
+        }
+
+        // Active Streaming Upload Progress Card (with exact Phone & Google Drive paths)
+        summary.currentlyUploading?.let { active ->
+            val parentSubfolder = active.relativePath.replace('\\', '/').substringBeforeLast('/', "")
+            val driveFullTarget = if (parentSubfolder.isNotBlank()) {
+                "My Drive / $rootDriveName / $parentSubfolder / ${active.fileName}"
+            } else {
+                "My Drive / $rootDriveName / ${active.fileName}"
+            }
+            item {
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Text(
+                            text = "⬆️ LIVE FILE UPLOADING NOW (${active.syncJobState.name})",
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = "File Name: ${active.fileName} (Version v${active.backupVersion})",
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text("From Phone Folder/File: /storage/emulated/0/${active.relativePath.trimStart('/')}")
+                        Text("To Google Drive Folder: $driveFullTarget")
+                        Text("Progress: ${formatBytes(active.uploadedBytes)} / ${formatBytes(active.totalBytes)} (${(active.fraction * 100).toInt()}%)")
+                        Text(
+                            "Speed: ${formatBytes(active.transferSpeedBps)}/s | ETA: ${
+                                active.estimatedRemainingSeconds?.let { "${it}s" } ?: "Calculating..."
+                            }"
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+                        LinearProgressIndicator(
+                            progress = { active.fraction.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: 0f },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+                }
+            }
+        }
+
         // Quick Setup & Persistent Connection Card
         item {
             Card(
@@ -123,7 +240,7 @@ fun HomeDashboardScreen(
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Text(
-                        text = "Permanent Drive — Desktop-Class Android Client",
+                        text = "Permanent Drive — Auto-Backup & Permissions",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
                     )
@@ -133,7 +250,7 @@ fun HomeDashboardScreen(
                     ) {
                         Text(
                             if (summary.accountState.isConnected) {
-                                "✓ Connected: ${summary.accountState.email} (Persistent Session)"
+                                "✓ Connected: ${summary.accountState.email} (Auto-Backup Active)"
                             } else {
                                 "1. Connect Google Account (গুগল ড্রাইভ যুক্ত করুন)"
                             }
@@ -143,7 +260,7 @@ fun HomeDashboardScreen(
                         onClick = onEnableConsentAndPermissions,
                         modifier = Modifier.fillMaxWidth(),
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = if (settings.userBackupConsentGranted && summary.accessibleFolderCount > 0) {
+                            containerColor = if (summary.accessibleFolderCount > 0) {
                                 MaterialTheme.colorScheme.secondary
                             } else {
                                 MaterialTheme.colorScheme.primary
@@ -151,12 +268,18 @@ fun HomeDashboardScreen(
                         )
                     ) {
                         Text(
-                            if (settings.userBackupConsentGranted && summary.accessibleFolderCount > 0) {
-                                "✓ Phone Storage Access Active (${summary.accessibleFolderCount} Folders)"
+                            if (summary.accessibleFolderCount > 0) {
+                                "✓ Phone Storage Access Active (${summary.accessibleFolderCount} Folders Backing Up)"
                             } else {
-                                "2. Grant Phone Storage Permission (স্টোরেজ পারমিশন দিন)"
+                                "2. Grant All-Files Storage Permission (সব ফোল্ডার ব্যাকআপ পারমিশন দিন)"
                             }
                         )
+                    }
+                    OutlinedButton(
+                        onClick = onRequestBatteryUnrestricted,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("3. Allow 24/7 Unrestricted Background Run (Never Stop in Background)")
                     }
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -172,7 +295,121 @@ fun HomeDashboardScreen(
                             onClick = onOpenPhoneStorageScreen,
                             modifier = Modifier.weight(1f)
                         ) {
-                            Text("Phone Explorer")
+                            Text("Phone Folders")
+                        }
+                    }
+                }
+            }
+        }
+
+        // PHONE FOLDERS BACKING UP TO GOOGLE DRIVE
+        item {
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Text(
+                        text = "📂 Phone Folders Auto-Backing Up to Google Drive",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        text = "Every phone folder below is automatically mirrored into 'My Drive / $rootDriveName / <Folder>' (Append-Only, Zero Deletion):",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    val visibleFolders = folderCoverage.filter {
+                        it.accessStatus != FolderAccessStatus.RESTRICTED_BY_ANDROID_OS
+                    }
+                    if (visibleFolders.isEmpty()) {
+                        Text(
+                            text = "• Phone: /storage/emulated/0/DCIM  ➔  Google Drive: My Drive / $rootDriveName / DCIM\n" +
+                                "• Phone: /storage/emulated/0/Pictures  ➔  Google Drive: My Drive / $rootDriveName / Pictures\n" +
+                                "• Phone: /storage/emulated/0/Movies  ➔  Google Drive: My Drive / $rootDriveName / Movies\n" +
+                                "• Phone: /storage/emulated/0/Download  ➔  Google Drive: My Drive / $rootDriveName / Download\n" +
+                                "• Phone: /storage/emulated/0/Documents  ➔  Google Drive: My Drive / $rootDriveName / Documents\n" +
+                                "• Phone: /storage/emulated/0/Music  ➔  Google Drive: My Drive / $rootDriveName / Music\n" +
+                                "• Phone: /storage/emulated/0/Android/media/com.whatsapp/WhatsApp/Media  ➔  Google Drive: My Drive / $rootDriveName / WhatsApp",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    } else {
+                        visibleFolders.forEach { folder ->
+                            HorizontalDivider(modifier = Modifier.padding(vertical = 2.dp))
+                            Text(
+                                text = "📁 ${folder.folderName} (${if (folder.backupEnabled) "Auto-Backup ON" else "Paused"})",
+                                fontWeight = FontWeight.Bold,
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                            Text(
+                                text = "From Phone: /storage/emulated/0/${folder.relativePath.trimStart('/')}",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                            Text(
+                                text = "To Google Drive: My Drive / $rootDriveName / ${folder.relativePath.trimStart('/')}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                            Text(
+                                text = "Backed Up: ${folder.backedUpFileCount} / ${folder.discoveredFileCount} files (${(folder.completenessFraction * 100).toInt()}%)",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // LIVE & RECENT FILES BACKING UP FROM PHONE TO GOOGLE DRIVE
+        item {
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Text(
+                        text = "📄 Files Backing Up from Phone to Google Drive",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                    val combinedFiles = (activeQueue + recentRecords)
+                        .distinctBy { it.id }
+                        .take(10)
+                    if (combinedFiles.isEmpty()) {
+                        Text(
+                            text = if (summary.accessibleFolderCount == 0) {
+                                "Grant Phone Storage Permission above so the auto-backup engine can scan and upload your phone files."
+                            } else {
+                                "Auto-backup scanner is active. New or existing files in DCIM, Pictures, Downloads, Documents, Music, and Videos will appear here with their exact Phone and Google Drive paths."
+                            },
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    } else {
+                        combinedFiles.forEach { file ->
+                            val subDir = file.relativePath.replace('\\', '/').substringBeforeLast('/', "")
+                            val driveDest = if (subDir.isNotBlank()) {
+                                "My Drive / $rootDriveName / $subDir / ${file.driveStoredName}"
+                            } else {
+                                "My Drive / $rootDriveName / ${file.driveStoredName}"
+                            }
+                            HorizontalDivider(modifier = Modifier.padding(vertical = 2.dp))
+                            Text(
+                                text = "📄 ${file.driveStoredName} (v${file.backupVersion}) — ${file.uploadStatus}",
+                                fontWeight = FontWeight.Bold,
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                            Text(
+                                text = "From Phone: /storage/emulated/0/${file.relativePath.trimStart('/')}",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                            Text(
+                                text = "To Google Drive: $driveDest",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                            Text(
+                                text = "Size: ${formatBytes(file.uploadedBytes)} / ${formatBytes(file.fileSize)}",
+                                style = MaterialTheme.typography.bodySmall
+                            )
                         }
                     }
                 }
@@ -193,7 +430,7 @@ fun HomeDashboardScreen(
                         fontWeight = FontWeight.Bold
                     )
                     Text(
-                        text = "Append-Only & Non-Destructive Backup to '${summary.accountState.rootDriveFolderName}'. Local file delete, folder delete, rename, move, or modification NEVER deletes or overwrites previous cloud versions.",
+                        text = "Append-Only & Non-Destructive Backup to 'My Drive / $rootDriveName'. Local file delete, folder delete, rename, move, or modification NEVER deletes or overwrites previous cloud versions.",
                         style = MaterialTheme.typography.bodySmall
                     )
                 }
@@ -229,31 +466,6 @@ fun HomeDashboardScreen(
             }
         }
 
-        summary.currentlyUploading?.let { active ->
-            item {
-                Card(modifier = Modifier.fillMaxWidth()) {
-                    Column(modifier = Modifier.padding(16.dp)) {
-                        Text(
-                            text = "Streaming Upload (${active.syncJobState.name})",
-                            fontWeight = FontWeight.Bold
-                        )
-                        Text("File: ${active.fileName} (v${active.backupVersion})")
-                        Text("Progress: ${formatBytes(active.uploadedBytes)} / ${formatBytes(active.totalBytes)} (${(active.fraction * 100).toInt()}%)")
-                        Text(
-                            "Speed: ${formatBytes(active.transferSpeedBps)}/s | ETA: ${
-                                active.estimatedRemainingSeconds?.let { "${it}s" } ?: "Calculating..."
-                            }"
-                        )
-                        Spacer(modifier = Modifier.height(6.dp))
-                        LinearProgressIndicator(
-                            progress = { active.fraction.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: 0f },
-                            modifier = Modifier.fillMaxWidth()
-                        )
-                    }
-                }
-            }
-        }
-
         // Section 12 Home Dashboard Metrics
         item {
             Card(modifier = Modifier.fillMaxWidth()) {
@@ -268,8 +480,10 @@ fun HomeDashboardScreen(
                     )
                     MetricRow(
                         "Connected Google Account",
-                        if (summary.accountState.isConnected) summary.accountState.email else "Disconnected"
+                        if (summary.accountState.isConnected) summary.accountState.email else "Auto-Connecting..."
                     )
+                    MetricRow("Google Drive Backup Folder", "My Drive / $rootDriveName")
+                    MetricRow("Background Auto-Backup", if (settings.backgroundSyncPaused) "Paused" else "Active 24/7 (Never Stops)")
                     MetricRow("Background Sync Status", summary.backgroundSyncStatus.label)
                     MetricRow(
                         "Google Drive Storage Used",
@@ -318,7 +532,7 @@ fun HomeDashboardScreen(
                     onClick = onBackupNow,
                     modifier = Modifier.weight(1f)
                 ) {
-                    Text(if (summary.isBackupRunning) "Backup Running..." else "Backup Now")
+                    Text(if (summary.isBackupRunning) "Auto-Backup Running..." else "Run Backup Now")
                 }
                 OutlinedButton(
                     onClick = onRefresh,
@@ -584,7 +798,7 @@ fun MyDriveExplorerScreen(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 modifier = Modifier.fillMaxSize()
             ) {
-                items(items, key = { it.driveFileId }) { item ->
+                gridItemsIndexed(items, key = { idx, it -> "grid_${idx}_${it.driveFileId}" }) { _, item ->
                     DriveFileCard(
                         item = item,
                         onOpenFolder = onOpenFolder,
@@ -610,7 +824,7 @@ fun MyDriveExplorerScreen(
                 verticalArrangement = Arrangement.spacedBy(8.dp),
                 modifier = Modifier.fillMaxSize()
             ) {
-                items(items, key = { it.driveFileId }) { item ->
+                itemsIndexed(items, key = { idx, it -> "list_${idx}_${it.driveFileId}" }) { _, item ->
                     DriveFileCard(
                         item = item,
                         onOpenFolder = onOpenFolder,
@@ -843,7 +1057,7 @@ fun PhoneStorageExplorerScreen(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "Path: /${currentPath.ifBlank { "Internal Shared Storage & SD Card" }}",
+                    text = "Phone Path: /storage/emulated/0/${currentPath.ifBlank { "" }}",
                     fontWeight = FontWeight.Bold,
                     style = MaterialTheme.typography.bodyMedium,
                     modifier = Modifier.weight(1f)
@@ -866,7 +1080,7 @@ fun PhoneStorageExplorerScreen(
                 }
             } else {
                 LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    items(localItems, key = { it.relativePath }) { item ->
+                    itemsIndexed(localItems, key = { idx, it -> "local_${idx}_${it.relativePath}" }) { _, item ->
                         Card(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -890,9 +1104,9 @@ fun PhoneStorageExplorerScreen(
                                         text = if (item.isRestrictedByOs) {
                                             "Restricted by Android OS Sandbox (Never read or claimed)"
                                         } else if (item.isDirectory) {
-                                            "Category: ${item.folderCategory} • ${item.childCount} items"
+                                            "Phone: /storage/emulated/0/${item.relativePath}  ➔  Drive: My Drive/Android_Permanent_Backup/${item.relativePath} • ${item.childCount} items"
                                         } else {
-                                            "${formatBytes(item.sizeBytes)} • ${item.mimeType} • Modified ${formatTimestamp(item.lastModifiedMs)}"
+                                            "Phone: /storage/emulated/0/${item.relativePath} • ${formatBytes(item.sizeBytes)}"
                                         },
                                         style = MaterialTheme.typography.bodySmall
                                     )
@@ -930,7 +1144,7 @@ fun PhoneStorageExplorerScreen(
                 }
             }
             LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(coverageItems, key = { it.folderName + it.relativePath }) { item ->
+                itemsIndexed(coverageItems, key = { idx, it -> "cov_${idx}_${it.folderName}_${it.relativePath}" }) { _, item ->
                     val isRestricted = item.accessStatus == com.permanentbackup.gdrive.domain.model.FolderAccessStatus.RESTRICTED_BY_ANDROID_OS
                     Card(modifier = Modifier.fillMaxWidth()) {
                         Column(modifier = Modifier.padding(12.dp)) {
@@ -941,7 +1155,14 @@ fun PhoneStorageExplorerScreen(
                             ) {
                                 Column(modifier = Modifier.weight(1f)) {
                                     Text(item.folderName, fontWeight = FontWeight.Bold)
-                                    Text("Relative Path: ${item.relativePath}", style = MaterialTheme.typography.bodySmall)
+                                    Text("From Phone: /storage/emulated/0/${item.relativePath}", style = MaterialTheme.typography.bodySmall)
+                                    if (!isRestricted) {
+                                        Text(
+                                            "To Google Drive: My Drive / Android_Permanent_Backup / ${item.relativePath}",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.primary
+                                        )
+                                    }
                                 }
                                 Switch(
                                     checked = item.backupEnabled && !isRestricted,
@@ -985,10 +1206,12 @@ fun BackupVersionHistoryScreen(
             title = { Text("Immutable Versions: ${sample.displayName}") },
             text = {
                 LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    items(selectedFileVersions, key = { it.id }) { ver ->
+                    itemsIndexed(selectedFileVersions, key = { idx, it -> "sel_ver_${idx}_${it.id}" }) { _, ver ->
                         Card(modifier = Modifier.fillMaxWidth()) {
                             Column(modifier = Modifier.padding(10.dp)) {
                                 Text("Version v${ver.backupVersion}: ${ver.driveStoredName}", fontWeight = FontWeight.Bold)
+                                Text("From Phone: /storage/emulated/0/${ver.relativePath.trimStart('/')}", style = MaterialTheme.typography.bodySmall)
+                                Text("To Google Drive: My Drive / Android_Permanent_Backup / ${ver.relativePath.replace('\\', '/').substringBeforeLast('/', "")} / ${ver.driveStoredName}", style = MaterialTheme.typography.bodySmall)
                                 Text("Account: ${ver.accountId} • Size: ${formatBytes(ver.fileSize)}", style = MaterialTheme.typography.bodySmall)
                                 Text("SHA-256: ${ver.sha256Hash?.take(20) ?: "Verified"}...", style = MaterialTheme.typography.bodySmall)
                                 OutlinedButton(onClick = { onRestoreVersion(ver) }) {
@@ -1031,15 +1254,22 @@ fun BackupVersionHistoryScreen(
             }
         }
         LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(verifiedHistory, key = { it.id }) { item ->
+            itemsIndexed(verifiedHistory, key = { idx, it -> "ver_hist_${idx}_${it.id}" }) { _, item ->
+                val subFolder = item.relativePath.replace('\\', '/').substringBeforeLast('/', "")
+                val drivePath = if (subFolder.isNotBlank()) {
+                    "My Drive / Android_Permanent_Backup / $subFolder / ${item.driveStoredName}"
+                } else {
+                    "My Drive / Android_Permanent_Backup / ${item.driveStoredName}"
+                }
                 Card(modifier = Modifier.fillMaxWidth()) {
                     Column(modifier = Modifier.padding(12.dp)) {
                         Text(
                             text = "${item.driveStoredName} (Version ${item.backupVersion})",
                             fontWeight = FontWeight.Bold
                         )
-                        Text("Original File: ${item.relativePath} • Account: ${item.accountId}")
-                        Text("Drive File ID: ${item.driveFileId ?: "N/A"}")
+                        Text("From Phone: /storage/emulated/0/${item.relativePath.trimStart('/')}")
+                        Text("To Google Drive: $drivePath", color = MaterialTheme.colorScheme.primary)
+                        Text("Account: ${item.accountId} • Drive File ID: ${item.driveFileId ?: "N/A"}")
                         Text("Size: ${formatBytes(item.fileSize)} | Integrity: ${item.verificationStatus}")
                         Text("SHA-256: ${item.sha256Hash?.take(24) ?: "Stream Verified"}...")
                         Text(
@@ -1072,7 +1302,7 @@ fun BackupVersionHistoryScreen(
                         fontWeight = FontWeight.Bold
                     )
                 }
-                items(accountBackupVersions, key = { "acct_ver_${it.versionId}" }) { ver ->
+                itemsIndexed(accountBackupVersions, key = { idx, it -> "acct_ver_${idx}_${it.versionId}" }) { _, ver ->
                     Card(modifier = Modifier.fillMaxWidth()) {
                         Column(modifier = Modifier.padding(10.dp)) {
                             Text(
@@ -1080,7 +1310,15 @@ fun BackupVersionHistoryScreen(
                                 fontWeight = FontWeight.Bold
                             )
                             Text(
-                                text = "Path: ${ver.relativePath} • Account: ${ver.accountId} • Size: ${formatBytes(ver.fileSize)}",
+                                text = "From Phone: /storage/emulated/0/${ver.relativePath.trimStart('/')}",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                            Text(
+                                text = "To Google Drive: My Drive / Android_Permanent_Backup / ${ver.relativePath.replace('\\', '/').substringBeforeLast('/', "")} / ${ver.driveStoredName}",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                            Text(
+                                text = "Account: ${ver.accountId} • Size: ${formatBytes(ver.fileSize)}",
                                 style = MaterialTheme.typography.bodySmall
                             )
                             Text(
@@ -1120,11 +1358,18 @@ fun RecentActivityScreen(
                 fontWeight = FontWeight.Bold
             )
         }
-        items(recentRecords.take(50), key = { "rec_${it.id}" }) { rec ->
+        itemsIndexed(recentRecords.take(50), key = { idx, it -> "rec_${idx}_${it.id}" }) { _, rec ->
+            val subFolder = rec.relativePath.replace('\\', '/').substringBeforeLast('/', "")
+            val driveTarget = if (subFolder.isNotBlank()) {
+                "My Drive / Android_Permanent_Backup / $subFolder / ${rec.driveStoredName}"
+            } else {
+                "My Drive / Android_Permanent_Backup / ${rec.driveStoredName}"
+            }
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(12.dp)) {
                     Text("${rec.driveStoredName} (v${rec.backupVersion})", fontWeight = FontWeight.Bold)
-                    Text("Path: Android_Permanent_Backup/${rec.relativePath}")
+                    Text("From Phone: /storage/emulated/0/${rec.relativePath.trimStart('/')}")
+                    Text("To Google Drive: $driveTarget", color = MaterialTheme.colorScheme.primary)
                     Text("Status: ${rec.uploadStatus} • ${formatBytes(rec.fileSize)} • ${formatTimestamp(rec.createdAtMs)}")
                     if (rec.driveFileId != null) {
                         Spacer(modifier = Modifier.height(4.dp))
@@ -1144,7 +1389,7 @@ fun RecentActivityScreen(
                     fontWeight = FontWeight.Bold
                 )
             }
-            items(syncEvents.take(50), key = { "ev_${it.eventId}" }) { ev ->
+            itemsIndexed(syncEvents.take(50), key = { idx, it -> "ev_${idx}_${it.eventId}" }) { _, ev ->
                 Card(modifier = Modifier.fillMaxWidth()) {
                     Column(modifier = Modifier.padding(10.dp)) {
                         Text(
@@ -1181,6 +1426,8 @@ fun TransferManagerScreen(
     onRetryAll: () -> Unit,
     onRetrySingle: (Long) -> Unit
 ) {
+    val rootDriveName = summary.accountState.rootDriveFolderName.ifBlank { "Android_Permanent_Backup" }
+
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
@@ -1210,6 +1457,12 @@ fun TransferManagerScreen(
         }
 
         summary.currentlyUploading?.let { active ->
+            val parentSubfolder = active.relativePath.replace('\\', '/').substringBeforeLast('/', "")
+            val driveFullTarget = if (parentSubfolder.isNotBlank()) {
+                "My Drive / $rootDriveName / $parentSubfolder / ${active.fileName}"
+            } else {
+                "My Drive / $rootDriveName / ${active.fileName}"
+            }
             item {
                 Card(
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
@@ -1218,6 +1471,8 @@ fun TransferManagerScreen(
                     Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         Text("Active Streaming Upload", fontWeight = FontWeight.Bold)
                         Text("File Name: ${active.fileName} (v${active.backupVersion})")
+                        Text("From Phone: /storage/emulated/0/${active.relativePath.trimStart('/')}")
+                        Text("To Google Drive: $driveFullTarget")
                         Text("File Size: ${formatBytes(active.totalBytes)}")
                         Text("Uploaded Bytes: ${formatBytes(active.uploadedBytes)} (${(active.fraction * 100).toInt()}%)")
                         Text("Transfer Speed: ${formatBytes(active.transferSpeedBps)}/s")
@@ -1252,11 +1507,19 @@ fun TransferManagerScreen(
                 Text("No pending uploads in queue.", style = MaterialTheme.typography.bodySmall)
             }
         } else {
-            items(activeQueue, key = { "q_${it.id}" }) { item ->
+            itemsIndexed(activeQueue, key = { idx, it -> "q_${idx}_${it.id}" }) { _, item ->
                 val pct = if (item.fileSize > 0L) ((item.uploadedBytes * 100L) / item.fileSize).toInt() else 0
+                val subDir = item.relativePath.replace('\\', '/').substringBeforeLast('/', "")
+                val driveDest = if (subDir.isNotBlank()) {
+                    "My Drive / $rootDriveName / $subDir / ${item.driveStoredName}"
+                } else {
+                    "My Drive / $rootDriveName / ${item.driveStoredName}"
+                }
                 Card(modifier = Modifier.fillMaxWidth()) {
                     Column(modifier = Modifier.padding(12.dp)) {
                         Text("${item.driveStoredName} (v${item.backupVersion})", fontWeight = FontWeight.Bold)
+                        Text("From Phone: /storage/emulated/0/${item.relativePath.trimStart('/')}")
+                        Text("To Google Drive: $driveDest", color = MaterialTheme.colorScheme.primary)
                         Text("Size: ${formatBytes(item.fileSize)} | Uploaded: ${formatBytes(item.uploadedBytes)} ($pct%)")
                         Text("State: ${item.uploadStatus} | Speed: ${formatBytes(summary.currentUploadSpeedBps)}/s")
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1293,10 +1556,18 @@ fun TransferManagerScreen(
             }
         }
 
-        items(failedList, key = { "f_${it.id}" }) { item ->
+        itemsIndexed(failedList, key = { idx, it -> "f_${idx}_${it.id}" }) { _, item ->
+            val subDir = item.relativePath.replace('\\', '/').substringBeforeLast('/', "")
+            val driveDest = if (subDir.isNotBlank()) {
+                "My Drive / $rootDriveName / $subDir / ${item.driveStoredName}"
+            } else {
+                "My Drive / $rootDriveName / ${item.driveStoredName}"
+            }
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(12.dp)) {
                     Text("${item.driveStoredName} (v${item.backupVersion})", fontWeight = FontWeight.Bold)
+                    Text("From Phone: /storage/emulated/0/${item.relativePath.trimStart('/')}")
+                    Text("To Google Drive: $driveDest")
                     Text("Reason: ${item.failureReason}")
                     item.failureDetail?.let { Text("Detail: $it", style = MaterialTheme.typography.bodySmall) }
                     Text("Saved Byte Offset: ${formatBytes(item.uploadedBytes)} / ${formatBytes(item.fileSize)}")
@@ -1317,7 +1588,7 @@ fun TransferManagerScreen(
                     fontWeight = FontWeight.Bold
                 )
             }
-            items(unresolvedFailures.take(25), key = { "uf_${it.failureId}" }) { fail ->
+            itemsIndexed(unresolvedFailures.take(25), key = { idx, it -> "uf_${idx}_${it.failureId}" }) { _, fail ->
                 Card(
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
                     modifier = Modifier.fillMaxWidth()
@@ -1347,10 +1618,14 @@ fun TransferManagerScreen(
                     fontWeight = FontWeight.Bold
                 )
             }
-            items(syncJobs.take(30), key = { "sj_${it.jobId}" }) { job ->
+            itemsIndexed(syncJobs.take(30), key = { idx, it -> "sj_${idx}_${it.jobId}" }) { _, job ->
                 Card(modifier = Modifier.fillMaxWidth()) {
                     Column(modifier = Modifier.padding(10.dp)) {
                         Text("${job.fileName} (v${job.backupVersion}) — ${job.syncState}", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                        Text(
+                            "From Phone: /storage/emulated/0/${job.relativePath.trimStart('/')}",
+                            style = MaterialTheme.typography.bodySmall
+                        )
                         Text(
                             "Progress: ${formatBytes(job.uploadedBytes)} / ${formatBytes(job.totalBytes)} • Account: ${job.accountId}",
                             style = MaterialTheme.typography.bodySmall
@@ -1412,7 +1687,7 @@ fun OfflineAccessScreen(
             )
         } else {
             LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(pinnedFiles, key = { it.driveFileId }) { file ->
+                itemsIndexed(pinnedFiles, key = { idx, it -> "pin_${idx}_${it.driveFileId}" }) { _, file ->
                     Card(modifier = Modifier.fillMaxWidth()) {
                         Column(modifier = Modifier.padding(12.dp)) {
                             Text(file.name, fontWeight = FontWeight.Bold)

@@ -62,7 +62,7 @@ class AndroidStorageScanner(
         val ANDROID_RESTRICTED_PATHS = listOf(
             "Android/data" to "Restricted by Android 11+ Scoped Storage (App-private external data cannot be read by backup apps)",
             "Android/obb" to "Restricted by Android 11+ Scoped Storage (Opaque binary expansion files)",
-            "/data/data" to "Restricted by Android Linux Kernel Sandbox (Internal private app databases & keys)"
+            "Internal App Sandbox" to "Restricted by Android OS Sandbox (Internal private app databases & keys)"
         )
 
         val MIRROR_AND_RESTORE_EXCLUDED_DIR_NAMES = setOf(
@@ -70,6 +70,13 @@ class AndroidStorageScanner(
             "drive_mirror"
         )
     }
+
+    private fun safeCanonicalPath(file: File): String =
+        try {
+            file.canonicalPath
+        } catch (_: Throwable) {
+            file.absolutePath
+        }
 
     private val persistedSafTreeUris: MutableSet<String> = Collections.synchronizedSet(LinkedHashSet())
 
@@ -147,11 +154,12 @@ class AndroidStorageScanner(
 
         for ((rootIndex, rootDir) in roots.withIndex()) {
             val rootPrefix = if (rootIndex == 0) "" else "SDCard_${rootIndex}/"
-            val rootPath = rootDir.canonicalPath
+            val rootPath = safeCanonicalPath(rootDir)
 
             rootDir.walkTopDown()
+                .onFail { _, _ -> }
                 .onEnter { dir ->
-                    val rel = dir.canonicalPath.removePrefix(rootPath).trimStart('/', '\\').replace('\\', '/')
+                    val rel = safeCanonicalPath(dir).removePrefix(rootPath).trimStart('/', '\\').replace('\\', '/')
                     !isRestrictedAndroidPath(rel) &&
                         !isMirrorOrRestoreDirectory(dir.name, rel) &&
                         !dir.name.startsWith(".thumbnails") &&
@@ -159,7 +167,7 @@ class AndroidStorageScanner(
                 }
                 .filter { it.isFile && it.canRead() }
                 .forEach { file ->
-                    val relPath = file.canonicalPath.removePrefix(rootPath).trimStart('/', '\\')
+                    val relPath = safeCanonicalPath(file).removePrefix(rootPath).trimStart('/', '\\')
                         .replace('\\', '/')
                     val fullRelativePath = "$rootPrefix$relPath"
                     val category = classifyFolderCategory(relPath, rootIndex > 0)
@@ -302,8 +310,8 @@ class AndroidStorageScanner(
             return emptyList()
         }
 
-        val rootCanonical = activeRoot.canonicalPath
-        val targetCanonical = targetDir.canonicalPath
+        val rootCanonical = safeCanonicalPath(activeRoot)
+        val targetCanonical = safeCanonicalPath(targetDir)
         if (!targetCanonical.startsWith(rootCanonical)) {
             return emptyList()
         }
@@ -338,7 +346,7 @@ class AndroidStorageScanner(
             children
                 .sortedWith(compareByDescending<File> { it.isDirectory }.thenBy { it.name.lowercase() })
                 .map { child ->
-                    val relInsideRoot = child.canonicalPath.removePrefix(rootCanonical).trimStart('/', '\\').replace('\\', '/')
+                    val relInsideRoot = safeCanonicalPath(child).removePrefix(rootCanonical).trimStart('/', '\\').replace('\\', '/')
                     val fullRel = "$activeRootPrefix$relInsideRoot"
                     val restricted = isRestrictedAndroidPath(relInsideRoot)
                     val childCount = if (child.isDirectory && !restricted && child.canRead()) {

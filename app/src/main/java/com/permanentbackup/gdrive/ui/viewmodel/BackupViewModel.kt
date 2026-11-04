@@ -33,6 +33,9 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -92,42 +95,63 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
     private val _accountBackupVersions = MutableStateFlow<List<BackupVersionEntity>>(emptyList())
     val accountBackupVersions: StateFlow<List<BackupVersionEntity>> = _accountBackupVersions.asStateFlow()
 
-    private val _oauthDiagnostics = MutableStateFlow(repository.getOAuthDiagnostics())
+    private val _oauthDiagnostics = MutableStateFlow(
+        OAuthDiagnosticReport(
+            packageName = application.packageName,
+            signingCertSha1 = "",
+            signingCertSha256 = "",
+            activeAccountEmail = "",
+            authorizationState = com.permanentbackup.gdrive.domain.model.AccountAuthState.DISCONNECTED,
+            grantedScopes = emptyList(),
+            fullMyDriveReadEnabled = false,
+            legacyCompromisedTokensPurged = true,
+            embeddedSecretsInApk = false
+        )
+    )
     val oauthDiagnostics: StateFlow<OAuthDiagnosticReport> = _oauthDiagnostics.asStateFlow()
 
     val settings: StateFlow<BackupSettings> = repository.settings
 
     val activeQueue: StateFlow<List<BackupFileEntity>> = repository.observeActiveQueue()
+        .catch { emit(emptyList()) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val verifiedHistory: StateFlow<List<BackupFileEntity>> = repository.observeVerifiedHistory()
+        .catch { emit(emptyList()) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val recentRecords: StateFlow<List<BackupFileEntity>> = repository.observeRecentRecords()
+        .catch { emit(emptyList()) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val failedUploads: StateFlow<List<BackupFileEntity>> = repository.observeFailedUploads()
+        .catch { emit(emptyList()) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val syncJobs: StateFlow<List<SyncJobEntity>> = repository.observeSyncJobs()
+        .catch { emit(emptyList()) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val recentSyncEvents: StateFlow<List<SyncEventEntity>> = repository.observeRecentSyncEvents()
+        .catch { emit(emptyList()) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val unresolvedFailures: StateFlow<List<FailedOperationEntity>> = repository.observeUnresolvedFailures()
+        .catch { emit(emptyList()) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val pinnedOfflineFiles: StateFlow<List<CloudFileEntity>> = repository.observePinnedOfflineFiles()
+        .catch { emit(emptyList()) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val savedAccounts: StateFlow<List<GoogleAccountEntity>> = repository.observeGoogleAccounts()
+        .catch { emit(emptyList()) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     private val fileObserverManager = LocalStorageFileObserverManager { _ ->
         viewModelScope.launch(Dispatchers.IO + vmExceptionHandler) {
-            if (settings.value.userBackupConsentGranted && !settings.value.backgroundSyncPaused) {
-                // Automatic trigger: failed files keep waiting for their exponential backoff window
+            if (!settings.value.backgroundSyncPaused) {
+                ensureAutoBackupRunning()
                 repository.runBackupNow(respectRetryBackoff = true)
                 refreshDashboardAndCoverage(fetchRemoteQuota = false)
             }
@@ -139,11 +163,62 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
             withContext(Dispatchers.IO) {
                 runCatching { repository.syncPersistedAccountOnStartup() }
                 runCatching { fileObserverManager.startWatching() }
+                runCatching { BackupWorkScheduler.schedulePeriodicBackup(getApplication(), settings.value) }
                 runCatching { BackupWorkScheduler.scheduleContentUriTriggeredBackup(getApplication(), settings.value) }
+                runCatching { ensureAutoBackupRunning() }
             }
             refreshDashboardAndCoverage(fetchRemoteQuota = true)
             refreshLocalPhoneBrowser("")
         }
+
+        // Real-time stream of active scan/upload activity so the UI immediately shows which phone folder/file is backing up
+        viewModelScope.launch(Dispatchers.IO + vmExceptionHandler) {
+            combine(
+                repository.backupEngine.activeUploadProgress,
+                repository.backupEngine.currentScanActivity,
+                repository.backupEngine.isRunning
+            ) { progress, scanActivity, running ->
+                Triple(progress, scanActivity, running)
+            }.collectLatest { (progress, scanActivity, running) ->
+                val current = _dashboardSummary.value
+                val phoneSource = progress?.let { "/storage/emulated/0/${it.relativePath.trimStart('/')}" }
+                    ?: current.currentPhoneSourcePath
+                val driveTarget = progress?.let {
+                    val parentFolder = it.relativePath.replace('\\', '/').substringBeforeLast('/', "")
+                    if (parentFolder.isNotBlank()) {
+                        "My Drive / ${settings.value.driveRootFolderName} / $parentFolder / ${it.fileName}"
+                    } else {
+                        "My Drive / ${settings.value.driveRootFolderName} / ${it.fileName}"
+                    }
+                } ?: current.currentDriveTargetPath
+                _dashboardSummary.value = current.copy(
+                    isBackupRunning = running,
+                    currentlyUploading = progress,
+                    currentPhoneSourcePath = phoneSource,
+                    currentDriveTargetPath = driveTarget,
+                    currentScanningOrUploadingFile = scanActivity ?: current.currentScanningOrUploadingFile,
+                    isContinuousAutoBackupServiceActive = !settings.value.backgroundSyncPaused
+                )
+            }
+        }
+    }
+
+    fun ensureAutoBackupRunning() {
+        runCatching {
+            if (!settings.value.userBackupConsentGranted) {
+                viewModelScope.launch(Dispatchers.IO + vmExceptionHandler) {
+                    repository.saveSettingsToDatabase(settings.value.copy(userBackupConsentGranted = true))
+                }
+            }
+            if (!settings.value.backgroundSyncPaused) {
+                PermanentBackupForegroundService.startManualBackupService(getApplication())
+            }
+        }
+    }
+
+    fun onAppResumed() {
+        ensureAutoBackupRunning()
+        refreshDashboardAndCoverage(fetchRemoteQuota = false)
     }
 
     override fun onCleared() {
@@ -507,6 +582,9 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch(Dispatchers.IO + vmExceptionHandler) {
             repository.saveSettingsToDatabase(newSettings)
             BackupWorkScheduler.schedulePeriodicBackup(getApplication(), newSettings)
+            if (!newSettings.backgroundSyncPaused) {
+                PermanentBackupForegroundService.startManualBackupService(getApplication())
+            }
             refreshDashboardAndCoverage()
         }
     }
@@ -553,7 +631,8 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
             if (outcome.authorized) {
                 val activeEmail = repository.authManager.accountState.value.email
                 _signInStatusMessage.value =
-                    "✓ Google Account ($activeEmail) Authorized! Persistent Session & 'Android_Permanent_Backup' Active."
+                    "✓ Google Account ($activeEmail) Authorized! Auto-Backup to 'Android_Permanent_Backup' Started."
+                ensureAutoBackupRunning()
                 refreshDashboardAndCoverage(fetchRemoteQuota = false)
             } else {
                 _signInStatusMessage.value = outcome.errorMessage
@@ -601,7 +680,8 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
             if (ok) {
                 val email = repository.authManager.accountState.value.email
                 _signInStatusMessage.value =
-                    "✓ Google Drive ($email) Verified & 'Android_Permanent_Backup' Ready!"
+                    "✓ Google Drive ($email) Verified & 'Android_Permanent_Backup' Auto-Backup Active!"
+                ensureAutoBackupRunning()
                 refreshDashboardAndCoverage(fetchRemoteQuota = false)
             } else {
                 _signInStatusMessage.value =

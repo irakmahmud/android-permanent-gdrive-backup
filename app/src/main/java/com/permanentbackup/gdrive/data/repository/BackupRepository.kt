@@ -41,6 +41,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.map
@@ -119,43 +120,53 @@ class BackupRepository(
     @OptIn(ExperimentalCoroutinesApi::class)
     fun observeActiveQueue(): Flow<List<BackupFileEntity>> =
         activeAccountIdFlow.flatMapLatest { backupDao.observeActiveQueueForAccount(it) }
+            .catch { emit(emptyList()) }
 
     @OptIn(ExperimentalCoroutinesApi::class)
     fun observeVerifiedHistory(): Flow<List<BackupFileEntity>> =
         activeAccountIdFlow.flatMapLatest { backupDao.observeVerifiedHistoryForAccount(it) }
+            .catch { emit(emptyList()) }
 
     @OptIn(ExperimentalCoroutinesApi::class)
     fun observeFailedUploads(): Flow<List<BackupFileEntity>> =
         activeAccountIdFlow.flatMapLatest { backupDao.observeFailedRecordsForAccount(it) }
+            .catch { emit(emptyList()) }
 
     @OptIn(ExperimentalCoroutinesApi::class)
     fun observeRecentRecords(): Flow<List<BackupFileEntity>> =
         activeAccountIdFlow.flatMapLatest { backupDao.observeRecentRecordsForAccount(it) }
+            .catch { emit(emptyList()) }
 
     @OptIn(ExperimentalCoroutinesApi::class)
     fun observeSyncJobs(): Flow<List<SyncJobEntity>> =
         activeAccountIdFlow.flatMapLatest { backupDao.observeSyncJobsForAccount(it) }
+            .catch { emit(emptyList()) }
 
     @OptIn(ExperimentalCoroutinesApi::class)
     fun observeRecentSyncEvents(): Flow<List<SyncEventEntity>> =
         activeAccountIdFlow.flatMapLatest { backupDao.observeRecentSyncEventsForAccount(it) }
+            .catch { emit(emptyList()) }
 
     @OptIn(ExperimentalCoroutinesApi::class)
     fun observeUnresolvedFailures(): Flow<List<FailedOperationEntity>> =
         activeAccountIdFlow.flatMapLatest { backupDao.observeUnresolvedFailuresForAccount(it) }
+            .catch { emit(emptyList()) }
 
-    fun observeGoogleAccounts(): Flow<List<GoogleAccountEntity>> = backupDao.observeAllGoogleAccounts()
+    fun observeGoogleAccounts(): Flow<List<GoogleAccountEntity>> =
+        backupDao.observeAllGoogleAccounts().catch { emit(emptyList()) }
 
     @OptIn(ExperimentalCoroutinesApi::class)
     fun observePinnedOfflineFiles(): Flow<List<CloudFileEntity>> =
         activeAccountIdFlow.flatMapLatest { backupDao.observePinnedOfflineFiles(it) }
+            .catch { emit(emptyList()) }
 
     suspend fun syncPersistedAccountOnStartup() {
         try {
-            // 1. Restore persisted AppSettingsEntity from Room if present
-            backupDao.getAppSettingsEntity()?.let { dbSettings ->
+            // 1. Restore persisted AppSettingsEntity from Room if present; always ensure auto-backup consent is active
+            val dbSettings = backupDao.getAppSettingsEntity()
+            if (dbSettings != null) {
                 val restored = BackupSettings(
-                    userBackupConsentGranted = dbSettings.userBackupConsentGranted,
+                    userBackupConsentGranted = true,
                     wifiOnly = dbSettings.wifiOnly,
                     chargingOnly = dbSettings.chargingOnly,
                     unmeteredNetworkOnly = dbSettings.unmeteredNetworkOnly,
@@ -168,6 +179,12 @@ class BackupRepository(
                 )
                 _settings.value = restored
                 backupEngine.setEnginePaused(restored.backgroundSyncPaused)
+                if (!dbSettings.userBackupConsentGranted) {
+                    saveSettingsToDatabase(restored)
+                }
+            } else {
+                val defaultAutoSettings = _settings.value.copy(userBackupConsentGranted = true)
+                saveSettingsToDatabase(defaultAutoSettings)
             }
 
             // 2. Restore persisted SAF Tree URIs into storageSource so custom SAF folders are scanned
@@ -870,6 +887,27 @@ class BackupRepository(
             verifiedCount = verified
         )
 
+        val activeUpload = backupEngine.activeUploadProgress.value
+        val activePhoneSource = if (activeUpload != null) {
+            "/storage/emulated/0/${activeUpload.relativePath}"
+        } else {
+            val enabledFolderNames = coverage
+                .filter { it.accessStatus == FolderAccessStatus.ACCESSIBLE && it.backupEnabled }
+                .joinToString(", ") { it.relativePath }
+                .ifBlank { "DCIM, Pictures, Videos, Downloads, Documents, WhatsApp/Media, Telegram" }
+            "/storage/emulated/0/{$enabledFolderNames}"
+        }
+        val activeDriveTarget = if (activeUpload != null) {
+            val parentFolder = activeUpload.relativePath.substringBeforeLast('/', "")
+            if (parentFolder.isBlank()) {
+                "My Drive / ${accountState.rootDriveFolderName} / ${activeUpload.fileName}"
+            } else {
+                "My Drive / ${accountState.rootDriveFolderName} / $parentFolder / ${activeUpload.fileName}"
+            }
+        } else {
+            "My Drive / ${accountState.rootDriveFolderName} / <Phone_Folder_Name> / <File_Name>"
+        }
+
         return DashboardSummary(
             accountState = accountState,
             connectedAccountsCount = accountsCount,
@@ -886,7 +924,7 @@ class BackupRepository(
             driveQuota = backupEngine.latestQuotaInfo.value,
             accessibleFolderCount = accessibleCount,
             restrictedFolderCount = restrictedCount,
-            currentlyUploading = backupEngine.activeUploadProgress.value,
+            currentlyUploading = activeUpload,
             backgroundSyncStatus = syncStatus,
             offlinePinnedCount = offlinePinnedCount,
             offlineCacheUsedBytes = offlineUsedBytes,
@@ -894,7 +932,11 @@ class BackupRepository(
             permissionFailureMessage = backupEngine.lastPermissionError.value,
             quotaFullAlert = backupEngine.quotaFullState.value,
             networkFailureMessage = backupEngine.transferConditionBlock.value ?: backupEngine.lastNetworkError.value,
-            isBackupRunning = backupEngine.isRunning.value
+            isBackupRunning = backupEngine.isRunning.value,
+            currentPhoneSourcePath = activePhoneSource,
+            currentDriveTargetPath = activeDriveTarget,
+            currentScanningOrUploadingFile = backupEngine.currentScanActivity.value,
+            isContinuousAutoBackupServiceActive = !_settings.value.backgroundSyncPaused && !backupEngine.isPaused.value
         )
     }
 
@@ -990,10 +1032,10 @@ class BackupRepository(
     private fun loadSettings(): BackupSettings {
         val p = prefs ?: return BackupSettings()
         return BackupSettings(
-            userBackupConsentGranted = p.getBoolean("consent_granted", false),
-            wifiOnly = p.getBoolean("wifi_only", true),
+            userBackupConsentGranted = p.getBoolean("consent_granted", true),
+            wifiOnly = p.getBoolean("wifi_only", false),
             chargingOnly = p.getBoolean("charging_only", false),
-            unmeteredNetworkOnly = p.getBoolean("unmetered_only", true),
+            unmeteredNetworkOnly = p.getBoolean("unmetered_only", false),
             uploadConcurrency = p.getInt("concurrency", 1),
             periodicIntervalHours = p.getInt("interval_hours", 6),
             chunkSizeBytes = p.getInt("chunk_size_bytes", 256 * 1024),

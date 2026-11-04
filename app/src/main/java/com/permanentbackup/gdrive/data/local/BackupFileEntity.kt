@@ -350,10 +350,10 @@ data class FailedOperationEntity(
 data class AppSettingsEntity(
     @PrimaryKey
     val settingKey: String = "GLOBAL_SETTINGS",
-    val userBackupConsentGranted: Boolean = false,
-    val wifiOnly: Boolean = true,
+    val userBackupConsentGranted: Boolean = true,
+    val wifiOnly: Boolean = false,
     val chargingOnly: Boolean = false,
-    val unmeteredNetworkOnly: Boolean = true,
+    val unmeteredNetworkOnly: Boolean = false,
     val uploadConcurrency: Int = 1,
     val periodicIntervalHours: Int = 6,
     val chunkSizeBytes: Int = 256 * 1024,

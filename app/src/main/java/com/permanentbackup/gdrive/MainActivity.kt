@@ -1,11 +1,14 @@
 package com.permanentbackup.gdrive
 
+import android.Manifest
 import android.accounts.AccountManager
 import android.app.Activity
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -34,6 +37,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -44,6 +48,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import com.google.android.gms.auth.api.identity.Identity
 import com.permanentbackup.gdrive.domain.model.CloudBrowseItem
 import com.permanentbackup.gdrive.provider.DriveStreamingContentProvider
@@ -64,11 +69,16 @@ class MainActivity : ComponentActivity() {
 
     private val viewModel: BackupViewModel by viewModels()
 
+    override fun onResume() {
+        super.onResume()
+        runCatching { viewModel.onAppResumed() }
+    }
+
     @OptIn(ExperimentalMaterial3Api::class)
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         if (savedInstanceState == null) {
-            handleIncomingShareIntent(intent)
+            runCatching { handleIncomingShareIntent(intent) }
         }
 
         setContent {
@@ -105,6 +115,43 @@ class MainActivity : ComponentActivity() {
                 val selectedFileVersions by viewModel.selectedFileVersions.collectAsState()
                 val accountBackupVersions by viewModel.accountBackupVersions.collectAsState()
 
+                val runtimePermissionsLauncher = rememberLauncherForActivityResult(
+                    contract = ActivityResultContracts.RequestMultiplePermissions()
+                ) {
+                    runCatching { viewModel.onAppResumed() }
+                }
+
+                LaunchedEffect(Unit) {
+                    runCatching {
+                        val needed = mutableListOf<String>()
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            listOf(
+                                Manifest.permission.POST_NOTIFICATIONS,
+                                Manifest.permission.READ_MEDIA_IMAGES,
+                                Manifest.permission.READ_MEDIA_VIDEO,
+                                Manifest.permission.READ_MEDIA_AUDIO
+                            ).forEach { perm ->
+                                if (ContextCompat.checkSelfPermission(this@MainActivity, perm) != PackageManager.PERMISSION_GRANTED) {
+                                    needed.add(perm)
+                                }
+                            }
+                        } else {
+                            if (ContextCompat.checkSelfPermission(
+                                    this@MainActivity,
+                                    Manifest.permission.READ_EXTERNAL_STORAGE
+                                ) != PackageManager.PERMISSION_GRANTED
+                            ) {
+                                needed.add(Manifest.permission.READ_EXTERNAL_STORAGE)
+                            }
+                        }
+                        if (needed.isNotEmpty()) {
+                            runtimePermissionsLauncher.launch(needed.toTypedArray())
+                        } else {
+                            viewModel.onAppResumed()
+                        }
+                    }
+                }
+
                 val safTreeLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.OpenDocumentTree()
                 ) { treeUri: Uri? ->
@@ -134,7 +181,6 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                         val targetFolder = driveBreadcrumbs.lastOrNull()?.second ?: "Direct_Uploads"
-                        // Inside a My Drive folder -> upload straight into that exact Drive folder
                         val targetFolderId = driveBreadcrumbs.lastOrNull()?.first
                         viewModel.uploadDirectUrisToDrive(uris, targetFolder, targetDriveFolderId = targetFolderId)
                     }
@@ -173,7 +219,7 @@ class MainActivity : ComponentActivity() {
                             requestFullDriveRead = pendingFullReadScope,
                             gisAccessToken = gisToken,
                             onRecoverableConsentIntent = { consentIntent ->
-                                recoverableConsentLauncher.launch(consentIntent)
+                                runCatching { recoverableConsentLauncher.launch(consentIntent) }
                             }
                         )
                     }
@@ -194,12 +240,14 @@ class MainActivity : ComponentActivity() {
                             selectedEmail = selectedEmail,
                             requestFullDriveRead = pendingFullReadScope,
                             onResolutionPendingIntent = { pendingIntent ->
-                                identityAuthorizationLauncher.launch(
-                                    IntentSenderRequest.Builder(pendingIntent).build()
-                                )
+                                runCatching {
+                                    identityAuthorizationLauncher.launch(
+                                        IntentSenderRequest.Builder(pendingIntent).build()
+                                    )
+                                }
                             },
                             onRecoverableConsentIntent = { consentIntent ->
-                                recoverableConsentLauncher.launch(consentIntent)
+                                runCatching { recoverableConsentLauncher.launch(consentIntent) }
                             }
                         )
                     }
@@ -234,12 +282,14 @@ class MainActivity : ComponentActivity() {
                             selectedEmail = activeEmail,
                             requestFullDriveRead = true,
                             onResolutionPendingIntent = { pendingIntent ->
-                                identityAuthorizationLauncher.launch(
-                                    IntentSenderRequest.Builder(pendingIntent).build()
-                                )
+                                runCatching {
+                                    identityAuthorizationLauncher.launch(
+                                        IntentSenderRequest.Builder(pendingIntent).build()
+                                    )
+                                }
                             },
                             onRecoverableConsentIntent = { consentIntent ->
-                                recoverableConsentLauncher.launch(consentIntent)
+                                runCatching { recoverableConsentLauncher.launch(consentIntent) }
                             }
                         )
                     } else {
@@ -283,11 +333,13 @@ class MainActivity : ComponentActivity() {
                             AppScreen.HOME -> HomeDashboardScreen(
                                 summary = summary,
                                 settings = settings,
+                                folderCoverage = folderCoverage,
+                                activeQueue = activeQueue,
+                                recentRecords = recentRecords,
                                 actionFeedback = actionFeedbackMessage,
                                 onBackupNow = { viewModel.triggerManualBackupNow() },
                                 onConnectOrManageAccount = {
                                     currentScreen = AppScreen.ACCOUNTS
-                                    // Section 3: Never prompt Account Picker if already connected!
                                     if (!summary.accountState.isConnected) {
                                         launchNativeGoogleAccountPicker(false)
                                     }
@@ -303,6 +355,9 @@ class MainActivity : ComponentActivity() {
                                 onEnableConsentAndPermissions = {
                                     viewModel.updateSettings(settings.copy(userBackupConsentGranted = true))
                                     requestManageAllFilesAccess()
+                                },
+                                onRequestBatteryUnrestricted = {
+                                    requestIgnoreBatteryOptimizations()
                                 },
                                 onRefresh = { viewModel.refreshDashboardAndCoverage(fetchRemoteQuota = true) }
                             )
@@ -331,7 +386,7 @@ class MainActivity : ComponentActivity() {
                                 onTogglePinOffline = { viewModel.toggleCloudFileOfflinePin(it) },
                                 onShareFileLink = { shareCloudFileLink(it) },
                                 onCreateFolder = { viewModel.createNewCloudFolder(it) },
-                                onUploadDirectFiles = { directFileUploadLauncher.launch(arrayOf("*/*")) },
+                                onUploadDirectFiles = { runCatching { directFileUploadLauncher.launch(arrayOf("*/*")) } },
                                 onLoadMore = { viewModel.loadMoreCloudDriveFiles() },
                                 onRequestFullDriveReadScope = authorizeAdditionalDriveReadScope,
                                 onRefresh = { viewModel.refreshCloudDriveExplorer() }
@@ -346,7 +401,7 @@ class MainActivity : ComponentActivity() {
                                     viewModel.updateSettings(settings.copy(userBackupConsentGranted = true))
                                     requestManageAllFilesAccess()
                                 },
-                                onSelectSafTree = { safTreeLauncher.launch(null) },
+                                onSelectSafTree = { runCatching { safTreeLauncher.launch(null) } },
                                 onToggleFolderBackup = { item, enabled ->
                                     viewModel.toggleFolderBackup(item, enabled)
                                 },
@@ -538,8 +593,26 @@ class MainActivity : ComponentActivity() {
                 )
                 startActivity(intent)
             } catch (_: Throwable) {
-                startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+                runCatching { startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)) }
             }
+        }
+    }
+
+    @Suppress("BatteryLife")
+    private fun requestIgnoreBatteryOptimizations() {
+        try {
+            val pm = getSystemService(POWER_SERVICE) as? PowerManager
+            if (pm != null && !pm.isIgnoringBatteryOptimizations(packageName)) {
+                val intent = Intent(
+                    Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                    Uri.parse("package:$packageName")
+                )
+                startActivity(intent)
+            } else {
+                startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+            }
+        } catch (_: Throwable) {
+            runCatching { startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) }
         }
     }
 }

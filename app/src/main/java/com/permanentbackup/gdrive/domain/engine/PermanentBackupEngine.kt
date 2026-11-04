@@ -119,6 +119,10 @@ class PermanentBackupEngine(
     private val _transferConditionBlock = MutableStateFlow<String?>(null)
     val transferConditionBlock: StateFlow<String?> = _transferConditionBlock.asStateFlow()
 
+    /** Real-time phone source folder/file and Google Drive destination path being scanned or backed up. */
+    private val _currentScanActivity = MutableStateFlow<String?>(null)
+    val currentScanActivity: StateFlow<String?> = _currentScanActivity.asStateFlow()
+
     /**
      * Optional callback invoked during incremental cloud changes sync when a pinned offline file
      * has been updated on Google Drive (or a new file appeared inside a pinned offline folder)
@@ -606,6 +610,10 @@ class PermanentBackupEngine(
             for (discovered in storageSource.scanFilesSequence(computeHashes = false)) {
                 scannedCount++
                 discoveredIdentities.add(discovered.sourceFileIdentity)
+                if (scannedCount == 1 || scannedCount % 10 == 0) {
+                    _currentScanActivity.value =
+                        "Scanning Phone: /storage/emulated/0/${discovered.relativePath} → Google Drive: My Drive/$ROOT_DRIVE_FOLDER_NAME/${discovered.relativePath}"
+                }
 
                 val normalizedRelPath = discovered.relativePath.replace('\\', '/').trim('/').lowercase()
                 val isFolderDisabled = discovered.folderCategory in disabledCategories ||
@@ -618,6 +626,8 @@ class PermanentBackupEngine(
                 val queued = evaluateAndQueueDiscoveredFile(discovered)
                 if (queued) {
                     newlyQueued++
+                    _currentScanActivity.value =
+                        "Queued from Phone: /storage/emulated/0/${discovered.relativePath} → Google Drive: My Drive/$ROOT_DRIVE_FOLDER_NAME/${discovered.relativePath}"
                 } else {
                     skippedUnchanged++
                 }
@@ -1117,6 +1127,14 @@ class PermanentBackupEngine(
         settings: BackupSettings
     ): Boolean {
         val accountId = currentAccountId()
+        val driveParentSubPath = initialRecord.relativePath.substringBeforeLast('/', "")
+        val driveFullTarget = if (driveParentSubPath.isBlank()) {
+            "My Drive/$ROOT_DRIVE_FOLDER_NAME/${initialRecord.driveStoredName}"
+        } else {
+            "My Drive/$ROOT_DRIVE_FOLDER_NAME/$driveParentSubPath/${initialRecord.driveStoredName}"
+        }
+        _currentScanActivity.value =
+            "Backing up Phone: /storage/emulated/0/${initialRecord.relativePath} → Google Drive: $driveFullTarget"
 
         // Transition to PREPARING
         backupDao.transitionSyncJobState(
@@ -1831,6 +1849,14 @@ class PermanentBackupEngine(
         )
 
         _lastNetworkError.value = null
+        val verifiedParentSubPath = record.relativePath.substringBeforeLast('/', "")
+        val verifiedDriveTarget = if (verifiedParentSubPath.isBlank()) {
+            "My Drive/$ROOT_DRIVE_FOLDER_NAME/${record.driveStoredName}"
+        } else {
+            "My Drive/$ROOT_DRIVE_FOLDER_NAME/$verifiedParentSubPath/${record.driveStoredName}"
+        }
+        _currentScanActivity.value =
+            "✓ Backed up Phone: /storage/emulated/0/${record.relativePath} → Google Drive: $verifiedDriveTarget"
 
         // Post-verification hooks (e.g. delete app-private share staging copy). Failures never undo VERIFIED.
         try {

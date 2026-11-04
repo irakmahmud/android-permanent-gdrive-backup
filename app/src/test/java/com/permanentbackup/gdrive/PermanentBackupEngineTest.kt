@@ -2905,6 +2905,60 @@ class PermanentBackupEngineTest {
         assertNotNull(com.permanentbackup.gdrive.data.local.PermanentBackupDatabase.MIGRATION_2_3)
         assertNotNull(com.permanentbackup.gdrive.data.local.PermanentBackupDatabase.MIGRATION_3_4)
     }
+
+    // 38. v2.3.2 Mandatory Auto-Backup Defaults, Live Phone/Drive Path Reporting & Reactive Flow Crash Resilience
+    @Test
+    fun test38_autoBackupDefaultSettings_liveSourceAndDestinationPaths_andFlowCrashResilience() = runTest {
+        installStandardDriveMockDispatcher()
+
+        // 1. Default BackupSettings & AppSettingsEntity enable auto-backup out-of-the-box on Wi-Fi & Mobile Data
+        val defaultSettings = BackupSettings()
+        assertTrue("Auto-backup consent must be enabled by default", defaultSettings.userBackupConsentGranted)
+        assertFalse("wifiOnly must default to false so auto-backup works on mobile data too", defaultSettings.wifiOnly)
+        assertFalse("unmeteredNetworkOnly must default to false", defaultSettings.unmeteredNetworkOnly)
+        assertFalse("backgroundSyncPaused must default to false", defaultSettings.backgroundSyncPaused)
+
+        val defaultEntity = AppSettingsEntity()
+        assertTrue(defaultEntity.userBackupConsentGranted)
+        assertFalse(defaultEntity.wifiOnly)
+        assertFalse(defaultEntity.unmeteredNetworkOnly)
+
+        // 2. Create a phone file in DCIM/Camera/auto_photo.jpg and run backup with default settings
+        val cameraDir = File(tempStorageDir, "DCIM/Camera").apply { mkdirs() }
+        File(cameraDir, "auto_photo.jpg").writeText("AUTO_BACKUP_PHOTO_BYTES_2026")
+
+        val prefs = TestInMemorySharedPreferences()
+        val scanner = AndroidStorageScanner(null, listOf(tempStorageDir), true)
+        val repository = BackupRepository(
+            context = null,
+            backupDao = dao,
+            storageSource = scanner,
+            driveApiClient = driveApiClient,
+            authManager = authManager,
+            customSettingsPrefs = prefs
+        )
+
+        repository.syncPersistedAccountOnStartup()
+        assertTrue(repository.settings.value.userBackupConsentGranted)
+
+        val cycleSummary = repository.runBackupNow()
+        assertEquals(1, cycleSummary.uploadedAndVerifiedFiles)
+
+        // 3. Verify DashboardSummary explicitly reports where it is backing up in Google Drive & which folder/file from Phone
+        val coverage = repository.getFolderCoverageItems()
+        val dash = repository.buildDashboardSummary(precomputedCoverage = coverage)
+        assertTrue(dash.isContinuousAutoBackupServiceActive)
+        assertTrue(
+            "Phone source path must mention DCIM/Camera/auto_photo.jpg, got: ${dash.currentPhoneSourcePath}",
+            dash.currentPhoneSourcePath.contains("DCIM/Camera/auto_photo.jpg")
+        )
+        assertTrue(
+            "Drive target path must mention Android_Permanent_Backup and DCIM/Camera, got: ${dash.currentDriveTargetPath}",
+            dash.currentDriveTargetPath.contains("Android_Permanent_Backup") &&
+                dash.currentDriveTargetPath.contains("DCIM/Camera")
+        )
+        assertNotNull("currentScanningOrUploadingFile must be populated after backup", dash.currentScanningOrUploadingFile)
+    }
 }
 
 class TestInMemorySharedPreferences : SharedPreferences {

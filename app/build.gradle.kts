@@ -13,8 +13,8 @@ android {
         applicationId = "com.permanentbackup.gdrive"
         minSdk = 26
         targetSdk = 35
-        versionCode = 9
-        versionName = "2.3.1"
+        versionCode = 10
+        versionName = "2.3.2"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -42,6 +42,10 @@ android {
                 storePassword = System.getenv("KEYSTORE_PASSWORD") ?: ""
                 keyAlias = System.getenv("KEY_ALIAS") ?: ""
                 keyPassword = System.getenv("KEY_PASSWORD") ?: ""
+                enableV1Signing = true
+                enableV2Signing = true
+                enableV3Signing = true
+                enableV4Signing = true
             }
         }
     }
@@ -49,10 +53,16 @@ android {
     buildTypes {
         debug {
             isMinifyEnabled = false
+            isDebuggable = false
+            val keystorePath = System.getenv("KEYSTORE_FILE_PATH")
+            if (!keystorePath.isNullOrBlank() && file(keystorePath).exists()) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
         release {
             isMinifyEnabled = true
             isShrinkResources = true
+            isDebuggable = false
             val keystorePath = System.getenv("KEYSTORE_FILE_PATH")
             if (!keystorePath.isNullOrBlank() && file(keystorePath).exists()) {
                 signingConfig = signingConfigs.getByName("release")
@@ -146,5 +156,4 @@ dependencies {
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
     testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
     testImplementation("org.json:json:20240303")
-    debugImplementation("androidx.compose.ui:ui-tooling")
 }

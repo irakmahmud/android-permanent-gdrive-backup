@@ -11,22 +11,31 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
+import com.permanentbackup.gdrive.MainActivity
 import com.permanentbackup.gdrive.PermanentBackupApp
 import com.permanentbackup.gdrive.R
+import com.permanentbackup.gdrive.domain.engine.PermanentBackupEngine
 import com.permanentbackup.gdrive.domain.model.ActiveUploadProgress
 import com.permanentbackup.gdrive.worker.BackupWorkScheduler
+import com.permanentbackup.gdrive.worker.LocalStorageFileObserverManager
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
- * Foreground Service for long-running streaming backups with Windows Desktop-style live system tray
- * progress notification (active file name, determinate progress bar %, speed, ETA, and Pause/Resume/Stop actions).
- * Complies with Android 14/15/16 ForegroundServiceType DATA_SYNC and Job/FGS timeout quotas.
+ * 24/7 Continuous Background Auto-Backup Foreground Service:
+ * - Never stops in the background after a scan cycle finishes (uses START_STICKY + continuous watcher loop).
+ * - Watches local phone folders via FileObserver even when MainActivity is closed.
+ * - Shows exact Phone Source Folder/File and Google Drive Destination Folder/File in live notifications.
+ * - Complies with Android 14/15/16 ForegroundServiceType DATA_SYNC and Job/FGS timeout quotas.
  */
 class PermanentBackupForegroundService : Service() {
 
@@ -40,15 +49,18 @@ class PermanentBackupForegroundService : Service() {
         /** Upload already-queued files only (share-sheet / "Upload File") — no full storage rescan. */
         const val ACTION_UPLOAD_QUEUE = "com.permanentbackup.gdrive.action.UPLOAD_QUEUE"
 
+        private const val CONTINUOUS_AUTO_BACKUP_INTERVAL_MS = 45_000L
+
         fun startManualBackupService(context: Context) {
             try {
-                val intent = Intent(context, PermanentBackupForegroundService::class.java).apply {
+                val appContext = context.applicationContext ?: context
+                val intent = Intent(appContext, PermanentBackupForegroundService::class.java).apply {
                     action = ACTION_START_BACKUP
                 }
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    context.startForegroundService(intent)
+                    appContext.startForegroundService(intent)
                 } else {
-                    context.startService(intent)
+                    appContext.startService(intent)
                 }
             } catch (_: Throwable) {
                 BackupWorkScheduler.enqueueImmediateRetryWork(context)
@@ -57,13 +69,14 @@ class PermanentBackupForegroundService : Service() {
 
         fun startUploadQueueService(context: Context) {
             try {
-                val intent = Intent(context, PermanentBackupForegroundService::class.java).apply {
+                val appContext = context.applicationContext ?: context
+                val intent = Intent(appContext, PermanentBackupForegroundService::class.java).apply {
                     action = ACTION_UPLOAD_QUEUE
                 }
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    context.startForegroundService(intent)
+                    appContext.startForegroundService(intent)
                 } else {
-                    context.startService(intent)
+                    appContext.startService(intent)
                 }
             } catch (_: Throwable) {
                 BackupWorkScheduler.enqueueImmediateRetryWork(context)
@@ -71,38 +84,36 @@ class PermanentBackupForegroundService : Service() {
         }
     }
 
-    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val serviceExceptionHandler = CoroutineExceptionHandler { _, _ -> }
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO + serviceExceptionHandler)
     private var progressObserverJob: Job? = null
+    private var continuousLoopJob: Job? = null
+    private val wakeUpChannel = Channel<Boolean>(Channel.CONFLATED)
+
+    private val serviceFileObserver = LocalStorageFileObserverManager { _ ->
+        wakeUpChannel.trySend(false)
+    }
 
     override fun onCreate() {
         super.onCreate()
         ensureNotificationChannel()
+        try {
+            serviceFileObserver.startWatching()
+        } catch (_: Throwable) {
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val app = application as? PermanentBackupApp
 
-        when (intent?.action) {
-            ACTION_STOP_BACKUP -> {
-                app?.repository?.setBackupPaused(true)
-                stopSelf()
-                return START_NOT_STICKY
-            }
-            ACTION_PAUSE_BACKUP -> {
-                app?.repository?.setBackupPaused(true)
-                updateNotification(null, isPaused = true)
-                return START_NOT_STICKY
-            }
-            ACTION_RESUME_BACKUP -> {
-                app?.repository?.setBackupPaused(false)
-            }
-        }
-
+        // Always promote to foreground first to satisfy Android O+ 5-second startForeground contract
         val initialNotification = buildProgressNotification(
-            title = getString(R.string.app_name),
-            contentText = "Scanning & syncing to Google Drive (Zero-Delete Policy)...",
+            title = "Auto-Backup Active (24/7 Never-Stop)",
+            contentText = "Phone Folders → Google Drive: My Drive/${PermanentBackupEngine.ROOT_DRIVE_FOLDER_NAME}/",
+            bigText = "From Phone: /storage/emulated/0/{DCIM, Pictures, Videos, Downloads, Documents, WhatsApp, Telegram}\nTo Google Drive: My Drive / ${PermanentBackupEngine.ROOT_DRIVE_FOLDER_NAME} / <Phone_Folder>",
             progressPercent = null,
-            isPaused = app?.repository?.backupEngine?.isPaused?.value == true
+            isPaused = app?.repository?.backupEngine?.isPaused?.value == true,
+            indeterminate = false
         )
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -117,74 +128,130 @@ class PermanentBackupForegroundService : Service() {
         } catch (_: Throwable) {
         }
 
+        when (intent?.action) {
+            ACTION_STOP_BACKUP -> {
+                app?.repository?.setBackupPaused(true)
+                serviceFileObserver.stopWatching()
+                continuousLoopJob?.cancel()
+                progressObserverJob?.cancel()
+                stopSelf()
+                return START_NOT_STICKY
+            }
+            ACTION_PAUSE_BACKUP -> {
+                app?.repository?.setBackupPaused(true)
+                updateNotification(null, isPaused = true, scanStatus = null)
+                return START_STICKY
+            }
+            ACTION_RESUME_BACKUP -> {
+                app?.repository?.setBackupPaused(false)
+            }
+        }
+
         if (app != null) {
             startObservingLiveProgress(app)
             val uploadQueueOnly = intent?.action == ACTION_UPLOAD_QUEUE
-            serviceScope.launch {
-                try {
-                    if (uploadQueueOnly) {
-                        app.repository.runUploadQueueNow()
-                    } else {
-                        app.repository.runBackupNow()
-                    }
-                } finally {
-                    progressObserverJob?.cancel()
-                    if (app.repository.backupEngine.isPaused.value) {
-                        updateNotification(null, isPaused = true)
-                    } else {
-                        stopSelf()
-                    }
-                }
-            }
-        } else {
-            stopSelf()
+            wakeUpChannel.trySend(uploadQueueOnly)
+            ensureContinuousAutoBackupLoopRunning(app)
         }
 
-        return START_REDELIVER_INTENT
+        return START_STICKY
+    }
+
+    private fun ensureContinuousAutoBackupLoopRunning(app: PermanentBackupApp) {
+        if (continuousLoopJob?.isActive == true) return
+        continuousLoopJob = serviceScope.launch {
+            runCatching { app.repository.syncPersistedAccountOnStartup() }
+            runCatching { serviceFileObserver.startWatching() }
+
+            while (isActive) {
+                val uploadQueueOnly = withTimeoutOrNull(0L) { wakeUpChannel.receive() } ?: false
+                try {
+                    if (!app.repository.settings.value.backgroundSyncPaused &&
+                        !app.repository.backupEngine.isPaused.value
+                    ) {
+                        if (uploadQueueOnly) {
+                            app.repository.runUploadQueueNow()
+                        } else {
+                            app.repository.runBackupNow(respectRetryBackoff = false)
+                        }
+                    }
+                } catch (_: Throwable) {
+                }
+
+                // Wait for next real-time FileObserver trigger, manual trigger, or 45s heartbeat scan
+                withTimeoutOrNull(CONTINUOUS_AUTO_BACKUP_INTERVAL_MS) {
+                    wakeUpChannel.receive()
+                }
+            }
+        }
     }
 
     private fun startObservingLiveProgress(app: PermanentBackupApp) {
-        progressObserverJob?.cancel()
+        if (progressObserverJob?.isActive == true) return
         progressObserverJob = serviceScope.launch {
             combine(
                 app.repository.backupEngine.activeUploadProgress,
-                app.repository.backupEngine.isPaused
-            ) { progress, paused ->
-                progress to paused
-            }.collect { (progress, paused) ->
-                updateNotification(progress, paused)
+                app.repository.backupEngine.isPaused,
+                app.repository.backupEngine.currentScanActivity
+            ) { progress, paused, scanStatus ->
+                Triple(progress, paused, scanStatus)
+            }.collect { (progress, paused, scanStatus) ->
+                updateNotification(progress, paused, scanStatus)
             }
         }
     }
 
-    private fun updateNotification(progress: ActiveUploadProgress?, isPaused: Boolean) {
+    private fun updateNotification(
+        progress: ActiveUploadProgress?,
+        isPaused: Boolean,
+        scanStatus: String?
+    ) {
         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
+        val rootDriveName = PermanentBackupEngine.ROOT_DRIVE_FOLDER_NAME
         val notification = if (isPaused) {
             buildProgressNotification(
-                title = "Permanent Drive — Paused",
-                contentText = "Resumable session preserved; tap Resume to continue.",
+                title = "Permanent Drive — Auto-Backup Paused",
+                contentText = "Tap Resume to continue backing up to Google Drive ($rootDriveName).",
+                bigText = "Resumable byte offset preserved.\nGoogle Drive Target: My Drive / $rootDriveName",
                 progressPercent = progress?.fraction?.let { (it * 100f).toInt().coerceIn(0, 100) },
-                isPaused = true
+                isPaused = true,
+                indeterminate = false
             )
         } else if (progress != null) {
             val pct = (progress.fraction * 100f).toInt().coerceIn(0, 100)
             val speedStr = formatSpeed(progress.transferSpeedBps)
             val etaStr = progress.estimatedRemainingSeconds?.let { " • ETA ${it}s" }.orEmpty()
+            val phonePath = "/storage/emulated/0/${progress.relativePath}"
+            val driveSubFolder = progress.relativePath.substringBeforeLast('/', "")
+            val drivePath = if (driveSubFolder.isBlank()) {
+                "My Drive/$rootDriveName/${progress.fileName}"
+            } else {
+                "My Drive/$rootDriveName/$driveSubFolder/${progress.fileName}"
+            }
             buildProgressNotification(
-                title = "Uploading ${progress.fileName} (v${progress.backupVersion})",
-                contentText = "$pct% • $speedStr$etaStr",
+                title = "Backing up ${progress.fileName} ($pct% • $speedStr$etaStr)",
+                contentText = "Phone: /${progress.relativePath} → Drive: $rootDriveName/${progress.relativePath}",
+                bigText = "From Phone: $phonePath\nTo Google Drive: $drivePath (v${progress.backupVersion})\nProgress: $pct% • $speedStr$etaStr",
                 progressPercent = pct,
-                isPaused = false
+                isPaused = false,
+                indeterminate = false
             )
         } else {
+            val activeDetail = scanStatus
+                ?: "From Phone: /storage/emulated/0/{DCIM, Pictures, Videos, Downloads, Documents, WhatsApp, Telegram}\nTo Google Drive: My Drive / $rootDriveName / <Phone_Folder>"
             buildProgressNotification(
-                title = getString(R.string.app_name),
-                contentText = "Streaming Upload-Only Backup Active (Never-Delete Policy)",
+                title = "Auto-Backup Active (24/7 Background Sync)",
+                contentText = "Phone → Google Drive: My Drive/$rootDriveName/",
+                bigText = activeDetail,
                 progressPercent = null,
-                isPaused = false
+                isPaused = false,
+                indeterminate = false
             )
         }
-        manager.notify(NOTIFICATION_ID, notification)
+        try {
+            manager.notify(NOTIFICATION_ID, notification)
+        } catch (_: Throwable) {
+        }
     }
 
     private fun formatSpeed(bps: Long): String {
@@ -194,6 +261,15 @@ class PermanentBackupForegroundService : Service() {
             String.format("%.1f MB/s", kbps / 1024.0)
         } else {
             String.format("%.0f KB/s", kbps)
+        }
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
+        try {
+            BackupWorkScheduler.enqueueImmediateRetryWork(applicationContext)
+            startManualBackupService(applicationContext)
+        } catch (_: Throwable) {
         }
     }
 
@@ -208,6 +284,8 @@ class PermanentBackupForegroundService : Service() {
     }
 
     override fun onDestroy() {
+        serviceFileObserver.stopWatching()
+        continuousLoopJob?.cancel()
         progressObserverJob?.cancel()
         serviceScope.cancel()
         super.onDestroy()
@@ -217,26 +295,36 @@ class PermanentBackupForegroundService : Service() {
 
     private fun ensureNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val manager = getSystemService(NotificationManager::class.java)
-            val channel = NotificationChannel(
-                CHANNEL_ID,
-                getString(R.string.notification_channel_name),
-                NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                description = getString(R.string.notification_channel_desc)
+            try {
+                val manager = getSystemService(NotificationManager::class.java)
+                val channel = NotificationChannel(
+                    CHANNEL_ID,
+                    getString(R.string.notification_channel_name),
+                    NotificationManager.IMPORTANCE_LOW
+                ).apply {
+                    description = getString(R.string.notification_channel_desc)
+                }
+                manager?.createNotificationChannel(channel)
+            } catch (_: Throwable) {
             }
-            manager?.createNotificationChannel(channel)
         }
     }
 
     private fun buildProgressNotification(
         title: String,
         contentText: String,
+        bigText: String,
         progressPercent: Int?,
-        isPaused: Boolean
+        isPaused: Boolean,
+        indeterminate: Boolean
     ): Notification {
         val pendingFlags = PendingIntent.FLAG_UPDATE_CURRENT or
             (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) PendingIntent.FLAG_IMMUTABLE else 0)
+
+        val openAppIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val openAppPending = PendingIntent.getActivity(this, 100, openAppIntent, pendingFlags)
 
         val pauseResumeIntent = Intent(this, PermanentBackupForegroundService::class.java).apply {
             action = if (isPaused) ACTION_RESUME_BACKUP else ACTION_PAUSE_BACKUP
@@ -252,6 +340,8 @@ class PermanentBackupForegroundService : Service() {
             .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setContentTitle(title)
             .setContentText(contentText)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(bigText))
+            .setContentIntent(openAppPending)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .addAction(
@@ -267,7 +357,7 @@ class PermanentBackupForegroundService : Service() {
 
         if (progressPercent != null) {
             builder.setProgress(100, progressPercent, false)
-        } else if (!isPaused) {
+        } else if (indeterminate && !isPaused) {
             builder.setProgress(100, 0, true)
         }
         return builder.build()
