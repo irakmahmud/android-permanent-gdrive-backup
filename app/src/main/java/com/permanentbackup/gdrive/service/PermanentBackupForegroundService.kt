@@ -212,7 +212,7 @@ class PermanentBackupForegroundService : Service() {
                         runCatching { app.repository.syncPersistedAccountOnStartup() }
                     }
                     if (serviceFileObserver.getWatchedDirectoryPaths().isEmpty() &&
-                        app.repository.hasStoragePermission
+                        app.repository.storageSource.hasStoragePermission
                     ) {
                         runCatching { serviceFileObserver.startWatching() }
                     }
