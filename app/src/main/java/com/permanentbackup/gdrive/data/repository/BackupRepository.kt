@@ -917,7 +917,7 @@ class BackupRepository(
             }
             latestRecord != null -> {
                 val parentFolder = latestRecord.relativePath.substringBeforeLast('/', "")
-                val targetName = latestRecord.driveTargetFileName.ifBlank { latestRecord.displayName }
+                val targetName = latestRecord.driveStoredName.ifBlank { latestRecord.displayName }
                 if (parentFolder.isBlank()) {
                     "My Drive / ${accountState.rootDriveFolderName} / $targetName"
                 } else {
