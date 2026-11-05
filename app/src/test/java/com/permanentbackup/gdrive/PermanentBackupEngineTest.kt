@@ -145,13 +145,19 @@ class InMemoryBackupDao : BackupDao {
 
     override suspend fun getLatestVersionForAccountAndIdentity(accountId: String, identity: String): BackupFileEntity? {
         return records.values
-            .filter { it.accountId == accountId && it.sourceFileIdentity == identity }
+            .filter { ownedBy(accountId, it.accountId) && it.sourceFileIdentity == identity }
             .maxByOrNull { it.backupVersion }
     }
 
     override suspend fun getAllVersionsForIdentity(identity: String): List<BackupFileEntity> {
         return records.values
             .filter { it.sourceFileIdentity == identity }
+            .sortedByDescending { it.backupVersion }
+    }
+
+    override suspend fun getAllVersionsForAccountAndIdentity(accountId: String, identity: String): List<BackupFileEntity> {
+        return records.values
+            .filter { ownedBy(accountId, it.accountId) && it.sourceFileIdentity == identity }
             .sortedByDescending { it.backupVersion }
     }
 
@@ -170,7 +176,7 @@ class InMemoryBackupDao : BackupDao {
     override suspend fun getPendingRecordsForAccountPaged(accountId: String, limit: Int, offset: Int): List<BackupFileEntity> {
         return records.values
             .filter {
-                it.accountId == accountId && (
+                ownedBy(accountId, it.accountId) && (
                     it.uploadStatus == UploadStatus.PENDING ||
                         it.uploadStatus == UploadStatus.PENDING_RETRY ||
                         it.uploadStatus == UploadStatus.IN_PROGRESS
@@ -189,8 +195,20 @@ class InMemoryBackupDao : BackupDao {
             .take(limit)
     }
 
+    override suspend fun getFailedRecordsForAccountPaged(accountId: String, limit: Int, offset: Int): List<BackupFileEntity> {
+        return records.values
+            .filter { ownedBy(accountId, it.accountId) && it.uploadStatus == UploadStatus.FAILED }
+            .sortedBy { it.createdAtMs }
+            .drop(offset)
+            .take(limit)
+    }
+
     override suspend fun getInProgressRecords(): List<BackupFileEntity> {
         return records.values.filter { it.uploadStatus == UploadStatus.IN_PROGRESS }
+    }
+
+    override suspend fun getInProgressRecordsForAccount(accountId: String): List<BackupFileEntity> {
+        return records.values.filter { ownedBy(accountId, it.accountId) && it.uploadStatus == UploadStatus.IN_PROGRESS }
     }
 
     override suspend fun updateUploadProgress(
@@ -258,6 +276,15 @@ class InMemoryBackupDao : BackupDao {
         notifyChange()
     }
 
+    override suspend fun markLocalFileDeletedForAccountPreservingCloudBackup(accountId: String, identity: String) {
+        records.entries.forEach { (id, rec) ->
+            if (rec.sourceFileIdentity == identity && ownedBy(accountId, rec.accountId)) {
+                records[id] = rec.copy(localExists = false)
+            }
+        }
+        notifyChange()
+    }
+
     override fun observeRecentRecords(): Flow<List<BackupFileEntity>> = stateFlow
     override fun observeVerifiedHistory(): Flow<List<BackupFileEntity>> =
         stateFlow.map { list -> list.filter { it.uploadStatus == UploadStatus.VERIFIED } }
@@ -311,6 +338,15 @@ class InMemoryBackupDao : BackupDao {
     override suspend fun getActiveIdentitiesPaged(limit: Int, offset: Int): List<String> {
         return records.values
             .filter { it.localExists }
+            .map { it.sourceFileIdentity }
+            .distinct()
+            .drop(offset)
+            .take(limit)
+    }
+
+    override suspend fun getActiveIdentitiesForAccountPaged(accountId: String, limit: Int, offset: Int): List<String> {
+        return records.values
+            .filter { it.localExists && ownedBy(accountId, it.accountId) }
             .map { it.sourceFileIdentity }
             .distinct()
             .drop(offset)
@@ -435,6 +471,9 @@ class InMemoryBackupDao : BackupDao {
     override suspend fun sumOfflineCachedBytes(): Long =
         cloudFiles.values.filter { it.isPinnedOffline }.sumOf { it.offlineCachedBytes }
 
+    override suspend fun sumOfflineCachedBytesForAccount(accountId: String): Long =
+        cloudFiles.values.filter { it.accountId == accountId && it.isPinnedOffline }.sumOf { it.offlineCachedBytes }
+
     override suspend fun updateCloudFileOfflinePin(
         driveFileId: String,
         pinned: Boolean,
@@ -476,6 +515,14 @@ class InMemoryBackupDao : BackupDao {
     override suspend fun markVersionsPreservedAfterLocalDelete(identity: String) {
         backupVersions.entries.forEach { (id, ver) ->
             if (ver.sourceFileIdentity == identity) {
+                backupVersions[id] = ver.copy(preservedAfterLocalDelete = true)
+            }
+        }
+    }
+
+    override suspend fun markVersionsPreservedForAccountAfterLocalDelete(accountId: String, identity: String) {
+        backupVersions.entries.forEach { (id, ver) ->
+            if (ver.sourceFileIdentity == identity && ownedBy(accountId, ver.accountId)) {
                 backupVersions[id] = ver.copy(preservedAfterLocalDelete = true)
             }
         }
@@ -572,8 +619,9 @@ class InMemoryBackupDao : BackupDao {
     override suspend fun getDriveChangeToken(accountId: String): DriveChangeTokenEntity? =
         driveChangeTokens[accountId]
 
-    // v2.3.0 additions
-    private fun ownedBy(accountId: String, rowAccount: String) = rowAccount == accountId || rowAccount == "default_account"
+    // v2.3.0 / v2.3.6 additions
+    private fun ownedBy(accountId: String, rowAccount: String) =
+        rowAccount == accountId || (accountId in setOf("default_account", "user@example.com") && rowAccount == "default_account")
     private fun underPath(relativePath: String, prefix: String) = relativePath.startsWith("$prefix/")
 
     override suspend fun findVerifiedDuplicateBySha256(
@@ -684,6 +732,134 @@ class InMemoryBackupDao : BackupDao {
             .sortedByDescending { it.lastSuccessfulBackupMs ?: 0L }
             .drop(offset)
             .take(limit)
+
+    override suspend fun clearSpoofedRootFolderIdFromAccounts(ownerAccountId: String, bridgeRootId: String) {
+        accounts.entries.forEach { (id, acc) ->
+            if (!id.equals(ownerAccountId, ignoreCase = true) && acc.backupRootFolderId == bridgeRootId) {
+                accounts[id] = acc.copy(backupRootFolderId = null)
+            }
+        }
+        notifyChange()
+    }
+
+    override suspend fun reassignSpoofedBackupRecordsToOwner(spoofedAccountId: String, ownerAccountId: String) {
+        records.entries.forEach { (id, rec) ->
+            if (rec.accountId == spoofedAccountId) {
+                val collision = records.values.any {
+                    it.id != id &&
+                        it.accountId == ownerAccountId &&
+                        it.sourceFileIdentity == rec.sourceFileIdentity &&
+                        it.backupVersion == rec.backupVersion
+                }
+                if (!collision) {
+                    records[id] = rec.copy(accountId = ownerAccountId)
+                }
+            }
+        }
+        notifyChange()
+    }
+
+    override suspend fun archiveRemainingSpoofedBackupRecords(spoofedAccountId: String, ownerAccountId: String) {
+        records.entries.forEach { (id, rec) ->
+            if (rec.accountId == spoofedAccountId) {
+                records[id] = rec.copy(accountId = "bridge_archive:$ownerAccountId")
+            }
+        }
+        notifyChange()
+    }
+
+    override suspend fun reassignSpoofedBackupVersionsToOwner(spoofedAccountId: String, ownerAccountId: String) {
+        backupVersions.entries.forEach { (id, ver) ->
+            if (ver.accountId == spoofedAccountId) {
+                val collision = backupVersions.values.any {
+                    it.versionId != id &&
+                        it.accountId == ownerAccountId &&
+                        it.sourceFileIdentity == ver.sourceFileIdentity &&
+                        it.versionNumber == ver.versionNumber
+                }
+                if (!collision) {
+                    backupVersions[id] = ver.copy(accountId = ownerAccountId)
+                }
+            }
+        }
+        notifyChange()
+    }
+
+    override suspend fun archiveRemainingSpoofedBackupVersions(spoofedAccountId: String, ownerAccountId: String) {
+        backupVersions.entries.forEach { (id, ver) ->
+            if (ver.accountId == spoofedAccountId) {
+                backupVersions[id] = ver.copy(accountId = "bridge_archive:$ownerAccountId")
+            }
+        }
+        notifyChange()
+    }
+
+    override suspend fun reassignSpoofedSyncJobsToOwner(spoofedAccountId: String, ownerAccountId: String) {
+        syncJobs.entries.forEach { (id, job) ->
+            if (job.accountId == spoofedAccountId) {
+                syncJobs[id] = job.copy(accountId = ownerAccountId)
+            }
+        }
+        notifyChange()
+    }
+
+    override suspend fun reassignSpoofedSyncEventsToOwner(spoofedAccountId: String, ownerAccountId: String) {
+        for (i in syncEvents.indices) {
+            val ev = syncEvents[i]
+            if (ev.accountId == spoofedAccountId) {
+                syncEvents[i] = ev.copy(accountId = ownerAccountId)
+            }
+        }
+        notifyChange()
+    }
+
+    override suspend fun reassignSpoofedFailedOperationsToOwner(spoofedAccountId: String, ownerAccountId: String) {
+        failedOperations.entries.forEach { (id, op) ->
+            if (op.accountId == spoofedAccountId) {
+                failedOperations[id] = op.copy(accountId = ownerAccountId)
+            }
+        }
+        notifyChange()
+    }
+
+    override suspend fun reassignSpoofedUploadSessionsToOwner(spoofedAccountId: String, ownerAccountId: String) {
+        uploadSessions.entries.forEach { (id, sess) ->
+            if (sess.accountId == spoofedAccountId) {
+                uploadSessions[id] = sess.copy(accountId = ownerAccountId)
+            }
+        }
+        notifyChange()
+    }
+
+    override suspend fun archiveRemainingSpoofedUploadSessions(spoofedAccountId: String, ownerAccountId: String) {
+        uploadSessions.entries.forEach { (id, sess) ->
+            if (sess.accountId == spoofedAccountId) {
+                uploadSessions[id] = sess.copy(accountId = "bridge_archive:$ownerAccountId", isActive = false)
+            }
+        }
+        notifyChange()
+    }
+
+    override suspend fun reassignSpoofedCloudFilesToOwner(spoofedAccountId: String, ownerAccountId: String) {
+        cloudFiles.entries.forEach { (id, cf) ->
+            if (cf.accountId == spoofedAccountId) {
+                cloudFiles[id] = cf.copy(accountId = ownerAccountId)
+            }
+        }
+        notifyChange()
+    }
+
+    override suspend fun archiveSpoofedDriveFolderCache(spoofedAccountPrefix: String, bridgeRootId: String) {
+        val toArchive = folderCache.entries.filter { (key, entity) ->
+            key.startsWith(spoofedAccountPrefix) ||
+                entity.driveFolderId == bridgeRootId ||
+                entity.parentDriveFolderId == bridgeRootId
+        }
+        for ((key, entity) in toArchive) {
+            folderCache.remove(key)
+            folderCache["bridge_archive:$key"] = entity.copy(relativePath = "bridge_archive:$key")
+        }
+    }
 
     fun getAllRecordsSnapshot(): List<BackupFileEntity> = records.values.toList()
     fun getAllSyncJobsSnapshot(): List<SyncJobEntity> = syncJobs.values.toList()
@@ -3191,6 +3367,199 @@ class PermanentBackupEngineTest {
         assertTrue(
             "Android_Permanent_Backup folder must be created on Google Drive immediately",
             createdFoldersOnDrive.any { it.contains("Android_Permanent_Backup") }
+        )
+    }
+
+    // 42. Complete Account Switch ("Account switch maanei sob kisu switch") + Legacy Spoofed DB Remediation
+    @Test
+    fun test42_completeAccountSwitch_purgesOldCredentialsRemediatesSpoofedDbAndSwitchesEverything() = runTest {
+        val createdFoldersByToken = mutableListOf<Pair<String, String>>()
+        mockWebServer.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                val path = request.path ?: ""
+                val method = request.method ?: "GET"
+                val auth = request.getHeader("Authorization").orEmpty()
+                val isIrakiroan = auth.contains("irakiroan_token")
+
+                if (path.startsWith("/drive/v3/about")) {
+                    val limit = if (isIrakiroan) 15_000_000_000L else 5_000_000_000_000L
+                    val usage = if (isIrakiroan) 200_000_000L else 950_000_000_000L
+                    return MockResponse()
+                        .setResponseCode(200)
+                        .setBody("""{"storageQuota":{"limit":$limit,"usage":$usage,"usageInDrive":$usage,"usageInDriveTrash":0}}""")
+                }
+                if (method == "GET" && path.startsWith("/drive/v3/files?")) {
+                    return MockResponse().setResponseCode(200).setBody("""{"files":[]}""")
+                }
+                if (method == "POST" && path.startsWith("/drive/v3/files") && !path.contains("uploadType")) {
+                    val bodyStr = request.body.readUtf8()
+                    createdFoldersByToken.add(auth to bodyStr)
+                    val id = if (isIrakiroan) "irakiroan_drive_folder_${fileIdSeq.incrementAndGet()}"
+                    else "bridge_owner_folder_${fileIdSeq.incrementAndGet()}"
+                    return MockResponse().setResponseCode(200).setBody("""{"id":"$id","name":"Android_Permanent_Backup"}""")
+                }
+                if (method == "POST" && path.startsWith("/upload/drive/v3/files?uploadType=resumable")) {
+                    val uploadId = "up42_${fileIdSeq.incrementAndGet()}"
+                    val sessionUrl = mockWebServer.url("/upload/drive/v3/files?uploadType=resumable&upload_id=$uploadId").toString()
+                    return MockResponse().setResponseCode(200).addHeader("Location", sessionUrl)
+                }
+                if (method == "PUT" && path.contains("upload_id=up42_")) {
+                    val bodyBytes = request.body.readByteArray()
+                    val driveId = if (isIrakiroan) "irakiroan_file_${fileIdSeq.incrementAndGet()}" else "owner_file_${fileIdSeq.incrementAndGet()}"
+                    uploadedDriveFiles[driveId] = Triple(driveId, bodyBytes.size.toLong(), null)
+                    return MockResponse().setResponseCode(200)
+                        .setBody("""{"id":"$driveId","name":"photo_switch.jpg","size":${bodyBytes.size}}""")
+                }
+                if (method == "GET" && path.startsWith("/drive/v3/files/")) {
+                    val fileId = path.substringAfter("/drive/v3/files/").substringBefore("?")
+                    val meta = uploadedDriveFiles[fileId]
+                    val size = meta?.second ?: 24L
+                    return MockResponse().setResponseCode(200)
+                        .setBody("""{"id":"$fileId","name":"photo_switch.jpg","size":$size,"trashed":false}""")
+                }
+                return MockResponse().setResponseCode(404)
+            }
+        }
+
+        val dcimDir = File(tempStorageDir, "DCIM/Camera").apply { mkdirs() }
+        val localPhoto = File(dcimDir, "photo_switch.jpg").apply {
+            writeText("CAMERA_PHOTO_SWITCH_2026")
+        }
+
+        // Simulate contaminated v2.3.4 state where irakiroan@gmail.com had the Cloud Bridge owner's
+        // root folder ID (19pEu61NKlENus5JAEmUkST5EimE6KOm_) and VERIFIED records in SQLite
+        val authPrefs = TestInMemorySharedPreferences()
+        authPrefs.edit()
+            .putString("account_email", "irakiroan@gmail.com")
+            .putString("root_drive_folder_id", GoogleAuthManager.CLOUD_BRIDGE_OWNER_ROOT_FOLDER_ID)
+            .putString("irakiroan@gmail.com_root_drive_folder_id", GoogleAuthManager.CLOUD_BRIDGE_OWNER_ROOT_FOLDER_ID)
+            .apply()
+
+        val switchAuth = GoogleAuthManager(
+            context = null,
+            tokenEndpointUrl = mockWebServer.url("/oauth2/token").toString(),
+            revokeEndpointUrl = mockWebServer.url("/oauth2/revoke").toString(),
+            customPrefs = authPrefs
+        )
+
+        // Verify constructor immediately purged the bridge owner's root folder ID from irakiroan@gmail.com
+        assertEquals(null, switchAuth.accountState.value.rootDriveFolderId)
+
+        dao.upsertGoogleAccount(
+            GoogleAccountEntity(
+                accountId = "irakiroan@gmail.com",
+                email = "irakiroan@gmail.com",
+                displayName = "Irakiroan",
+                selectedAccountRef = "irakiroan@gmail.com",
+                isActive = true,
+                authorizationState = AccountAuthState.AUTHORIZED.name,
+                grantedScopes = GoogleAuthManager.LEAST_PRIVILEGE_SCOPE,
+                lastSuccessfulConnectionMs = 1000L,
+                lastTokenRefreshStatus = "OK",
+                lastTokenRefreshMs = 1000L,
+                connectionError = null,
+                backupRootFolderId = GoogleAuthManager.CLOUD_BRIDGE_OWNER_ROOT_FOLDER_ID,
+                backupRootFolderName = "Android_Permanent_Backup"
+            )
+        )
+        dao.insertRecord(
+            BackupFileEntity(
+                accountId = "irakiroan@gmail.com",
+                sourceUri = localPhoto.absolutePath,
+                sourceFileIdentity = "vol0:DCIM/Camera/photo_switch.jpg",
+                relativePath = "DCIM/Camera/photo_switch.jpg",
+                displayName = "photo_switch.jpg",
+                folderCategory = "Camera (DCIM/Camera)",
+                fileSize = localPhoto.length(),
+                lastModifiedMs = localPhoto.lastModified(),
+                mimeType = "image/jpeg",
+                driveFileId = "old_bridge_owner_file_id",
+                driveFolderId = GoogleAuthManager.CLOUD_BRIDGE_OWNER_ROOT_FOLDER_ID,
+                driveStoredName = "photo_switch.jpg",
+                backupVersion = 1,
+                uploadedBytes = localPhoto.length(),
+                uploadStatus = UploadStatus.VERIFIED,
+                verificationStatus = VerificationStatus.CHECKSUM_AND_SIZE_VERIFIED
+            )
+        )
+        dao.cacheDriveFolder(
+            DriveFolderCacheEntity(
+                relativePath = "irakiroan@gmail.com:${GoogleAuthManager.CLOUD_BRIDGE_OWNER_ROOT_FOLDER_ID}:DCIM/Camera",
+                driveFolderId = "old_bridge_camera_folder_id",
+                parentDriveFolderId = GoogleAuthManager.CLOUD_BRIDGE_OWNER_ROOT_FOLDER_ID
+            )
+        )
+
+        val scanner = AndroidStorageScanner(null, listOf(tempStorageDir), true)
+        val repoPrefs = TestInMemorySharedPreferences()
+        val repository = BackupRepository(
+            context = null,
+            backupDao = dao,
+            storageSource = scanner,
+            driveApiClient = driveApiClient,
+            authManager = switchAuth,
+            customSettingsPrefs = repoPrefs
+        )
+
+        // 1. Startup remediation moves spoofed rows to mdkamruzzamanirak@gmail.com and clears irakiroan@gmail.com
+        repository.syncPersistedAccountOnStartup()
+        assertEquals(
+            "Startup must never restore bridge owner's folder ID onto irakiroan@gmail.com",
+            null,
+            switchAuth.accountState.value.rootDriveFolderId
+        )
+        assertEquals(
+            "Spoofed record must be reassigned to mdkamruzzamanirak@gmail.com",
+            1,
+            dao.countVerifiedRecordsForAccount("mdkamruzzamanirak@gmail.com")
+        )
+        assertEquals(
+            "irakiroan@gmail.com must have 0 verified records before its own genuine backup runs",
+            0,
+            dao.countVerifiedRecordsForAccount("irakiroan@gmail.com")
+        )
+
+        // 2. Authorize mdkamruzzamanirak@gmail.com first and verify its 5 TB quota and 1 verified record
+        switchAuth.onAccountAuthorized(
+            email = "mdkamruzzamanirak@gmail.com",
+            displayName = "Md Kamruzzaman Irak",
+            accessToken = "owner_token",
+            refreshToken = "owner_refresh"
+        )
+        switchAuth.setRootDriveFolderName("Android_Permanent_Backup", GoogleAuthManager.CLOUD_BRIDGE_OWNER_ROOT_FOLDER_ID)
+        repository.backupEngine.refreshRemoteQuotaAndRootFolder(createFolderIfMissing = false)
+        val ownerDash = repository.buildDashboardSummary()
+        assertEquals("mdkamruzzamanirak@gmail.com", ownerDash.accountState.email)
+        assertEquals(1, ownerDash.successfullyBackedUpFiles)
+        assertEquals(5_000_000_000_000L, ownerDash.driveQuota.limitBytes)
+
+        // 3. Switch account to irakiroan@gmail.com -> EVERYTHING switches atomically
+        repository.onAccountSwitchReset("irakiroan@gmail.com")
+        assertFalse("Old 5 TB quota must be cleared immediately on account switch", repository.backupEngine.latestQuotaInfo.value.isLoaded)
+        assertEquals("irakiroan@gmail.com", switchAuth.accountState.value.email)
+        assertEquals(null, switchAuth.accountState.value.rootDriveFolderId)
+
+        switchAuth.switchGoogleAccount(
+            newEmail = "irakiroan@gmail.com",
+            newDisplayName = "Irakiroan",
+            newAccessToken = "irakiroan_token",
+            newRefreshToken = "irakiroan_refresh"
+        )
+        val backupCycle = repository.runBackupNow()
+        assertEquals(
+            "irakiroan@gmail.com must upload local files to its own Google Drive (not skip due to old spoofed records)",
+            1,
+            backupCycle.uploadedAndVerifiedFiles
+        )
+
+        val irakiroanDash = repository.buildDashboardSummary()
+        assertEquals("irakiroan@gmail.com", irakiroanDash.accountState.email)
+        assertEquals(1, irakiroanDash.successfullyBackedUpFiles)
+        assertEquals(15_000_000_000L, irakiroanDash.driveQuota.limitBytes)
+        assertNotNull(irakiroanDash.accountState.rootDriveFolderId)
+        assertTrue(
+            "irakiroan@gmail.com must have its own Drive root folder ID, not the bridge owner's",
+            irakiroanDash.accountState.rootDriveFolderId!!.startsWith("irakiroan_drive_folder_")
         )
     }
 }

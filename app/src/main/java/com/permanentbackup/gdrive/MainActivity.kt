@@ -315,6 +315,37 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
+                var autoReauthTriggeredForEmail by remember { mutableStateOf("") }
+                LaunchedEffect(summary.accountState.email, summary.accountState.isConnected, summary.isDashboardLoading) {
+                    val savedEmail = summary.accountState.email.trim()
+                    if (!summary.isDashboardLoading &&
+                        savedEmail.isNotBlank() &&
+                        !summary.accountState.isConnected &&
+                        !isAuthorizingAccount &&
+                        !viewModel.isUserExplicitlyDisconnected() &&
+                        !autoReauthTriggeredForEmail.equals(savedEmail, ignoreCase = true)
+                    ) {
+                        autoReauthTriggeredForEmail = savedEmail
+                        pendingSelectedEmail = savedEmail
+                        viewModel.onNativeGoogleAccountSelected(
+                            context = this@MainActivity,
+                            selectedEmail = savedEmail,
+                            requestFullDriveRead = pendingFullReadScope,
+                            onResolutionPendingIntent = { pendingIntent ->
+                                runCatching {
+                                    identityAuthorizationLauncher.launch(
+                                        IntentSenderRequest.Builder(pendingIntent).build()
+                                    )
+                                }
+                            },
+                            onRecoverableConsentIntent = { consentIntent ->
+                                runCatching { recoverableConsentLauncher.launch(consentIntent) }
+                            },
+                            onLoopbackBrowserAuthUri = openLoopbackBrowserOAuth
+                        )
+                    }
+                }
+
                 Scaffold(
                     modifier = Modifier
                         .fillMaxSize()
@@ -510,6 +541,16 @@ class MainActivity : ComponentActivity() {
                                     viewModel.switchActiveSavedAccount(
                                         context = this@MainActivity,
                                         email = email,
+                                        onResolutionPendingIntent = { pendingIntent ->
+                                            runCatching {
+                                                identityAuthorizationLauncher.launch(
+                                                    IntentSenderRequest.Builder(pendingIntent).build()
+                                                )
+                                            }
+                                        },
+                                        onRecoverableConsentIntent = { consentIntent ->
+                                            runCatching { recoverableConsentLauncher.launch(consentIntent) }
+                                        },
                                         onLoopbackBrowserAuthUri = openLoopbackBrowserOAuth
                                     )
                                 },

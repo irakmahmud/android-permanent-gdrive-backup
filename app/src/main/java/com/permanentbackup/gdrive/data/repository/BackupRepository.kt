@@ -161,8 +161,72 @@ class BackupRepository(
         activeAccountIdFlow.flatMapLatest { backupDao.observePinnedOfflineFiles(it) }
             .catch { emit(emptyList()) }
 
+    /**
+     * One-time + idempotent SQLite remediation for any records that were created in v2.3.4 while a
+     * non-owner account (such as irakiroan@gmail.com) was spoofed with the Cloud Bridge owner's
+     * credentials (mdkamruzzamanirak@gmail.com, root folder 19pEu61NKlENus5JAEmUkST5EimE6KOm_).
+     * Reassigns those cloud records to mdkamruzzamanirak@gmail.com (zero data loss) and clears
+     * irakiroan@gmail.com so it creates its own folder and backs up all phone files into its own Drive.
+     */
+    suspend fun remediateLegacyBridgeSpoofedDataIfNeeded() {
+        try {
+            authManager.purgeMismatchedBridgeTokensIfNeeded()
+            val ownerId = GoogleAuthManager.CLOUD_BRIDGE_OWNER_EMAIL.lowercase()
+            val bridgeRootId = GoogleAuthManager.CLOUD_BRIDGE_OWNER_ROOT_FOLDER_ID
+            val alreadyRemediated = prefs?.getBoolean("v236_spoofed_bridge_remediated", false) == true
+
+            val allDbAccounts = backupDao.getAllGoogleAccounts()
+            val taintedAccounts = allDbAccounts
+                .filter { !it.accountId.equals(ownerId, ignoreCase = true) && it.backupRootFolderId == bridgeRootId }
+                .map { it.accountId }
+                .toMutableSet()
+
+            if (!alreadyRemediated) {
+                taintedAccounts.add("irakiroan@gmail.com")
+            }
+
+            if (taintedAccounts.isNotEmpty() || !alreadyRemediated) {
+                backupDao.clearSpoofedRootFolderIdFromAccounts(ownerId, bridgeRootId)
+                for (spoofedId in taintedAccounts) {
+                    if (spoofedId.equals(ownerId, ignoreCase = true)) continue
+                    backupDao.reassignSpoofedBackupRecordsToOwner(spoofedId, ownerId)
+                    backupDao.archiveRemainingSpoofedBackupRecords(spoofedId, ownerId)
+                    backupDao.reassignSpoofedBackupVersionsToOwner(spoofedId, ownerId)
+                    backupDao.archiveRemainingSpoofedBackupVersions(spoofedId, ownerId)
+                    backupDao.reassignSpoofedSyncJobsToOwner(spoofedId, ownerId)
+                    backupDao.reassignSpoofedSyncEventsToOwner(spoofedId, ownerId)
+                    backupDao.reassignSpoofedFailedOperationsToOwner(spoofedId, ownerId)
+                    backupDao.reassignSpoofedUploadSessionsToOwner(spoofedId, ownerId)
+                    backupDao.archiveRemainingSpoofedUploadSessions(spoofedId, ownerId)
+                    backupDao.reassignSpoofedCloudFilesToOwner(spoofedId, ownerId)
+                    backupDao.archiveSpoofedDriveFolderCache("$spoofedId:", bridgeRootId)
+                }
+                prefs?.edit()?.putBoolean("v236_spoofed_bridge_remediated", true)?.apply()
+            }
+        } catch (_: Throwable) {
+            // Best-effort remediation; never block app startup
+        }
+    }
+
+    /**
+     * Atomically resets engine, cloud explorer, and active account state when switching accounts
+     * ("Account switch means everything switches").
+     */
+    suspend fun onAccountSwitchReset(newEmail: String) {
+        val cleanEmail = newEmail.trim()
+        if (cleanEmail.isBlank()) return
+        remediateLegacyBridgeSpoofedDataIfNeeded()
+        backupEngine.resetStateForAccountSwitch()
+        _cloudNextPageToken.value = null
+        _lastCloudBrowseError.value = null
+        authManager.prepareForAccountSwitch(cleanEmail)
+        backupDao.setActiveGoogleAccount(cleanEmail.lowercase())
+    }
+
     suspend fun syncPersistedAccountOnStartup() {
         try {
+            remediateLegacyBridgeSpoofedDataIfNeeded()
+
             // 1. Restore persisted AppSettingsEntity from Room if present; always ensure auto-backup consent is active
             val dbSettings = backupDao.getAppSettingsEntity()
             if (dbSettings != null) {
@@ -207,7 +271,15 @@ class BackupRepository(
                 val restoredFolderName = activeDbAccount.backupRootFolderName.ifBlank {
                     authManager.accountState.value.rootDriveFolderName
                 }
-                authManager.setRootDriveFolderName(restoredFolderName, activeDbAccount.backupRootFolderId)
+                val safeDbRootFolderId = if (
+                    activeDbAccount.backupRootFolderId == GoogleAuthManager.CLOUD_BRIDGE_OWNER_ROOT_FOLDER_ID &&
+                    !activeDbAccount.email.equals(GoogleAuthManager.CLOUD_BRIDGE_OWNER_EMAIL, ignoreCase = true)
+                ) {
+                    null
+                } else {
+                    activeDbAccount.backupRootFolderId
+                }
+                authManager.setRootDriveFolderName(restoredFolderName, safeDbRootFolderId)
                 if (authManager.accountState.value.isConnected) {
                     persistCurrentAccountToDatabase()
                 }
@@ -385,7 +457,7 @@ class BackupRepository(
     }
 
     suspend fun retryAllFailedUploads(): BackupCycleSummary {
-        val failedList = backupDao.getFailedRecordsPaged(500, 0)
+        val failedList = backupDao.getFailedRecordsForAccountPaged(currentAccountId(), 500, 0)
         for (rec in failedList) {
             backupDao.updateUploadProgress(
                 id = rec.id,
@@ -495,10 +567,10 @@ class BackupRepository(
     ): List<CloudBrowseItem> {
         val rawEntities = when {
             searchQuery.isNotBlank() -> backupDao.searchCloudFiles(accountId, searchQuery.trim())
-            !parentFolderId.isNullOrBlank() -> backupDao.getCloudFilesByParent(parentFolderId)
+            !parentFolderId.isNullOrBlank() -> backupDao.getCloudFilesByParentForAccount(accountId, parentFolderId)
             filter == DriveViewFilter.BACKUP_ROOT -> {
                 val rootId = authManager.accountState.value.rootDriveFolderId
-                if (rootId.isNullOrBlank()) emptyList() else backupDao.getCloudFilesByParent(rootId)
+                if (rootId.isNullOrBlank()) emptyList() else backupDao.getCloudFilesByParentForAccount(accountId, rootId)
             }
             else -> backupDao.getCloudFilesForAccountPaged(accountId, 200, 0)
         }
@@ -855,7 +927,7 @@ class BackupRepository(
     }
 
     suspend fun getAllVersionsForFile(sourceFileIdentity: String): List<BackupFileEntity> {
-        return backupDao.getAllVersionsForIdentity(sourceFileIdentity)
+        return backupDao.getAllVersionsForAccountAndIdentity(currentAccountId(), sourceFileIdentity)
     }
 
     suspend fun getAccountBackupVersionsPaged(limit: Int = 200, offset: Int = 0): List<BackupVersionEntity> {
@@ -903,7 +975,7 @@ class BackupRepository(
         val restrictedCount = coverage.count { it.accessStatus == FolderAccessStatus.RESTRICTED_BY_ANDROID_OS }
         val accountState = authManager.accountState.value
         val offlinePinnedCount = backupDao.countPinnedOfflineFiles(accountId)
-        val offlineUsedBytes = backupDao.sumOfflineCachedBytes()
+        val offlineUsedBytes = backupDao.sumOfflineCachedBytesForAccount(accountId)
         val accountsCount = maxOf(backupDao.getAllGoogleAccounts().size, authManager.getKnownAccountEmails().size)
 
         val progress = if (total > 0) {

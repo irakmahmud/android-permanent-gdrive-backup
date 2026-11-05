@@ -1,4 +1,4 @@
-name: Remote Cloud Android Build & Verification (Permanent Drive v2.3.5)
+name: Remote Cloud Android Build & Verification (Permanent Drive v2.3.6)
 
 on:
   push:
@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   remote-android-apk-build:
-    name: Remote Cloud Build, Lint, 41 Unit/Integration Tests, Play Protect Signing & v2.3.5 Release
+    name: Remote Cloud Build, Lint, 42 Unit/Integration Tests, Play Protect Signing & v2.3.6 Release
     runs-on: ubuntu-latest
     env:
       CLOUD_BRIDGE_PAYLOAD: ${{ secrets.CLOUD_BRIDGE_PAYLOAD }}
@@ -61,7 +61,7 @@ jobs:
         run: |
           ./gradlew :app:lintDebug --no-daemon
 
-      - name: "Stage 8, 9 & 10: Execute 41 Unit, Integration & 3-Layer Never-Delete Policy Tests"
+      - name: "Stage 8, 9 & 10: Execute 42 Unit, Integration & 3-Layer Never-Delete Policy Tests"
         run: |
           ./gradlew :app:testDebugUnitTest --info --no-daemon
 
@@ -83,7 +83,7 @@ jobs:
             --v3-signing-enabled true \
             --out "$APK_FILE" \
             /tmp/aligned.apk
-          cp "$APK_FILE" app/build/outputs/apk/debug/Permanent-Drive-v2.3.5.apk
+          cp "$APK_FILE" app/build/outputs/apk/debug/Permanent-Drive-v2.3.6.apk
           echo "=== Auditing APK DEX Bytecode for Forbidden Secrets/Tokens & Play Protect Triggers ==="
           mkdir -p /tmp/apk-inspect
           unzip -q -o "$APK_FILE" -d /tmp/apk-inspect
@@ -107,37 +107,36 @@ jobs:
           APKSIGNER_BIN=$(find "${ANDROID_HOME:-$ANDROID_SDK_ROOT}/build-tools" -name apksigner | sort -V | tail -n 1)
           "$APKSIGNER_BIN" verify --verbose --print-certs "$APK_FILE" | tee app/build/outputs/apk/debug/apk-signing-certificate.txt
           sha256sum "$APK_FILE" | tee app/build/outputs/apk/debug/app-debug.apk.sha256
-          ls -lh "$APK_FILE" app/build/outputs/apk/debug/Permanent-Drive-v2.3.5.apk
+          ls -lh "$APK_FILE" app/build/outputs/apk/debug/Permanent-Drive-v2.3.6.apk
 
       - name: "Stage 14a: Upload Downloadable APK & Reports Artifact"
         uses: actions/upload-artifact@v4
         with:
-          name: Permanent-Drive-v2.3.5-APK
+          name: Permanent-Drive-v2.3.6-APK
           path: |
-            app/build/outputs/apk/debug/Permanent-Drive-v2.3.5.apk
+            app/build/outputs/apk/debug/Permanent-Drive-v2.3.6.apk
             app/build/outputs/apk/debug/app-debug.apk
             app/build/outputs/apk/debug/app-debug.apk.sha256
             app/build/outputs/apk/debug/apk-signing-certificate.txt
             app/build/reports/tests/testDebugUnitTest/
             app/build/reports/lint-results-debug.html
 
-      - name: "Stage 14b: Publish Direct Downloadable APK to GitHub Releases (v2.3.5)"
+      - name: "Stage 14b: Publish Direct Downloadable APK to GitHub Releases (v2.3.6)"
         if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.3.5
-          name: "Permanent Drive v2.3.5 — Strict Per-Account OAuth Isolation, RFC 8252 Browser Loopback OAuth & Immediate Google Drive Folder Creation"
+          tag_name: v2.3.6
+          name: "Permanent Drive v2.3.6 — Complete Atomic Account Switch ('Account Switch Means Everything Switches') & Legacy Spoofed SQLite Remediation"
           body: |
-            Automated Remote Cloud Build of **Permanent Drive v2.3.5** (`com.permanentbackup.gdrive`, `versionCode = 13`).
-            - **1. Strict Per-Account OAuth Token Isolation (Zero Cross-Account Spoofing)**:
-              - Fixed bug where selecting `irakiroan@gmail.com` fell back to the embedded Cloud Bridge token (`mdkamruzzamanirak@gmail.com`) and saved the bridge token under `irakiroan@gmail.com`, causing `Android_Permanent_Backup` to be created in `mdkamruzzamanirak@gmail.com`'s Google Drive instead of `irakiroan@gmail.com`'s Google Drive.
-              - Added automatic startup cleanup (`purgeMismatchedBridgeTokensIfNeeded()`) to remove any previously cross-bound bridge token or folder ID from non-bridge accounts.
-            - **2. RFC 8252 Loopback HTTP OAuth 2.0 Flow for Any User Google Account**:
-              - Added local `127.0.0.1:<ephemeral_port>` loopback OAuth 2.0 authorization (`prepareLoopbackOAuthSession` + `awaitLoopbackOAuthCodeAndExchange`) so selecting `irakiroan@gmail.com` (or any other account on the phone) opens Google Sign-In in the browser, obtains a genuine `access_token` + `refresh_token` for that exact account, and returns to `MainActivity` via `permanentdrive://oauth2redirect`.
-            - **3. Immediate Google Drive Root Folder Creation Upon Sign-In & App Refresh**:
-              - Updated `onNativeGoogleAccountSelected` and `refreshDashboardAndCoverage(fetchRemoteQuota = true)` to call `refreshRemoteQuotaAndRootFolder(createFolderIfMissing = true)`, ensuring `Android_Permanent_Backup` (or the user's custom folder name) is created on Google Drive immediately upon connecting an account without waiting for the full phone storage scan to finish.
+            Automated Remote Cloud Build of **Permanent Drive v2.3.6** (`com.permanentbackup.gdrive`, `versionCode = 14`).
+            - **1. Complete Atomic Account Switch ("Account Switch Means Everything Switches")**:
+              - Switching accounts (`prepareForAccountSwitch` + `onAccountSwitchReset` + `resetStateForAccountSwitch`) immediately switches 100% of app state: OAuth tokens, root Drive folder ID & folder name, in-flight backup cycle cancellation, Drive storage quota, active upload progress, scan banner, My Drive explorer, folder coverage counts, and all Room SQLite streams (`ActiveQueue`, `VerifiedHistory`, `RecentRecords`, `FailedUploads`, `SyncJobs`, `SyncEvents`, `UnresolvedFailures`, `PinnedOfflineFiles`).
+              - Scoped all remaining DAO queries (`getInProgressRecordsForAccount`, `getFailedRecordsForAccountPaged`, `getAllVersionsForAccountAndIdentity`, `getActiveIdentitiesForAccountPaged`, `markLocalFileDeletedForAccountPreservingCloudBackup`, `markVersionsPreservedForAccountAfterLocalDelete`, `sumOfflineCachedBytesForAccount`, `getCloudFilesByParentForAccount`, `countPreservedAfterLocalDeleteForAccount`) strictly to the active Google Account.
+            - **2. Automatic Remediation of Legacy Spoofed SQLite Rows & Old Credentials (`remediateLegacyBridgeSpoofedDataIfNeeded`)**:
+              - Eliminates the bug where `syncPersistedAccountOnStartup()` restored `mdkamruzzamanirak@gmail.com`'s root folder ID (`19pEu61NKlENus5JAEmUkST5EimE6KOm_`) from SQLite back onto `irakiroan@gmail.com`.
+              - Non-destructively reassigns all `v2.3.4` spoofed SQLite records from `irakiroan@gmail.com` to `mdkamruzzamanirak@gmail.com` (zero data loss) and clears `irakiroan@gmail.com`'s spoofed folder cache so `irakiroan@gmail.com` immediately creates its own `Android_Permanent_Backup` folder and backs up all phone files into `irakiroan@gmail.com`'s Google Drive.
           files: |
-            app/build/outputs/apk/debug/Permanent-Drive-v2.3.5.apk
+            app/build/outputs/apk/debug/Permanent-Drive-v2.3.6.apk
             app/build/outputs/apk/debug/app-debug.apk
             app/build/outputs/apk/debug/app-debug.apk.sha256
             app/build/outputs/apk/debug/apk-signing-certificate.txt

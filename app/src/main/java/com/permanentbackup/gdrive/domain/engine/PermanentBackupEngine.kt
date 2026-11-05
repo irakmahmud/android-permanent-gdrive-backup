@@ -150,10 +150,35 @@ class PermanentBackupEngine(
     @Volatile
     private var activeCycleDeferred: CompletableDeferred<BackupCycleSummary>? = null
     @Volatile
+    private var activeCycleJob: kotlinx.coroutines.Job? = null
+    @Volatile
     private var rerunRequestedSettings: BackupSettings? = null
 
     fun setEnginePaused(paused: Boolean) {
         _isPaused.value = paused
+    }
+
+    /**
+     * Atomically cancels any in-flight backup cycle for the previous account and resets all
+     * transient engine states (quota, active upload progress, scan banner, and error messages)
+     * so switching accounts immediately reflects the newly selected account ("Account switch means everything switches").
+     */
+    fun resetStateForAccountSwitch() {
+        rerunRequestedSettings = null
+        activeCycleDeferred?.cancel()
+        activeCycleDeferred = null
+        activeCycleJob?.cancel()
+        activeCycleJob = null
+        pausedRecordIds.clear()
+        resetAllUploadProgress()
+        _latestQuotaInfo.value = DriveQuotaInfo()
+        _quotaFullState.value = false
+        _lastNetworkError.value = null
+        _lastPermissionError.value = null
+        _transferConditionBlock.value = null
+        _currentScanActivity.value = null
+        _isVerifyingOrCreatingDriveFolder.value = false
+        _isRunning.value = false
     }
 
     suspend fun pauseSingleRecord(recordId: Long, paused: Boolean) {
@@ -228,7 +253,7 @@ class PermanentBackupEngine(
      */
     suspend fun recoverInterruptedUploadsAfterRestart(): Int {
         val accountId = currentAccountId()
-        val interrupted = backupDao.getInProgressRecords()
+        val interrupted = backupDao.getInProgressRecordsForAccount(accountId)
         for (record in interrupted) {
             backupDao.updateUploadProgress(
                 id = record.id,
@@ -538,6 +563,7 @@ class PermanentBackupEngine(
         return cycleMutex.withLock {
             val deferred = CompletableDeferred<BackupCycleSummary>()
             activeCycleDeferred = deferred
+            activeCycleJob = kotlin.coroutines.coroutineContext[kotlinx.coroutines.Job]
             try {
                 rerunRequestedSettings = null
                 var summary = block()
@@ -560,6 +586,7 @@ class PermanentBackupEngine(
                 throw t
             } finally {
                 activeCycleDeferred = null
+                activeCycleJob = null
             }
         }
     }
@@ -576,14 +603,14 @@ class PermanentBackupEngine(
         if (settings.backgroundSyncPaused || _isPaused.value) {
             return BackupCycleSummary(
                 0, 0, 0, 0, 0,
-                preservedDeletedLocalFiles = backupDao.countPreservedAfterLocalDelete(),
+                preservedDeletedLocalFiles = backupDao.countPreservedAfterLocalDeleteForAccount(currentAccountId()),
                 errorMessage = "Backup is currently paused by user."
             )
         }
         if (!authManager.accountState.value.isConnected) {
             return BackupCycleSummary(
                 0, 0, 0, 0, 0,
-                preservedDeletedLocalFiles = backupDao.countPreservedAfterLocalDelete(),
+                preservedDeletedLocalFiles = backupDao.countPreservedAfterLocalDeleteForAccount(currentAccountId()),
                 errorMessage = "Google Account is not connected. Queued files are kept safely."
             )
         }
@@ -596,7 +623,7 @@ class PermanentBackupEngine(
                 skippedUnchangedFiles = 0,
                 uploadedAndVerifiedFiles = outcome.first,
                 failedUploads = outcome.second,
-                preservedDeletedLocalFiles = backupDao.countPreservedAfterLocalDelete(),
+                preservedDeletedLocalFiles = backupDao.countPreservedAfterLocalDeleteForAccount(currentAccountId()),
                 quotaFull = _quotaFullState.value,
                 errorMessage = _transferConditionBlock.value ?: _lastNetworkError.value
             )
@@ -634,7 +661,7 @@ class PermanentBackupEngine(
                 skippedUnchangedFiles = 0,
                 uploadedAndVerifiedFiles = 0,
                 failedUploads = 0,
-                preservedDeletedLocalFiles = backupDao.countPreservedAfterLocalDelete(),
+                preservedDeletedLocalFiles = backupDao.countPreservedAfterLocalDeleteForAccount(currentAccountId()),
                 errorMessage = "Backup is currently paused by user."
             )
         }
@@ -712,7 +739,7 @@ class PermanentBackupEngine(
             val preservedDeletedCount = if (storageSource.hasStoragePermission) {
                 reconcileLocallyDeletedFiles(discoveredIdentities)
             } else {
-                backupDao.countPreservedAfterLocalDelete()
+                backupDao.countPreservedAfterLocalDeleteForAccount(accountId)
             }
 
             // Step 4: Execute pending uploads & incremental cloud changes sync if Google Account is connected
@@ -955,10 +982,11 @@ class PermanentBackupEngine(
      * their corresponding Google Drive backups.
      */
     private suspend fun reconcileLocallyDeletedFiles(presentIdentities: Set<String>): Int {
+        val accountId = currentAccountId()
         var offset = 0
         val missingIdentities = mutableListOf<String>()
         while (true) {
-            val page = backupDao.getActiveIdentitiesPaged(PAGINATION_BATCH_SIZE, offset)
+            val page = backupDao.getActiveIdentitiesForAccountPaged(accountId, PAGINATION_BATCH_SIZE, offset)
             if (page.isEmpty()) break
             for (identity in page) {
                 if (!identity.startsWith("shared:") && identity !in presentIdentities) {
@@ -969,11 +997,11 @@ class PermanentBackupEngine(
         }
 
         for (identity in missingIdentities) {
-            backupDao.markLocalFileDeletedPreservingCloudBackup(identity)
+            backupDao.markLocalFileDeletedForAccountPreservingCloudBackup(accountId, identity)
             backupDao.markLocalFileIndexDeleted(identity)
-            backupDao.markVersionsPreservedAfterLocalDelete(identity)
+            backupDao.markVersionsPreservedForAccountAfterLocalDelete(accountId, identity)
         }
-        return backupDao.countPreservedAfterLocalDelete()
+        return backupDao.countPreservedAfterLocalDeleteForAccount(accountId)
     }
 
     private suspend fun processPendingUploadQueue(
@@ -1016,7 +1044,17 @@ class PermanentBackupEngine(
         // Ensure active root backup folder exists on Google Drive
         val activeRootName = activeRootFolderName()
         val rootFolderId = try {
-            val cachedRoot = authManager.accountState.value.rootDriveFolderId
+            val currentEmail = authManager.accountState.value.email.trim()
+            val rawCachedRoot = authManager.accountState.value.rootDriveFolderId
+            val cachedRoot = if (rawCachedRoot == GoogleAuthManager.CLOUD_BRIDGE_OWNER_ROOT_FOLDER_ID &&
+                currentEmail.isNotBlank() &&
+                !currentEmail.equals(GoogleAuthManager.CLOUD_BRIDGE_OWNER_EMAIL, ignoreCase = true)
+            ) {
+                authManager.setRootDriveFolderName(activeRootName, null)
+                null
+            } else {
+                rawCachedRoot
+            }
             if (!cachedRoot.isNullOrBlank()) {
                 cachedRoot
             } else {
