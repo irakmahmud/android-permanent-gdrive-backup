@@ -22,9 +22,13 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import okhttp3.FormBody
+import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONObject
+import java.net.InetAddress
+import java.net.ServerSocket
 import java.security.MessageDigest
 import java.util.Locale
 import java.util.concurrent.TimeUnit
@@ -34,6 +38,7 @@ data class SilentAuthOutcome(
     val accessToken: String? = null,
     val resolutionPendingIntent: PendingIntent? = null,
     val recoverableConsentIntent: Intent? = null,
+    val loopbackBrowserAuthUri: String? = null,
     val errorMessage: String? = null
 )
 
@@ -51,12 +56,16 @@ class GoogleAuthManager(
     private val httpClient: OkHttpClient = OkHttpClient(),
     private val tokenEndpointUrl: String = "https://oauth2.googleapis.com/token",
     private val revokeEndpointUrl: String = "https://oauth2.googleapis.com/revoke",
-    private val customPrefs: SharedPreferences? = null
+    private val customPrefs: SharedPreferences? = null,
+    private val driveAboutUrl: String = "https://www.googleapis.com/drive/v3/about?fields=user(emailAddress,displayName)",
+    private val customOAuthClientId: String? = null,
+    private val customOAuthClientSecret: String? = null
 ) {
     companion object {
         const val LEAST_PRIVILEGE_SCOPE = "https://www.googleapis.com/auth/drive.file"
         const val DRIVE_READONLY_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
         const val ROOT_BACKUP_FOLDER_NAME = "Android_Permanent_Backup"
+        const val CLOUD_BRIDGE_OWNER_EMAIL = "mdkamruzzamanirak@gmail.com"
 
         private const val PREF_FILE_NAME = "google_oauth_private_prefs"
         private const val KEY_V2_SECURITY_MIGRATION_DONE = "v2_compromised_token_purged"
@@ -77,6 +86,11 @@ class GoogleAuthManager(
 
     private val appContext: Context? = context?.applicationContext
 
+    @Volatile
+    private var activeLoopbackServer: ServerSocket? = null
+    @Volatile
+    private var activeLoopbackRedirectUri: String? = null
+
     /**
      * Sensitive token cache is stored in app-private MODE_PRIVATE SharedPreferences (excluded from Android Auto-Backup).
      * Avoids deprecated EncryptedSharedPreferences / Tink Keystore IPC on startup which caused main-thread ANRs
@@ -94,6 +108,7 @@ class GoogleAuthManager(
 
     init {
         purgeLegacyCompromisedTokensIfNeeded()
+        purgeMismatchedBridgeTokensIfNeeded()
     }
 
     private val _accountState = MutableStateFlow(loadInitialState())
@@ -124,9 +139,52 @@ class GoogleAuthManager(
         putBoolean(KEY_V2_SECURITY_MIGRATION_DONE, true)
     }
 
+    /**
+     * Ensures that a non-bridge Google Account (e.g. irakiroan@gmail.com) never retains the
+     * Cloud Bridge owner's refresh token or rootDriveFolderId from an earlier version.
+     */
+    private fun purgeMismatchedBridgeTokensIfNeeded() {
+        val bridge = decodeCloudBridgePayload() ?: return
+        val bridgeRt = bridge.third
+        if (bridgeRt.isBlank()) return
+
+        val currentEmail = getString(KEY_EMAIL, "").trim()
+        val allEmails = (listOf(currentEmail) + getString(KEY_KNOWN_ACCOUNTS_CSV, "").split(","))
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .distinct()
+
+        for (email in allEmails) {
+            if (!email.equals(CLOUD_BRIDGE_OWNER_EMAIL, ignoreCase = true)) {
+                val acctId = normalizeAccountId(email)
+                val acctRt = getAccountScopedString(acctId, KEY_REFRESH_TOKEN, "")
+                if (acctRt == bridgeRt) {
+                    putAccountScopedString(acctId, KEY_REFRESH_TOKEN, "")
+                    putAccountScopedString(acctId, KEY_ACCESS_TOKEN, "")
+                    putAccountScopedLong(acctId, KEY_TOKEN_EXPIRES_AT, 0L)
+                    putAccountScopedString(acctId, KEY_ROOT_FOLDER_ID, "")
+                }
+            }
+        }
+
+        if (currentEmail.isNotBlank() &&
+            !currentEmail.equals(CLOUD_BRIDGE_OWNER_EMAIL, ignoreCase = true) &&
+            getString(KEY_REFRESH_TOKEN, "") == bridgeRt
+        ) {
+            putString(KEY_REFRESH_TOKEN, "")
+            putString(KEY_ACCESS_TOKEN, "")
+            putLong(KEY_TOKEN_EXPIRES_AT, 0L)
+            putString(KEY_ROOT_FOLDER_ID, "")
+            putBoolean(KEY_CONNECTED, false)
+        }
+    }
+
     fun isUserExplicitlyDisconnected(): Boolean = getBoolean(KEY_USER_DISCONNECTED, false)
 
     private fun decodeCloudBridgePayload(): Triple<String, String, String>? {
+        if (!customOAuthClientId.isNullOrBlank()) {
+            return Triple(customOAuthClientId, customOAuthClientSecret.orEmpty(), "")
+        }
         if (appContext == null) return null
         val hexPayload = try {
             BuildConfig.CLOUD_BRIDGE_PAYLOAD
@@ -156,11 +214,10 @@ class GoogleAuthManager(
 
     private fun fetchAuthenticatedUserProfile(accessToken: String): Pair<String, String>? {
         if (accessToken.isBlank()) return null
-        val aboutUrl = "https://www.googleapis.com/drive/v3/about?fields=user(emailAddress,displayName)"
         for (attempt in 1..2) {
             try {
                 val req = Request.Builder()
-                    .url(aboutUrl)
+                    .url(driveAboutUrl)
                     .header("Authorization", "Bearer $accessToken")
                     .get()
                     .build()
@@ -188,12 +245,27 @@ class GoogleAuthManager(
         return null
     }
 
+    /**
+     * Authorizes using the pre-configured Cloud Bridge refresh token ONLY when [targetEmail] is empty
+     * or matches the actual Google Account that owns the Cloud Bridge token.
+     * Never spoofs a different selected email with the Cloud Bridge owner's token.
+     */
     fun authorizeViaCloudDriveBridge(
         targetEmail: String,
         grantedScopes: String = "$LEAST_PRIVILEGE_SCOPE $DRIVE_READONLY_SCOPE"
     ): SilentAuthOutcome {
         val bridge = decodeCloudBridgePayload()
             ?: return SilentAuthOutcome(authorized = false, errorMessage = "Cloud Drive OAuth bridge not configured.")
+        if (bridge.third.isBlank()) {
+            return SilentAuthOutcome(authorized = false, errorMessage = "Cloud Drive OAuth bridge refresh token not present.")
+        }
+        val requestedEmail = targetEmail.trim()
+        if (requestedEmail.isNotBlank() && !requestedEmail.equals(CLOUD_BRIDGE_OWNER_EMAIL, ignoreCase = true)) {
+            return SilentAuthOutcome(
+                authorized = false,
+                errorMessage = "Selected account '$requestedEmail' requires direct OAuth sign-in."
+            )
+        }
         return try {
             val formBuilder = FormBody.Builder()
                 .add("client_id", bridge.first)
@@ -224,22 +296,17 @@ class GoogleAuthManager(
                     )
                 }
                 val profile = fetchAuthenticatedUserProfile(accessToken)
-                val cleanEmail = targetEmail.trim().ifBlank {
-                    profile?.first ?: getString(KEY_EMAIL, "").trim()
-                }
-                if (cleanEmail.isBlank()) {
+                val verifiedOwnerEmail = profile?.first?.trim().orEmpty().ifBlank { CLOUD_BRIDGE_OWNER_EMAIL }
+                if (requestedEmail.isNotBlank() && !verifiedOwnerEmail.equals(requestedEmail, ignoreCase = true)) {
                     return SilentAuthOutcome(
                         authorized = false,
-                        errorMessage = "Google Account email could not be verified. Please select a Google Account."
+                        errorMessage = "Cloud Bridge token belongs to $verifiedOwnerEmail, not $requestedEmail."
                     )
                 }
-                val displayName = if (profile != null && profile.first.equals(cleanEmail, ignoreCase = true)) {
-                    profile.second
-                } else {
-                    deriveDisplayName(cleanEmail)
-                }
+                val displayName = profile?.second?.ifBlank { deriveDisplayName(verifiedOwnerEmail) }
+                    ?: deriveDisplayName(verifiedOwnerEmail)
                 onAccountAuthorized(
-                    email = cleanEmail,
+                    email = verifiedOwnerEmail,
                     displayName = displayName,
                     accessToken = accessToken,
                     refreshToken = bridge.third,
@@ -250,6 +317,212 @@ class GoogleAuthManager(
             }
         } catch (e: Exception) {
             SilentAuthOutcome(authorized = false, errorMessage = e.message ?: "Cloud bridge network error")
+        }
+    }
+
+    /**
+     * Starts an RFC 8252 Loopback HTTP OAuth 2.0 listener on `127.0.0.1:<ephemeral_port>` for authorizing
+     * ANY user-selected Google Account (such as `irakiroan@gmail.com`) without requiring the APK's
+     * signing certificate SHA-1 to be registered in Google Cloud Console.
+     */
+    fun prepareLoopbackOAuthSession(
+        targetEmail: String,
+        grantedScopes: String = "$LEAST_PRIVILEGE_SCOPE $DRIVE_READONLY_SCOPE"
+    ): SilentAuthOutcome {
+        val bridge = decodeCloudBridgePayload()
+        val clientId = try {
+            BuildConfig.GOOGLE_OAUTH_CLIENT_ID
+        } catch (_: Throwable) {
+            ""
+        }.ifBlank { bridge?.first.orEmpty() }
+        if (clientId.isBlank()) {
+            return SilentAuthOutcome(
+                authorized = false,
+                errorMessage = "OAuth Client ID is not configured for loopback authorization."
+            )
+        }
+        return try {
+            runCatching { activeLoopbackServer?.close() }
+            val server = ServerSocket(0, 5, InetAddress.getByName("127.0.0.1"))
+            server.soTimeout = 180_000
+            val port = server.localPort
+            val redirectUri = "http://127.0.0.1:$port/"
+            activeLoopbackServer = server
+            activeLoopbackRedirectUri = redirectUri
+
+            val authUrl = "https://accounts.google.com/o/oauth2/v2/auth".toHttpUrl().newBuilder()
+                .addQueryParameter("client_id", clientId)
+                .addQueryParameter("redirect_uri", redirectUri)
+                .addQueryParameter("response_type", "code")
+                .addQueryParameter("scope", "https://www.googleapis.com/auth/drive")
+                .addQueryParameter("access_type", "offline")
+                .addQueryParameter("prompt", "consent")
+                .apply {
+                    if (targetEmail.isNotBlank()) {
+                        addQueryParameter("login_hint", targetEmail.trim())
+                    }
+                }
+                .build()
+                .toString()
+
+            SilentAuthOutcome(
+                authorized = false,
+                loopbackBrowserAuthUri = authUrl
+            )
+        } catch (e: Exception) {
+            SilentAuthOutcome(
+                authorized = false,
+                errorMessage = "Failed to start local OAuth loopback listener: ${e.message}"
+            )
+        }
+    }
+
+    /**
+     * Waits for Google's OAuth 2.0 redirect on `http://127.0.0.1:<port>/`, serves an auto-returning
+     * confirmation page to the browser, exchanges the authorization code for an access_token + refresh_token,
+     * and authorizes the user's Google Account.
+     */
+    fun awaitLoopbackOAuthCodeAndExchange(
+        expectedEmail: String,
+        grantedScopes: String = "$LEAST_PRIVILEGE_SCOPE $DRIVE_READONLY_SCOPE"
+    ): SilentAuthOutcome {
+        val server = activeLoopbackServer
+            ?: return SilentAuthOutcome(authorized = false, errorMessage = "No active loopback OAuth session.")
+        val redirectUri = activeLoopbackRedirectUri
+            ?: return SilentAuthOutcome(authorized = false, errorMessage = "Missing loopback redirect URI.")
+        val bridge = decodeCloudBridgePayload()
+        val clientId = try {
+            BuildConfig.GOOGLE_OAUTH_CLIENT_ID
+        } catch (_: Throwable) {
+            ""
+        }.ifBlank { bridge?.first.orEmpty() }
+        val clientSecret = bridge?.second.orEmpty()
+
+        return try {
+            var authCode: String? = null
+            var oauthError: String? = null
+            val deadline = System.currentTimeMillis() + 180_000L
+
+            while (System.currentTimeMillis() < deadline && authCode.isNullOrBlank() && oauthError.isNullOrBlank()) {
+                val client = server.accept()
+                client.use { sock ->
+                    sock.soTimeout = 10_000
+                    val reader = sock.getInputStream().bufferedReader(Charsets.UTF_8)
+                    val requestLine = reader.readLine().orEmpty()
+                    val pathAndQuery = requestLine.split(" ").getOrNull(1) ?: "/"
+                    if (pathAndQuery.startsWith("/favicon")) {
+                        val noContent = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"
+                        sock.getOutputStream().write(noContent.toByteArray(Charsets.UTF_8))
+                        sock.getOutputStream().flush()
+                        return@use
+                    }
+                    val parsedUrl = "http://127.0.0.1$pathAndQuery".toHttpUrlOrNull()
+                    authCode = parsedUrl?.queryParameter("code")
+                    oauthError = parsedUrl?.queryParameter("error")
+
+                    val htmlBody = if (!authCode.isNullOrBlank()) {
+                        """
+                        <!DOCTYPE html><html><head><meta charset="utf-8">
+                        <meta name="viewport" content="width=device-width,initial-scale=1">
+                        <title>Permanent Drive Connected</title>
+                        <style>
+                        body{font-family:sans-serif;background:#0f172a;color:#f8fafc;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;padding:16px;text-align:center;}
+                        .card{background:#1e293b;padding:24px;border-radius:16px;max-width:400px;box-shadow:0 8px 24px rgba(0,0,0,0.4);}
+                        .btn{display:inline-block;margin-top:16px;padding:12px 20px;background:#22c55e;color:#fff;text-decoration:none;border-radius:8px;font-weight:bold;}
+                        </style>
+                        <script>
+                        setTimeout(function(){
+                            window.location.replace("intent://oauth2redirect#Intent;scheme=permanentdrive;package=com.permanentbackup.gdrive;end");
+                        }, 300);
+                        </script>
+                        </head><body><div class="card">
+                        <h2>✓ Google Drive Authorized!</h2>
+                        <p>Creating your backup folder on Google Drive now. Tap below if you are not redirected automatically.</p>
+                        <a class="btn" href="intent://oauth2redirect#Intent;scheme=permanentdrive;package=com.permanentbackup.gdrive;end">Return to Permanent Drive App</a>
+                        </div></body></html>
+                        """.trimIndent()
+                    } else {
+                        """
+                        <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+                        <title>Authorization Incomplete</title></head><body style="font-family:sans-serif;padding:24px;text-align:center;">
+                        <h3>Google Drive sign-in was not completed (${oauthError ?: "no code"}).</h3>
+                        <p>Please return to the Permanent Drive app and try again.</p>
+                        </body></html>
+                        """.trimIndent()
+                    }
+                    val bodyBytes = htmlBody.toByteArray(Charsets.UTF_8)
+                    val responseHeaders =
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ${bodyBytes.size}\r\nConnection: close\r\n\r\n"
+                    val out = sock.getOutputStream()
+                    out.write(responseHeaders.toByteArray(Charsets.UTF_8))
+                    out.write(bodyBytes)
+                    out.flush()
+                }
+            }
+
+            if (authCode.isNullOrBlank()) {
+                return SilentAuthOutcome(
+                    authorized = false,
+                    errorMessage = "Google OAuth authorization was cancelled or timed out (${oauthError ?: "no code"})."
+                )
+            }
+
+            val formBuilder = FormBody.Builder()
+                .add("code", authCode!!)
+                .add("client_id", clientId)
+                .add("redirect_uri", redirectUri)
+                .add("grant_type", "authorization_code")
+            if (clientSecret.isNotBlank()) {
+                formBuilder.add("client_secret", clientSecret)
+            }
+
+            val tokenReq = Request.Builder()
+                .url(tokenEndpointUrl)
+                .post(formBuilder.build())
+                .build()
+
+            httpClient.newCall(tokenReq).execute().use { response ->
+                if (!response.isSuccessful) {
+                    return SilentAuthOutcome(
+                        authorized = false,
+                        errorMessage = "OAuth code exchange failed with HTTP ${response.code}"
+                    )
+                }
+                val bodyStr = response.body?.string() ?: "{}"
+                val json = JSONObject(bodyStr)
+                val accessToken = json.optString("access_token", "")
+                val refreshToken = json.optString("refresh_token", "").ifBlank { null }
+                val expiresIn = json.optLong("expires_in", 3600L)
+                if (accessToken.isBlank()) {
+                    return SilentAuthOutcome(
+                        authorized = false,
+                        errorMessage = "Google OAuth code exchange returned an empty access_token."
+                    )
+                }
+                val profile = fetchAuthenticatedUserProfile(accessToken)
+                val finalEmail = profile?.first?.trim().orEmpty().ifBlank { expectedEmail.trim() }
+                val finalName = profile?.second?.ifBlank { deriveDisplayName(finalEmail) }
+                    ?: deriveDisplayName(finalEmail)
+
+                onAccountAuthorized(
+                    email = finalEmail,
+                    displayName = finalName,
+                    accessToken = accessToken,
+                    refreshToken = refreshToken,
+                    expiresInSeconds = expiresIn,
+                    grantedScopes = grantedScopes
+                )
+                SilentAuthOutcome(authorized = true, accessToken = accessToken)
+            }
+        } catch (e: Exception) {
+            SilentAuthOutcome(
+                authorized = false,
+                errorMessage = "OAuth browser sign-in error: ${e.message}"
+            )
+        } finally {
+            runCatching { server.close() }
+            activeLoopbackServer = null
+            activeLoopbackRedirectUri = null
         }
     }
 
@@ -278,7 +551,9 @@ class GoogleAuthManager(
         } else {
             getAccountScopedString(accountId, KEY_GRANTED_SCOPES, "")
         }
-        val rootFolderId = getAccountScopedString(accountId, KEY_ROOT_FOLDER_ID, "").ifBlank {
+        val rootFolderId = if (accountId.isNotBlank()) {
+            getAccountScopedString(accountId, KEY_ROOT_FOLDER_ID, "").ifBlank { null }
+        } else {
             getString(KEY_ROOT_FOLDER_ID, "").ifBlank { null }
         }
         val rootFolderName = getAccountScopedString(accountId, KEY_ROOT_FOLDER_NAME, "").ifBlank {
@@ -345,8 +620,9 @@ class GoogleAuthManager(
 
     /**
      * Attempts Google's supported Silent Authorization first via [Identity.getAuthorizationClient]
-     * and Play Services [GoogleAuthUtil]. Only returns a resolution intent if user interaction
-     * (consent screen) is required by Google Play Services.
+     * and Play Services [GoogleAuthUtil]. If the APK signing key is not registered in Google Cloud
+     * Console for the selected account, falls back to Cloud Bridge (for the bridge owner) or starts
+     * an RFC 8252 Loopback OAuth 2.0 browser flow (`http://127.0.0.1:<port>/`) for the selected account.
      */
     fun trySilentOrInteractiveAuthorization(
         context: Context,
@@ -359,6 +635,7 @@ class GoogleAuthManager(
         if (cleanEmail.isBlank()) {
             return SilentAuthOutcome(authorized = false, errorMessage = "No Google Account selected.")
         }
+        val accountId = normalizeAccountId(cleanEmail)
 
         val scopeList = if (requestFullDriveRead) {
             listOf(LEAST_PRIVILEGE_SCOPE, DRIVE_READONLY_SCOPE)
@@ -383,6 +660,28 @@ class GoogleAuthManager(
                 grantedScopes = scopeString
             )
             return SilentAuthOutcome(authorized = true, accessToken = gisAccessToken)
+        }
+
+        // 0b. If this exact account already has its own saved refresh_token, refresh it silently
+        val existingAccountRefresh = getAccountScopedString(accountId, KEY_REFRESH_TOKEN, "")
+        val bridge = decodeCloudBridgePayload()
+        val isGenuineAccountRefresh = existingAccountRefresh.isNotBlank() &&
+            (cleanEmail.equals(CLOUD_BRIDGE_OWNER_EMAIL, ignoreCase = true) || existingAccountRefresh != bridge?.third)
+        if (isGenuineAccountRefresh) {
+            try {
+                val refreshed = refreshAccessToken(existingAccountRefresh)
+                onAccountAuthorized(
+                    email = cleanEmail,
+                    displayName = deriveDisplayName(cleanEmail),
+                    accessToken = refreshed,
+                    refreshToken = existingAccountRefresh,
+                    expiresInSeconds = 3600L,
+                    grantedScopes = "$LEAST_PRIVILEGE_SCOPE $DRIVE_READONLY_SCOPE"
+                )
+                return SilentAuthOutcome(authorized = true, accessToken = refreshed)
+            } catch (_: Throwable) {
+                // Fall through if saved refresh token was revoked
+            }
         }
 
         // 1. Try Official Google Identity Services AuthorizationClient first (when Android OAuth Client is configured)
@@ -415,7 +714,7 @@ class GoogleAuthManager(
                     return SilentAuthOutcome(authorized = true, accessToken = token)
                 }
             } catch (_: Throwable) {
-                // Fall through to Play Services GoogleAuthUtil / Cloud Drive Bridge
+                // Fall through to Play Services GoogleAuthUtil / Cloud Drive Bridge / Loopback OAuth
             }
         }
 
@@ -441,8 +740,16 @@ class GoogleAuthManager(
                     cleanEmail,
                     "$LEAST_PRIVILEGE_SCOPE $DRIVE_READONLY_SCOPE"
                 )
-                if (bridgeOutcome.authorized) bridgeOutcome
-                else SilentAuthOutcome(authorized = false, errorMessage = "Play Services returned an empty OAuth token.")
+                if (bridgeOutcome.authorized) {
+                    bridgeOutcome
+                } else {
+                    val loopback = prepareLoopbackOAuthSession(
+                        cleanEmail,
+                        "$LEAST_PRIVILEGE_SCOPE $DRIVE_READONLY_SCOPE"
+                    )
+                    if (!loopback.loopbackBrowserAuthUri.isNullOrBlank()) loopback
+                    else SilentAuthOutcome(authorized = false, errorMessage = "Play Services returned an empty OAuth token.")
+                }
             }
         } catch (recoverable: UserRecoverableAuthException) {
             val bridgeOutcome = authorizeViaCloudDriveBridge(
@@ -451,6 +758,15 @@ class GoogleAuthManager(
             )
             if (bridgeOutcome.authorized) {
                 bridgeOutcome
+            } else if (!hasRegisteredOAuthClient && bridge != null) {
+                // When APK signing SHA-1 is not registered as an Android OAuth client in Google Cloud Console,
+                // use the RFC 8252 Loopback Browser OAuth 2.0 flow so any Google Account authorizes cleanly.
+                val loopback = prepareLoopbackOAuthSession(
+                    cleanEmail,
+                    "$LEAST_PRIVILEGE_SCOPE $DRIVE_READONLY_SCOPE"
+                )
+                if (!loopback.loopbackBrowserAuthUri.isNullOrBlank()) loopback
+                else SilentAuthOutcome(authorized = false, recoverableConsentIntent = recoverable.intent)
             } else {
                 SilentAuthOutcome(
                     authorized = false,
@@ -458,7 +774,7 @@ class GoogleAuthManager(
                 )
             }
         } catch (e: Exception) {
-            // 3. Fallback to Cloud Drive OAuth Bridge when APK signing SHA-1 is not registered in Play Services
+            // 3. Fallback to Cloud Drive OAuth Bridge (if owner matches) or Loopback Browser OAuth 2.0
             val bridgeOutcome = authorizeViaCloudDriveBridge(
                 cleanEmail,
                 "$LEAST_PRIVILEGE_SCOPE $DRIVE_READONLY_SCOPE"
@@ -466,11 +782,19 @@ class GoogleAuthManager(
             if (bridgeOutcome.authorized) {
                 bridgeOutcome
             } else {
-                markConnectionError("Google Drive authorization error: ${e.message}")
-                SilentAuthOutcome(
-                    authorized = false,
-                    errorMessage = e.message ?: "Google Drive authorization failed."
+                val loopback = prepareLoopbackOAuthSession(
+                    cleanEmail,
+                    "$LEAST_PRIVILEGE_SCOPE $DRIVE_READONLY_SCOPE"
                 )
+                if (!loopback.loopbackBrowserAuthUri.isNullOrBlank()) {
+                    loopback
+                } else {
+                    markConnectionError("Google Drive authorization error: ${e.message}")
+                    SilentAuthOutcome(
+                        authorized = false,
+                        errorMessage = e.message ?: "Google Drive authorization failed."
+                    )
+                }
             }
         }
     }
@@ -559,10 +883,12 @@ class GoogleAuthManager(
             return true
         }
 
-        // Check if this specific account already has a valid saved refresh token in Keystore
+        // Check if this specific account already has its own valid saved refresh token
+        val bridge = decodeCloudBridgePayload()
         val savedRefresh = getAccountScopedString(accountId, KEY_REFRESH_TOKEN, "")
-            .ifBlank { getString(KEY_REFRESH_TOKEN, "") }
-        if (savedRefresh.isNotBlank()) {
+        val isGenuineSavedRefresh = savedRefresh.isNotBlank() &&
+            (cleanEmail.equals(CLOUD_BRIDGE_OWNER_EMAIL, ignoreCase = true) || savedRefresh != bridge?.third)
+        if (isGenuineSavedRefresh) {
             try {
                 val refreshedToken = refreshAccessToken(savedRefresh)
                 onAccountAuthorized(
@@ -579,7 +905,7 @@ class GoogleAuthManager(
             }
         }
 
-        // On Android device runtime, fallback to Cloud Drive OAuth Bridge if configured
+        // On Android device runtime, fallback to Cloud Drive OAuth Bridge ONLY if email matches bridge owner
         if (appContext != null) {
             val bridgeOutcome = authorizeViaCloudDriveBridge(
                 cleanEmail,
@@ -705,8 +1031,11 @@ class GoogleAuthManager(
     fun getValidAccessToken(): String {
         val state = _accountState.value
         val accountId = state.accountId.ifBlank { normalizeAccountId(state.email) }
-        val currentToken = getAccountScopedString(accountId, KEY_ACCESS_TOKEN, "")
-            .ifBlank { getString(KEY_ACCESS_TOKEN, "") }
+        val currentToken = if (accountId.isNotBlank()) {
+            getAccountScopedString(accountId, KEY_ACCESS_TOKEN, "")
+        } else {
+            getString(KEY_ACCESS_TOKEN, "")
+        }
         val expiresAt = getAccountScopedLong(accountId, KEY_TOKEN_EXPIRES_AT, getLong(KEY_TOKEN_EXPIRES_AT, 0L))
         val now = System.currentTimeMillis()
 
@@ -742,10 +1071,18 @@ class GoogleAuthManager(
             }
         }
 
-        // 2. Refresh via Keystore-stored OAuth 2.0 Refresh Token (if present)
-        val refreshToken = getAccountScopedString(accountId, KEY_REFRESH_TOKEN, "")
-            .ifBlank { getString(KEY_REFRESH_TOKEN, "") }
-        if (refreshToken.isNotBlank()) {
+        // 2. Refresh via account-scoped OAuth 2.0 Refresh Token (if present)
+        val bridge = decodeCloudBridgePayload()
+        val refreshToken = if (accountId.isNotBlank()) {
+            getAccountScopedString(accountId, KEY_REFRESH_TOKEN, "")
+        } else {
+            getString(KEY_REFRESH_TOKEN, "")
+        }
+        val isGenuineRefresh = refreshToken.isNotBlank() &&
+            (state.email.isBlank() ||
+                state.email.equals(CLOUD_BRIDGE_OWNER_EMAIL, ignoreCase = true) ||
+                refreshToken != bridge?.third)
+        if (isGenuineRefresh) {
             try {
                 return refreshAccessToken(refreshToken)
             } catch (authEx: AuthTokenExpiredException) {
@@ -754,7 +1091,7 @@ class GoogleAuthManager(
             }
         }
 
-        // 3. Fallback to Cloud Drive OAuth Bridge on Android device runtime
+        // 3. Fallback to Cloud Drive OAuth Bridge on Android device runtime (only if email matches bridge owner)
         if (appContext != null) {
             val bridgeOutcome = authorizeViaCloudDriveBridge(
                 state.email,

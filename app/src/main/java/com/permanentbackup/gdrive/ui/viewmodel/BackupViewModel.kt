@@ -331,7 +331,7 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
         dashboardRefreshJob = viewModelScope.launch(vmExceptionHandler) {
             withContext(Dispatchers.IO) {
                 if (fetchRemoteQuota && repository.authManager.accountState.value.isConnected) {
-                    runCatching { repository.backupEngine.refreshRemoteQuotaAndRootFolder() }
+                    runCatching { repository.backupEngine.refreshRemoteQuotaAndRootFolder(createFolderIfMissing = true) }
                     runCatching { repository.backupEngine.syncCloudChangesIncremental() }
                     runCatching { repository.persistCurrentAccountToDatabase() }
                 }
@@ -798,8 +798,9 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     /**
-     * Section 3: Official Google Identity Services AuthorizationClient + Play Services Silent Flow.
-     * Separates Account Selection from Drive Scope Authorization.
+     * Section 3: Official Google Identity Services AuthorizationClient + Play Services Silent Flow
+     * + Loopback HTTP OAuth 2.0 (RFC 8252) for arbitrary user Google accounts.
+     * Separates Account Selection from Drive Scope Authorization and enforces strict per-account isolation.
      */
     fun onNativeGoogleAccountSelected(
         context: Context,
@@ -808,7 +809,8 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
         skipGisResolution: Boolean = false,
         gisAccessToken: String? = null,
         onResolutionPendingIntent: (PendingIntent) -> Unit = {},
-        onRecoverableConsentIntent: (Intent) -> Unit = {}
+        onRecoverableConsentIntent: (Intent) -> Unit = {},
+        onLoopbackBrowserAuthUri: (String) -> Unit = {}
     ) {
         viewModelScope.launch(vmExceptionHandler) {
             _isAuthorizingAccount.value = true
@@ -822,32 +824,80 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
                     gisAccessToken = gisAccessToken
                 )
                 if (res.authorized) {
-                    repository.backupEngine.refreshRemoteQuotaAndRootFolder()
+                    repository.backupEngine.refreshRemoteQuotaAndRootFolder(createFolderIfMissing = true)
                     repository.persistCurrentAccountToDatabase()
                 }
                 res
             }
-            _isAuthorizingAccount.value = false
 
             if (!skipGisResolution && outcome.resolutionPendingIntent != null) {
+                _isAuthorizingAccount.value = false
                 onResolutionPendingIntent(outcome.resolutionPendingIntent)
                 return@launch
             }
             if (outcome.recoverableConsentIntent != null) {
+                _isAuthorizingAccount.value = false
                 onRecoverableConsentIntent(outcome.recoverableConsentIntent)
                 return@launch
             }
+            if (!outcome.loopbackBrowserAuthUri.isNullOrBlank()) {
+                val folderName = repository.authManager.accountState.value.rootDriveFolderName
+                    .ifBlank { "Android_Permanent_Backup" }
+                _signInStatusMessage.value =
+                    "Opening Google Sign-In in browser for $selectedEmail... Tap 'Allow' in the browser to connect and create '$folderName' in $selectedEmail's Google Drive."
+                _actionFeedbackMessage.value =
+                    "Complete Google Sign-In for $selectedEmail in browser to create folder '$folderName'..."
+                runCatching {
+                    PermanentBackupForegroundService.startManualBackupService(getApplication())
+                }
+                onLoopbackBrowserAuthUri(outcome.loopbackBrowserAuthUri)
+
+                val loopOutcome = withContext(Dispatchers.IO) {
+                    val loopRes = repository.authManager.awaitLoopbackOAuthCodeAndExchange(selectedEmail)
+                    if (loopRes.authorized) {
+                        repository.backupEngine.refreshRemoteQuotaAndRootFolder(createFolderIfMissing = true)
+                        repository.persistCurrentAccountToDatabase()
+                    }
+                    loopRes
+                }
+                _isAuthorizingAccount.value = false
+                if (loopOutcome.authorized) {
+                    val state = repository.authManager.accountState.value
+                    val resolvedFolderName = state.rootDriveFolderName.ifBlank { "Android_Permanent_Backup" }
+                    val folderStatus = if (!state.rootDriveFolderId.isNullOrBlank()) {
+                        "✓ Folder '$resolvedFolderName' is created on Google Drive (My Drive/$resolvedFolderName, ID: ${state.rootDriveFolderId})."
+                    } else {
+                        "Tap 'Create Folder Now' to create '$resolvedFolderName' on Google Drive."
+                    }
+                    _signInStatusMessage.value =
+                        "✓ Google Account (${state.email}) Connected! $folderStatus"
+                    _actionFeedbackMessage.value =
+                        "✓ Connected to ${state.email}! $folderStatus"
+                    ensureAutoBackupRunning()
+                    refreshDashboardAndCoverage(fetchRemoteQuota = false, forceCoverage = true)
+                    refreshCloudDriveExplorer()
+                } else {
+                    _signInStatusMessage.value = loopOutcome.errorMessage
+                        ?: "Browser Google Sign-In was not completed for $selectedEmail."
+                    refreshDashboardAndCoverage(fetchRemoteQuota = false)
+                }
+                return@launch
+            }
+
+            _isAuthorizingAccount.value = false
 
             if (outcome.authorized) {
                 val state = repository.authManager.accountState.value
                 val folderName = state.rootDriveFolderName.ifBlank { "Android_Permanent_Backup" }
                 val folderStatus = if (!state.rootDriveFolderId.isNullOrBlank()) {
-                    "✓ Folder '$folderName' is created on Google Drive (My Drive/$folderName)."
+                    "✓ Folder '$folderName' is created on Google Drive (My Drive/$folderName, ID: ${state.rootDriveFolderId})."
                 } else {
-                    "Folder '$folderName' is not created on Google Drive yet (it will be created when backup runs, or tap 'Create Folder Now' / 'Rename' to create it now)."
+                    "Folder '$folderName' is not created on Google Drive yet (tap 'Create Folder Now' / 'Rename' to create it immediately)."
                 }
                 _signInStatusMessage.value =
                     "✓ Google Account (${state.email}) Connected! $folderStatus"
+                _actionFeedbackMessage.value =
+                    "✓ Connected to ${state.email}! $folderStatus"
                 ensureAutoBackupRunning()
                 refreshDashboardAndCoverage(fetchRemoteQuota = false)
                 refreshCloudDriveExplorer()
@@ -864,7 +914,8 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
         selectedEmail: String,
         requestFullDriveRead: Boolean = false,
         gisAccessToken: String? = null,
-        onRecoverableConsentIntent: (Intent) -> Unit = {}
+        onRecoverableConsentIntent: (Intent) -> Unit = {},
+        onLoopbackBrowserAuthUri: (String) -> Unit = {}
     ) {
         onNativeGoogleAccountSelected(
             context = context,
@@ -872,12 +923,21 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
             requestFullDriveRead = requestFullDriveRead,
             skipGisResolution = true,
             gisAccessToken = gisAccessToken,
-            onRecoverableConsentIntent = onRecoverableConsentIntent
+            onRecoverableConsentIntent = onRecoverableConsentIntent,
+            onLoopbackBrowserAuthUri = onLoopbackBrowserAuthUri
         )
     }
 
-    fun switchActiveSavedAccount(context: Context, email: String) {
-        onNativeGoogleAccountSelected(context = context, selectedEmail = email)
+    fun switchActiveSavedAccount(
+        context: Context,
+        email: String,
+        onLoopbackBrowserAuthUri: (String) -> Unit = {}
+    ) {
+        onNativeGoogleAccountSelected(
+            context = context,
+            selectedEmail = email,
+            onLoopbackBrowserAuthUri = onLoopbackBrowserAuthUri
+        )
     }
 
     fun verifyAndRefreshCloudConnection() {

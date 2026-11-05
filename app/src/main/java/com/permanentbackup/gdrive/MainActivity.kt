@@ -191,6 +191,15 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
+                val openLoopbackBrowserOAuth: (String) -> Unit = { authUrl ->
+                    runCatching {
+                        val browserIntent = Intent(Intent.ACTION_VIEW, Uri.parse(authUrl)).apply {
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        startActivity(browserIntent)
+                    }
+                }
+
                 // Fallback Play Services Consent Intent Launcher
                 val recoverableConsentLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.StartActivityForResult()
@@ -199,7 +208,8 @@ class MainActivity : ComponentActivity() {
                         viewModel.completeNativeConsentResult(
                             context = this@MainActivity,
                             selectedEmail = pendingSelectedEmail,
-                            requestFullDriveRead = pendingFullReadScope
+                            requestFullDriveRead = pendingFullReadScope,
+                            onLoopbackBrowserAuthUri = openLoopbackBrowserOAuth
                         )
                     }
                 }
@@ -225,12 +235,13 @@ class MainActivity : ComponentActivity() {
                             gisAccessToken = gisToken,
                             onRecoverableConsentIntent = { consentIntent ->
                                 runCatching { recoverableConsentLauncher.launch(consentIntent) }
-                            }
+                            },
+                            onLoopbackBrowserAuthUri = openLoopbackBrowserOAuth
                         )
                     }
                 }
 
-                // Native Android System Account Picker -> Followed by Official Drive AuthorizationClient
+                // Native Android System Account Picker -> Followed by Official Drive AuthorizationClient / Loopback OAuth
                 val nativeAccountPickerLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.StartActivityForResult()
                 ) { result ->
@@ -253,7 +264,8 @@ class MainActivity : ComponentActivity() {
                             },
                             onRecoverableConsentIntent = { consentIntent ->
                                 runCatching { recoverableConsentLauncher.launch(consentIntent) }
-                            }
+                            },
+                            onLoopbackBrowserAuthUri = openLoopbackBrowserOAuth
                         )
                     }
                 }
@@ -295,7 +307,8 @@ class MainActivity : ComponentActivity() {
                             },
                             onRecoverableConsentIntent = { consentIntent ->
                                 runCatching { recoverableConsentLauncher.launch(consentIntent) }
-                            }
+                            },
+                            onLoopbackBrowserAuthUri = openLoopbackBrowserOAuth
                         )
                     } else {
                         launchNativeGoogleAccountPicker(true)
@@ -494,7 +507,11 @@ class MainActivity : ComponentActivity() {
                                 onGrantFullDriveReadScope = authorizeAdditionalDriveReadScope,
                                 onSwitchSavedAccount = { email ->
                                     pendingSelectedEmail = email
-                                    viewModel.switchActiveSavedAccount(this@MainActivity, email)
+                                    viewModel.switchActiveSavedAccount(
+                                        context = this@MainActivity,
+                                        email = email,
+                                        onLoopbackBrowserAuthUri = openLoopbackBrowserOAuth
+                                    )
                                 },
                                 onVerifyCloudConnection = { viewModel.verifyAndRefreshCloudConnection() },
                                 onCreateOrRenameBackupFolder = { folderName ->
@@ -517,6 +534,15 @@ class MainActivity : ComponentActivity() {
 
     @Suppress("DEPRECATION")
     private fun handleIncomingShareIntent(intent: Intent?) {
+        val dataUri = intent?.data
+        if (dataUri != null && dataUri.scheme == "permanentdrive") {
+            intent.data = null
+            runCatching {
+                viewModel.refreshDashboardAndCoverage(fetchRemoteQuota = true, forceCoverage = false)
+                viewModel.refreshCloudDriveExplorer()
+            }
+            return
+        }
         val action = intent?.action ?: return
         val collectedUris = mutableListOf<Uri>()
         if (action == Intent.ACTION_SEND) {

@@ -3095,6 +3095,103 @@ class PermanentBackupEngineTest {
             postCreateDocsItem.restrictionExplanation.contains("My Drive/My_Custom_Phone_Backup_2026/Documents")
         )
     }
+
+    // 41. Per-account OAuth isolation (zero bridge spoofing) + RFC 8252 Loopback OAuth flow + immediate Drive folder creation
+    @Test
+    fun test41_loopbackOAuthAndAccountIsolation_preventsAccountSpoofingAndCreatesFolderImmediately() = runTest {
+        val createdFoldersOnDrive = mutableListOf<String>()
+        mockWebServer.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                val path = request.path ?: ""
+                val method = request.method ?: "GET"
+
+                if (method == "POST" && path.startsWith("/oauth2/token")) {
+                    val bodyStr = request.body.readUtf8()
+                    if (bodyStr.contains("grant_type=authorization_code") && bodyStr.contains("code=auth_code_irakiroan_123")) {
+                        return MockResponse()
+                            .setResponseCode(200)
+                            .setBody("""{"access_token":"irakiroan_real_access_token","refresh_token":"irakiroan_real_refresh_token","expires_in":3600}""")
+                    }
+                    return MockResponse().setResponseCode(400).setBody("""{"error":"invalid_grant"}""")
+                }
+                if (method == "GET" && path.startsWith("/drive/v3/about")) {
+                    return MockResponse()
+                        .setResponseCode(200)
+                        .setBody("""{"user":{"emailAddress":"irakiroan@gmail.com","displayName":"Irak Iroan"},"storageQuota":{"limit":15000000000,"usage":120000000,"usageInDrive":120000000,"usageInDriveTrash":0}}""")
+                }
+                if (method == "GET" && path.startsWith("/drive/v3/files?")) {
+                    return MockResponse().setResponseCode(200).setBody("""{"files":[]}""")
+                }
+                if (method == "POST" && path.startsWith("/drive/v3/files")) {
+                    val reqJson = request.body.readUtf8()
+                    createdFoldersOnDrive.add(reqJson)
+                    return MockResponse()
+                        .setResponseCode(200)
+                        .setBody("""{"id":"irakiroan_root_folder_id_777","name":"Android_Permanent_Backup"}""")
+                }
+                return MockResponse().setResponseCode(404)
+            }
+        }
+
+        val testPrefs = TestInMemorySharedPreferences()
+        val isolatedAuth = GoogleAuthManager(
+            context = null,
+            tokenEndpointUrl = mockWebServer.url("/oauth2/token").toString(),
+            revokeEndpointUrl = mockWebServer.url("/oauth2/revoke").toString(),
+            customPrefs = testPrefs,
+            driveAboutUrl = mockWebServer.url("/drive/v3/about?fields=user(emailAddress,displayName)").toString(),
+            customOAuthClientId = "202264815644-test.apps.googleusercontent.com",
+            customOAuthClientSecret = "GOCSPX-testsecret"
+        )
+
+        // 1. Bridge authorization for a non-bridge email must be rejected (zero spoofing)
+        val bridgeSpoofAttempt = isolatedAuth.authorizeViaCloudDriveBridge("irakiroan@gmail.com")
+        assertFalse("Bridge must never spoof a non-owner Google account", bridgeSpoofAttempt.authorized)
+
+        // 2. Prepare RFC 8252 Loopback OAuth session for irakiroan@gmail.com
+        val prepOutcome = isolatedAuth.prepareLoopbackOAuthSession("irakiroan@gmail.com")
+        assertFalse(prepOutcome.authorized)
+        assertNotNull("Must return loopbackBrowserAuthUri", prepOutcome.loopbackBrowserAuthUri)
+        val authUri = prepOutcome.loopbackBrowserAuthUri!!
+        assertTrue("Auth URI must contain login_hint for irakiroan@gmail.com", authUri.contains("irakiroan%40gmail.com"))
+
+        val redirectParam = okhttp3.HttpUrl.Companion.run {
+            authUri.toHttpUrl().queryParameter("redirect_uri")
+        }
+        assertNotNull("redirect_uri must be present in auth URI", redirectParam)
+        assertTrue("redirect_uri must point to 127.0.0.1", redirectParam!!.startsWith("http://127.0.0.1:"))
+
+        // 3. Simulate browser redirect back to http://127.0.0.1:<port>/?code=auth_code_irakiroan_123 in background thread
+        val callbackThread = Thread {
+            Thread.sleep(80)
+            val callbackUrl = "${redirectParam}?code=auth_code_irakiroan_123&scope=https://www.googleapis.com/auth/drive"
+            val client = okhttp3.OkHttpClient()
+            val req = Request.Builder().url(callbackUrl).get().build()
+            client.newCall(req).execute().close()
+        }
+        callbackThread.start()
+
+        val loopOutcome = isolatedAuth.awaitLoopbackOAuthCodeAndExchange("irakiroan@gmail.com")
+        callbackThread.join(5000)
+
+        assertTrue("Loopback OAuth code exchange must succeed: ${loopOutcome.errorMessage}", loopOutcome.authorized)
+        assertEquals("irakiroan@gmail.com", isolatedAuth.accountState.value.email)
+        assertEquals("irakiroan_real_access_token", isolatedAuth.accountState.value.accessToken)
+
+        // 4. Immediate folder creation upon account connection (without waiting for full phone scan)
+        val scanner = AndroidStorageScanner(null, listOf(tempStorageDir), true)
+        val engine = PermanentBackupEngine(dao, scanner, driveApiClient, isolatedAuth)
+        val folderCreatedOk = engine.refreshRemoteQuotaAndRootFolder(createFolderIfMissing = true)
+        assertTrue("refreshRemoteQuotaAndRootFolder(createFolderIfMissing = true) must succeed", folderCreatedOk)
+        assertEquals(
+            "irakiroan_root_folder_id_777",
+            isolatedAuth.accountState.value.rootDriveFolderId
+        )
+        assertTrue(
+            "Android_Permanent_Backup folder must be created on Google Drive immediately",
+            createdFoldersOnDrive.any { it.contains("Android_Permanent_Backup") }
+        )
+    }
 }
 
 class TestInMemorySharedPreferences : SharedPreferences {
