@@ -3473,6 +3473,8 @@ class PermanentBackupEngineTest {
                 fileSize = localPhoto.length(),
                 lastModifiedMs = localPhoto.lastModified(),
                 mimeType = "image/jpeg",
+                sha256Hash = "dummy_sha256_hash",
+                md5Hash = "dummy_md5_hash",
                 driveFileId = "old_bridge_owner_file_id",
                 driveFolderId = GoogleAuthManager.CLOUD_BRIDGE_OWNER_ROOT_FOLDER_ID,
                 driveStoredName = "photo_switch.jpg",
