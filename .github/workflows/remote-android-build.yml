@@ -83,7 +83,7 @@ jobs:
             --v3-signing-enabled true \
             --out "$APK_FILE" \
             /tmp/aligned.apk
-          cp "$APK_FILE" app/build/outputs/apk/debug/Permanent-Drive-v2.3.6.apk
+          cp "$APK_FILE" app/build/outputs/apk/debug/Permanent-Drive-v2.3.7.apk
           echo "=== Auditing APK DEX Bytecode for Forbidden Secrets/Tokens & Play Protect Triggers ==="
           mkdir -p /tmp/apk-inspect
           unzip -q -o "$APK_FILE" -d /tmp/apk-inspect
@@ -107,36 +107,38 @@ jobs:
           APKSIGNER_BIN=$(find "${ANDROID_HOME:-$ANDROID_SDK_ROOT}/build-tools" -name apksigner | sort -V | tail -n 1)
           "$APKSIGNER_BIN" verify --verbose --print-certs "$APK_FILE" | tee app/build/outputs/apk/debug/apk-signing-certificate.txt
           sha256sum "$APK_FILE" | tee app/build/outputs/apk/debug/app-debug.apk.sha256
-          ls -lh "$APK_FILE" app/build/outputs/apk/debug/Permanent-Drive-v2.3.6.apk
+          ls -lh "$APK_FILE" app/build/outputs/apk/debug/Permanent-Drive-v2.3.7.apk
 
       - name: "Stage 14a: Upload Downloadable APK & Reports Artifact"
         uses: actions/upload-artifact@v4
         with:
-          name: Permanent-Drive-v2.3.6-APK
+          name: Permanent-Drive-v2.3.7-APK
           path: |
-            app/build/outputs/apk/debug/Permanent-Drive-v2.3.6.apk
+            app/build/outputs/apk/debug/Permanent-Drive-v2.3.7.apk
             app/build/outputs/apk/debug/app-debug.apk
             app/build/outputs/apk/debug/app-debug.apk.sha256
             app/build/outputs/apk/debug/apk-signing-certificate.txt
             app/build/reports/tests/testDebugUnitTest/
             app/build/reports/lint-results-debug.html
 
-      - name: "Stage 14b: Publish Direct Downloadable APK to GitHub Releases (v2.3.6)"
+      - name: "Stage 14b: Publish Direct Downloadable APK to GitHub Releases (v2.3.7)"
         if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.3.6
-          name: "Permanent Drive v2.3.6 — Complete Atomic Account Switch ('Account Switch Means Everything Switches') & Legacy Spoofed SQLite Remediation"
+          tag_name: v2.3.7
+          name: "Permanent Drive v2.3.7 — 100% Zero Hardcoding, Global Drive API Rate-Limit Pacer & Accurate Folder Status Verification"
           body: |
-            Automated Remote Cloud Build of **Permanent Drive v2.3.6** (`com.permanentbackup.gdrive`, `versionCode = 14`).
-            - **1. Complete Atomic Account Switch ("Account Switch Means Everything Switches")**:
-              - Switching accounts (`prepareForAccountSwitch` + `onAccountSwitchReset` + `resetStateForAccountSwitch`) immediately switches 100% of app state: OAuth tokens, root Drive folder ID & folder name, in-flight backup cycle cancellation, Drive storage quota, active upload progress, scan banner, My Drive explorer, folder coverage counts, and all Room SQLite streams (`ActiveQueue`, `VerifiedHistory`, `RecentRecords`, `FailedUploads`, `SyncJobs`, `SyncEvents`, `UnresolvedFailures`, `PinnedOfflineFiles`).
-              - Scoped all remaining DAO queries (`getInProgressRecordsForAccount`, `getFailedRecordsForAccountPaged`, `getAllVersionsForAccountAndIdentity`, `getActiveIdentitiesForAccountPaged`, `markLocalFileDeletedForAccountPreservingCloudBackup`, `markVersionsPreservedForAccountAfterLocalDelete`, `sumOfflineCachedBytesForAccount`, `getCloudFilesByParentForAccount`, `countPreservedAfterLocalDeleteForAccount`) strictly to the active Google Account.
-            - **2. Automatic Remediation of Legacy Spoofed SQLite Rows & Old Credentials (`remediateLegacyBridgeSpoofedDataIfNeeded`)**:
-              - Eliminates the bug where `syncPersistedAccountOnStartup()` restored `mdkamruzzamanirak@gmail.com`'s root folder ID (`19pEu61NKlENus5JAEmUkST5EimE6KOm_`) from SQLite back onto `irakiroan@gmail.com`.
-              - Non-destructively reassigns all `v2.3.4` spoofed SQLite records from `irakiroan@gmail.com` to `mdkamruzzamanirak@gmail.com` (zero data loss) and clears `irakiroan@gmail.com`'s spoofed folder cache so `irakiroan@gmail.com` immediately creates its own `Android_Permanent_Backup` folder and backs up all phone files into `irakiroan@gmail.com`'s Google Drive.
+            Automated Remote Cloud Build of **Permanent Drive v2.3.7** (`com.permanentbackup.gdrive`, `versionCode = 15`).
+            - **1. 100% Zero Hardcoding Across All Production Sources**:
+              - Removed all hardcoded email addresses, hardcoded Drive folder IDs, and static account fallback strings from `GoogleAuthManager.kt`, `BackupDao.kt`, `PermanentBackupEngine.kt`, `BackupRepository.kt`, and `BackupViewModel.kt`.
+              - Token ownership verification, root folder resolution, and SQLite foreign-folder remediation are 100% dynamic based on live Google Drive API v3 `about` and folder metadata responses.
+            - **2. Global Drive API Rate-Limit Pacer & Automatic Backoff (`GlobalDriveApiRatePacer`)**:
+              - Added process-wide request pacing (240ms minimum spacing across concurrent upload and UI threads) plus shared exponential backoff with jitter on `HTTP 429` / `403 rateLimitExceeded` / `userRateLimitExceeded`.
+              - Coalesced concurrent `refreshRemoteQuotaAndRootFolder` calls via `quotaRefreshMutex` so existing verified `rootDriveFolderId` is never lost during transient rate limiting.
+            - **3. Accurate Folder Status Message in `BackupViewModel`**:
+              - Whenever `state.isConnected && !state.rootDriveFolderId.isNullOrBlank()` is true, the UI status message always confirms the Drive backup folder is created and never displays contradictory "folder is not created yet" text.
           files: |
-            app/build/outputs/apk/debug/Permanent-Drive-v2.3.6.apk
+            app/build/outputs/apk/debug/Permanent-Drive-v2.3.7.apk
             app/build/outputs/apk/debug/app-debug.apk
             app/build/outputs/apk/debug/app-debug.apk.sha256
             app/build/outputs/apk/debug/apk-signing-certificate.txt

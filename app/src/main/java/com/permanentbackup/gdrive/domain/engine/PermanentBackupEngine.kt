@@ -147,6 +147,7 @@ class PermanentBackupEngine(
     private val pausedRecordIds: MutableSet<Long> = Collections.synchronizedSet(HashSet())
     private val cycleMutex = Mutex()
     private val folderCreationMutex = Mutex()
+    private val quotaRefreshMutex = Mutex()
     @Volatile
     private var activeCycleDeferred: CompletableDeferred<BackupCycleSummary>? = null
     @Volatile
@@ -278,48 +279,116 @@ class PermanentBackupEngine(
     }
 
     /**
-     * Connects to Google Drive API v3, refreshes storage quota info, and verifies whether
-     * the active root backup folder actually exists on Google Drive (or creates it if
-     * [createFolderIfMissing] is true). If the folder does not exist on Google Drive and
-     * [createFolderIfMissing] is false, clears any stale `rootDriveFolderId` so the UI
-     * never falsely claims the folder is created.
+     * Connects to Google Drive API v3, refreshes storage quota & authenticated user profile, and verifies
+     * whether the active root backup folder actually exists on Google Drive (or creates it if
+     * [createFolderIfMissing] is true). Dynamically reconciles any SQLite records that belonged to a
+     * foreign root folder without any hardcoded emails or folder IDs.
      */
-    suspend fun refreshRemoteQuotaAndRootFolder(createFolderIfMissing: Boolean = false): Boolean {
-        if (!authManager.accountState.value.isConnected) return false
-        _isVerifyingOrCreatingDriveFolder.value = true
-        return try {
-            var token = authManager.getValidAccessToken()
-            val quota = try {
-                driveApiClient.fetchDriveQuota(token)
-            } catch (e: AuthTokenExpiredException) {
-                token = authManager.invalidateAndRefreshTokenOn401()
-                driveApiClient.fetchDriveQuota(token)
-            }
-            _latestQuotaInfo.value = quota
-            _quotaFullState.value = quota.isQuotaFull
+    suspend fun refreshRemoteQuotaAndRootFolder(createFolderIfMissing: Boolean = false): Boolean =
+        quotaRefreshMutex.withLock {
+            if (!authManager.accountState.value.isConnected) return@withLock false
+            _isVerifyingOrCreatingDriveFolder.value = true
+            return@withLock try {
+                var token = authManager.getValidAccessToken()
+                val userAndQuota = try {
+                    driveApiClient.fetchDriveUserAndQuota(token)
+                } catch (e: AuthTokenExpiredException) {
+                    token = authManager.invalidateAndRefreshTokenOn401()
+                    driveApiClient.fetchDriveUserAndQuota(token)
+                }
+                if (!authManager.updateVerifiedUserProfile(userAndQuota.email, userAndQuota.displayName)) {
+                    return@withLock false
+                }
+                val quota = userAndQuota.quota
+                _latestQuotaInfo.value = quota
+                _quotaFullState.value = quota.isQuotaFull
 
-            val rootName = activeRootFolderName()
-            val verifiedRootId = if (createFolderIfMissing) {
-                driveApiClient.ensureFolderExists(
-                    accessToken = token,
-                    folderName = rootName,
-                    parentFolderId = null
-                )
-            } else {
-                driveApiClient.findFolderByName(
-                    accessToken = token,
-                    folderName = rootName,
-                    parentFolderId = null
-                )
+                val rootName = activeRootFolderName()
+                val verifiedRootId = if (createFolderIfMissing) {
+                    driveApiClient.ensureFolderExists(
+                        accessToken = token,
+                        folderName = rootName,
+                        parentFolderId = null
+                    )
+                } else {
+                    driveApiClient.findFolderByName(
+                        accessToken = token,
+                        folderName = rootName,
+                        parentFolderId = null
+                    )
+                }
+                if (!verifiedRootId.isNullOrBlank()) {
+                    reconcileForeignRootRecordsForAccount(currentAccountId(), verifiedRootId)
+                }
+                authManager.setRootDriveFolderName(rootName, verifiedRootId)
+                _lastNetworkError.value = null
+                true
+            } catch (e: DriveRateLimitException) {
+                val alreadyHasCreatedFolder = !authManager.accountState.value.rootDriveFolderId.isNullOrBlank()
+                if (!alreadyHasCreatedFolder) {
+                    _lastNetworkError.value = e.message
+                }
+                alreadyHasCreatedFolder
+            } catch (e: Exception) {
+                _lastNetworkError.value = e.message
+                false
+            } finally {
+                _isVerifyingOrCreatingDriveFolder.value = false
             }
-            authManager.setRootDriveFolderName(rootName, verifiedRootId)
-            _lastNetworkError.value = null
-            true
-        } catch (e: Exception) {
-            _lastNetworkError.value = e.message
-            false
-        } finally {
-            _isVerifyingOrCreatingDriveFolder.value = false
+        }
+
+    /**
+     * Dynamically detects if [accountId] previously had SQLite records or folder cache entries created
+     * under a foreign/different root folder ID (`oldRootId != verifiedRootId`), and reassigns them to
+     * whichever saved account actually owns `oldRootId` (or archives them non-destructively) so [accountId]
+     * cleanly backs up all local files into its own [verifiedRootId]. Zero hardcoded emails or folder IDs.
+     */
+    suspend fun reconcileForeignRootRecordsForAccount(accountId: String, verifiedRootId: String) {
+        if (accountId.isBlank() || verifiedRootId.isBlank()) return
+        try {
+            val allDbAccounts = backupDao.getAllGoogleAccounts()
+            val currentDbAccount = allDbAccounts.find { it.accountId.equals(accountId, ignoreCase = true) }
+            val previousDbRootId = currentDbAccount?.backupRootFolderId?.trim().orEmpty()
+
+            val cachedEntries = backupDao.getFolderCacheEntriesByPrefix("$accountId:")
+            val cachedRootIds = cachedEntries.mapNotNull { entry ->
+                val rest = entry.relativePath.removePrefix("$accountId:")
+                val candidateRoot = rest.substringBefore(':', "")
+                candidateRoot.takeIf { it.isNotBlank() }
+            }.toSet()
+
+            val foreignRootIds = buildSet {
+                if (previousDbRootId.isNotBlank() && previousDbRootId != verifiedRootId) {
+                    add(previousDbRootId)
+                }
+                for (cid in cachedRootIds) {
+                    if (cid != verifiedRootId) add(cid)
+                }
+            }
+
+            if (foreignRootIds.isEmpty()) return
+
+            for (foreignRootId in foreignRootIds) {
+                val ownerAccount = allDbAccounts.firstOrNull {
+                    !it.accountId.equals(accountId, ignoreCase = true) &&
+                        it.backupRootFolderId == foreignRootId
+                }
+                val targetOwnerId = ownerAccount?.accountId ?: "archived_root:$foreignRootId"
+                backupDao.clearSpoofedRootFolderIdFromAccounts(targetOwnerId, foreignRootId)
+                backupDao.reassignSpoofedBackupRecordsToOwner(accountId, targetOwnerId)
+                backupDao.archiveRemainingSpoofedBackupRecords(accountId, targetOwnerId)
+                backupDao.reassignSpoofedBackupVersionsToOwner(accountId, targetOwnerId)
+                backupDao.archiveRemainingSpoofedBackupVersions(accountId, targetOwnerId)
+                backupDao.reassignSpoofedSyncJobsToOwner(accountId, targetOwnerId)
+                backupDao.reassignSpoofedSyncEventsToOwner(accountId, targetOwnerId)
+                backupDao.reassignSpoofedFailedOperationsToOwner(accountId, targetOwnerId)
+                backupDao.reassignSpoofedUploadSessionsToOwner(accountId, targetOwnerId)
+                backupDao.archiveRemainingSpoofedUploadSessions(accountId, targetOwnerId)
+                backupDao.reassignSpoofedCloudFilesToOwner(accountId, targetOwnerId)
+                backupDao.archiveSpoofedDriveFolderCache("$accountId:$foreignRootId:", foreignRootId)
+            }
+        } catch (_: Throwable) {
+            // Non-blocking dynamic reconciliation
         }
     }
 
@@ -1042,20 +1111,12 @@ class PermanentBackupEngine(
         }
 
         // Ensure active root backup folder exists on Google Drive
+        val accountId = currentAccountId()
         val activeRootName = activeRootFolderName()
         val rootFolderId = try {
-            val currentEmail = authManager.accountState.value.email.trim()
-            val rawCachedRoot = authManager.accountState.value.rootDriveFolderId
-            val cachedRoot = if (rawCachedRoot == GoogleAuthManager.CLOUD_BRIDGE_OWNER_ROOT_FOLDER_ID &&
-                currentEmail.isNotBlank() &&
-                !currentEmail.equals(GoogleAuthManager.CLOUD_BRIDGE_OWNER_EMAIL, ignoreCase = true)
-            ) {
-                authManager.setRootDriveFolderName(activeRootName, null)
-                null
-            } else {
-                rawCachedRoot
-            }
+            val cachedRoot = authManager.accountState.value.rootDriveFolderId
             if (!cachedRoot.isNullOrBlank()) {
+                reconcileForeignRootRecordsForAccount(accountId, cachedRoot)
                 cachedRoot
             } else {
                 val createdId = driveApiClient.ensureFolderExists(
@@ -1063,6 +1124,7 @@ class PermanentBackupEngine(
                     folderName = activeRootName,
                     parentFolderId = null
                 )
+                reconcileForeignRootRecordsForAccount(accountId, createdId)
                 authManager.setRootDriveFolderName(activeRootName, createdId)
                 createdId
             }
@@ -1071,7 +1133,6 @@ class PermanentBackupEngine(
             return 0 to 0
         }
 
-        val accountId = currentAccountId()
         val concurrency = settings.uploadConcurrency.coerceIn(1, 4)
 
         // Every record is attempted at most once per pass. Paging skips records that are paused, still inside

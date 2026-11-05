@@ -162,49 +162,35 @@ class BackupRepository(
             .catch { emit(emptyList()) }
 
     /**
-     * One-time + idempotent SQLite remediation for any records that were created in v2.3.4 while a
-     * non-owner account (such as irakiroan@gmail.com) was spoofed with the Cloud Bridge owner's
-     * credentials (mdkamruzzamanirak@gmail.com, root folder 19pEu61NKlENus5JAEmUkST5EimE6KOm_).
-     * Reassigns those cloud records to mdkamruzzamanirak@gmail.com (zero data loss) and clears
-     * irakiroan@gmail.com so it creates its own folder and backs up all phone files into its own Drive.
+     * Dynamic, zero-hardcode SQLite remediation for any account whose stored token was unverified
+     * or whose cached folder entries belonged to a different root folder ID.
      */
-    suspend fun remediateLegacyBridgeSpoofedDataIfNeeded() {
+    suspend fun remediateUnverifiedAccountDataIfNeeded(
+        unverifiedAccountId: String,
+        unverifiedRootFolderId: String?
+    ) {
+        if (unverifiedAccountId.isBlank() || unverifiedRootFolderId.isNullOrBlank()) return
         try {
-            authManager.purgeMismatchedBridgeTokensIfNeeded()
-            val ownerId = GoogleAuthManager.CLOUD_BRIDGE_OWNER_EMAIL.lowercase()
-            val bridgeRootId = GoogleAuthManager.CLOUD_BRIDGE_OWNER_ROOT_FOLDER_ID
-            val alreadyRemediated = prefs?.getBoolean("v236_spoofed_bridge_remediated", false) == true
-
             val allDbAccounts = backupDao.getAllGoogleAccounts()
-            val taintedAccounts = allDbAccounts
-                .filter { !it.accountId.equals(ownerId, ignoreCase = true) && it.backupRootFolderId == bridgeRootId }
-                .map { it.accountId }
-                .toMutableSet()
-
-            if (!alreadyRemediated) {
-                taintedAccounts.add("irakiroan@gmail.com")
+            val ownerAccount = allDbAccounts.firstOrNull {
+                !it.accountId.equals(unverifiedAccountId, ignoreCase = true) &&
+                    it.backupRootFolderId == unverifiedRootFolderId
             }
-
-            if (taintedAccounts.isNotEmpty() || !alreadyRemediated) {
-                backupDao.clearSpoofedRootFolderIdFromAccounts(ownerId, bridgeRootId)
-                for (spoofedId in taintedAccounts) {
-                    if (spoofedId.equals(ownerId, ignoreCase = true)) continue
-                    backupDao.reassignSpoofedBackupRecordsToOwner(spoofedId, ownerId)
-                    backupDao.archiveRemainingSpoofedBackupRecords(spoofedId, ownerId)
-                    backupDao.reassignSpoofedBackupVersionsToOwner(spoofedId, ownerId)
-                    backupDao.archiveRemainingSpoofedBackupVersions(spoofedId, ownerId)
-                    backupDao.reassignSpoofedSyncJobsToOwner(spoofedId, ownerId)
-                    backupDao.reassignSpoofedSyncEventsToOwner(spoofedId, ownerId)
-                    backupDao.reassignSpoofedFailedOperationsToOwner(spoofedId, ownerId)
-                    backupDao.reassignSpoofedUploadSessionsToOwner(spoofedId, ownerId)
-                    backupDao.archiveRemainingSpoofedUploadSessions(spoofedId, ownerId)
-                    backupDao.reassignSpoofedCloudFilesToOwner(spoofedId, ownerId)
-                    backupDao.archiveSpoofedDriveFolderCache("$spoofedId:", bridgeRootId)
-                }
-                prefs?.edit()?.putBoolean("v236_spoofed_bridge_remediated", true)?.apply()
-            }
+            val targetOwnerId = ownerAccount?.accountId ?: "archived_root:$unverifiedRootFolderId"
+            backupDao.clearRootFolderIdForAccount(unverifiedAccountId)
+            backupDao.reassignSpoofedBackupRecordsToOwner(unverifiedAccountId, targetOwnerId)
+            backupDao.archiveRemainingSpoofedBackupRecords(unverifiedAccountId, targetOwnerId)
+            backupDao.reassignSpoofedBackupVersionsToOwner(unverifiedAccountId, targetOwnerId)
+            backupDao.archiveRemainingSpoofedBackupVersions(unverifiedAccountId, targetOwnerId)
+            backupDao.reassignSpoofedSyncJobsToOwner(unverifiedAccountId, targetOwnerId)
+            backupDao.reassignSpoofedSyncEventsToOwner(unverifiedAccountId, targetOwnerId)
+            backupDao.reassignSpoofedFailedOperationsToOwner(unverifiedAccountId, targetOwnerId)
+            backupDao.reassignSpoofedUploadSessionsToOwner(unverifiedAccountId, targetOwnerId)
+            backupDao.archiveRemainingSpoofedUploadSessions(unverifiedAccountId, targetOwnerId)
+            backupDao.reassignSpoofedCloudFilesToOwner(unverifiedAccountId, targetOwnerId)
+            backupDao.archiveSpoofedDriveFolderCache("$unverifiedAccountId:", unverifiedRootFolderId)
         } catch (_: Throwable) {
-            // Best-effort remediation; never block app startup
+            // Non-blocking dynamic remediation
         }
     }
 
@@ -215,7 +201,7 @@ class BackupRepository(
     suspend fun onAccountSwitchReset(newEmail: String) {
         val cleanEmail = newEmail.trim()
         if (cleanEmail.isBlank()) return
-        remediateLegacyBridgeSpoofedDataIfNeeded()
+        authManager.purgeMismatchedBridgeTokensIfNeeded()
         backupEngine.resetStateForAccountSwitch()
         _cloudNextPageToken.value = null
         _lastCloudBrowseError.value = null
@@ -225,7 +211,7 @@ class BackupRepository(
 
     suspend fun syncPersistedAccountOnStartup() {
         try {
-            remediateLegacyBridgeSpoofedDataIfNeeded()
+            authManager.purgeMismatchedBridgeTokensIfNeeded()
 
             // 1. Restore persisted AppSettingsEntity from Room if present; always ensure auto-backup consent is active
             val dbSettings = backupDao.getAppSettingsEntity()
@@ -263,7 +249,7 @@ class BackupRepository(
             if (authManager.isUserExplicitlyDisconnected()) return
             val activeDbAccount = backupDao.getActiveGoogleAccount()
             if (activeDbAccount != null && !authManager.accountState.value.isConnected) {
-                authManager.authorizeSelectedNativeAccount(
+                val authorized = authManager.authorizeSelectedNativeAccount(
                     selectedEmail = activeDbAccount.email,
                     nativePlayServicesToken = null,
                     grantedScopes = activeDbAccount.grantedScopes
@@ -271,13 +257,14 @@ class BackupRepository(
                 val restoredFolderName = activeDbAccount.backupRootFolderName.ifBlank {
                     authManager.accountState.value.rootDriveFolderName
                 }
-                val safeDbRootFolderId = if (
-                    activeDbAccount.backupRootFolderId == GoogleAuthManager.CLOUD_BRIDGE_OWNER_ROOT_FOLDER_ID &&
-                    !activeDbAccount.email.equals(GoogleAuthManager.CLOUD_BRIDGE_OWNER_EMAIL, ignoreCase = true)
-                ) {
-                    null
-                } else {
+                val safeDbRootFolderId = if (authorized) {
                     activeDbAccount.backupRootFolderId
+                } else {
+                    remediateUnverifiedAccountDataIfNeeded(
+                        unverifiedAccountId = activeDbAccount.accountId,
+                        unverifiedRootFolderId = activeDbAccount.backupRootFolderId
+                    )
+                    null
                 }
                 authManager.setRootDriveFolderName(restoredFolderName, safeDbRootFolderId)
                 if (authManager.accountState.value.isConnected) {

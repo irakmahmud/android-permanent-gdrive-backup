@@ -263,6 +263,11 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
                     !settings.value.backgroundSyncPaused &&
                     hasStoragePerm
 
+                if (isRootCreated && _signInStatusMessage.value?.contains("is not created yet", ignoreCase = true) == true) {
+                    _signInStatusMessage.value =
+                        "✓ Google Drive (${accountState.email}) Connected! Folder '$rootFolderName' is created at My Drive/$rootFolderName (ID: ${accountState.rootDriveFolderId})."
+                }
+
                 _dashboardSummary.value = current.copy(
                     accountState = accountState,
                     isBackupRunning = running,
@@ -988,7 +993,7 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
             _isAuthorizingAccount.value = false
             val state = repository.authManager.accountState.value
             val folderName = state.rootDriveFolderName.ifBlank { "Android_Permanent_Backup" }
-            if (ok && !state.rootDriveFolderId.isNullOrBlank()) {
+            if (state.isConnected && !state.rootDriveFolderId.isNullOrBlank()) {
                 _signInStatusMessage.value =
                     "✓ Google Drive (${state.email}) Verified! Folder '$folderName' is created at My Drive/$folderName (ID: ${state.rootDriveFolderId})."
                 ensureAutoBackupRunning()

@@ -112,6 +112,50 @@ class GlobalBandwidthLimiter {
 }
 
 /**
+ * Process-wide Google Drive API v3 request pacer & shared rate-limit backoff coordinator.
+ * Prevents concurrent upload workers + UI quota/explorer calls from exceeding Google Drive's per-user
+ * burst rate limit (HTTP 403 rateLimitExceeded / userRateLimitExceeded) and coordinates backoff across threads.
+ */
+object GlobalDriveApiRatePacer {
+    private val lock = Any()
+    private var nextAllowedRequestNs: Long = 0L
+    private var rateLimitCooldownUntilNs: Long = 0L
+    private const val MIN_REQUEST_INTERVAL_NS: Long = 240_000_000L // 240 ms (~4.1 req/sec steady state)
+
+    fun acquireSlot() {
+        val sleepMs = synchronized(lock) {
+            val now = System.nanoTime()
+            val earliest = maxOf(now, nextAllowedRequestNs, rateLimitCooldownUntilNs)
+            nextAllowedRequestNs = earliest + MIN_REQUEST_INTERVAL_NS
+            ((earliest - now) / 1_000_000L).coerceAtLeast(0L)
+        }
+        if (sleepMs > 0L) {
+            try {
+                Thread.sleep(sleepMs)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+        }
+    }
+
+    fun onRateLimitHit(attempt: Int) {
+        val shift = (attempt - 1).coerceIn(0, 4)
+        val backoffMs = (1500L shl shift) + ((System.nanoTime() and 0xFFL) * 2L)
+        val backoffNs = backoffMs * 1_000_000L
+        synchronized(lock) {
+            val now = System.nanoTime()
+            val target = now + backoffNs
+            if (target > rateLimitCooldownUntilNs) {
+                rateLimitCooldownUntilNs = target
+            }
+            if (target > nextAllowedRequestNs) {
+                nextAllowedRequestNs = target
+            }
+        }
+    }
+}
+
+/**
  * Full-Featured Google Drive API v3 Client (Section 5 & Section 9):
  * - Create Backup Folder & nested subfolder hierarchy
  * - List Files, Folder Navigation, Search Files, Recent, Starred, Shared With Me, Shared Drives
@@ -144,9 +188,10 @@ class DriveApiClient(
         .apply {
             if (driveBaseUrl.contains("googleapis.com", ignoreCase = true)) {
                 addInterceptor { chain ->
+                    GlobalDriveApiRatePacer.acquireSlot()
                     var response = chain.proceed(chain.request())
                     var attempt = 1
-                    val maxRetries = 3
+                    val maxRetries = 5
                     while (attempt <= maxRetries && (response.code == 429 || response.code == 403)) {
                         val peeked = runCatching { response.peekBody(4096).string() }.getOrDefault("")
                         val isRateLimit = response.code == 429 ||
@@ -154,12 +199,9 @@ class DriveApiClient(
                             peeked.contains("userRateLimitExceeded", ignoreCase = true)
                         if (!isRateLimit) break
                         response.close()
-                        try {
-                            Thread.sleep(1200L * attempt)
-                        } catch (_: InterruptedException) {
-                            Thread.currentThread().interrupt()
-                            break
-                        }
+                        GlobalDriveApiRatePacer.onRateLimitHit(attempt)
+                        GlobalDriveApiRatePacer.acquireSlot()
+                        if (Thread.currentThread().isInterrupted) break
                         attempt++
                         response = chain.proceed(chain.request())
                     }

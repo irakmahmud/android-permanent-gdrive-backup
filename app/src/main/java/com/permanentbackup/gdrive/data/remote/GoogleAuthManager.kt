@@ -65,8 +65,6 @@ class GoogleAuthManager(
         const val LEAST_PRIVILEGE_SCOPE = "https://www.googleapis.com/auth/drive.file"
         const val DRIVE_READONLY_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
         const val ROOT_BACKUP_FOLDER_NAME = "Android_Permanent_Backup"
-        const val CLOUD_BRIDGE_OWNER_EMAIL = "mdkamruzzamanirak@gmail.com"
-        const val CLOUD_BRIDGE_OWNER_ROOT_FOLDER_ID = "19pEu61NKlENus5JAEmUkST5EimE6KOm_"
 
         private const val PREF_FILE_NAME = "google_oauth_private_prefs"
         private const val KEY_V2_SECURITY_MIGRATION_DONE = "v2_compromised_token_purged"
@@ -83,6 +81,8 @@ class GoogleAuthManager(
         private const val KEY_ROOT_FOLDER_NAME = "root_drive_folder_name"
         private const val KEY_GRANTED_SCOPES = "granted_scopes"
         private const val KEY_KNOWN_ACCOUNTS_CSV = "known_accounts_csv"
+        private const val KEY_VERIFIED_TOKEN_OWNER = "verified_token_owner_email"
+        private const val KEY_BRIDGE_VERIFIED_OWNER_EMAIL = "bridge_verified_owner_email"
     }
 
     private val appContext: Context? = context?.applicationContext
@@ -141,50 +141,53 @@ class GoogleAuthManager(
     }
 
     /**
-     * Ensures that a non-bridge Google Account (e.g. irakiroan@gmail.com) never retains the
-     * Cloud Bridge owner's refresh token, access token, or rootDriveFolderId from an earlier version.
+     * Dynamically ensures that no Google Account retains an unverified bridge refresh token,
+     * access token, or cached rootDriveFolderId from an earlier version without any hardcoded emails.
      */
     fun purgeMismatchedBridgeTokensIfNeeded() {
         val bridge = decodeCloudBridgePayload()
         val bridgeRt = bridge?.third.orEmpty()
+        val bridgeVerifiedOwner = getString(KEY_BRIDGE_VERIFIED_OWNER_EMAIL, "").trim()
 
         val currentEmail = getString(KEY_EMAIL, "").trim()
-        val allEmails = (listOf(currentEmail, "irakiroan@gmail.com") + getString(KEY_KNOWN_ACCOUNTS_CSV, "").split(","))
+        val allEmails = (listOf(currentEmail) + getString(KEY_KNOWN_ACCOUNTS_CSV, "").split(","))
             .map { it.trim() }
             .filter { it.isNotBlank() }
             .distinct()
 
         for (email in allEmails) {
-            if (!email.equals(CLOUD_BRIDGE_OWNER_EMAIL, ignoreCase = true)) {
-                val acctId = normalizeAccountId(email)
-                val acctRt = getAccountScopedString(acctId, KEY_REFRESH_TOKEN, "")
-                val acctRootId = getAccountScopedString(acctId, KEY_ROOT_FOLDER_ID, "")
-                val hasBridgeRt = bridgeRt.isNotBlank() && acctRt == bridgeRt
-                val hasBridgeRootId = acctRootId == CLOUD_BRIDGE_OWNER_ROOT_FOLDER_ID
-                if (hasBridgeRt || hasBridgeRootId) {
-                    if (hasBridgeRt) {
-                        putAccountScopedString(acctId, KEY_REFRESH_TOKEN, "")
-                        putAccountScopedString(acctId, KEY_ACCESS_TOKEN, "")
-                        putAccountScopedLong(acctId, KEY_TOKEN_EXPIRES_AT, 0L)
-                    }
-                    putAccountScopedString(acctId, KEY_ROOT_FOLDER_ID, "")
-                }
+            val acctId = normalizeAccountId(email)
+            val acctRt = getAccountScopedString(acctId, KEY_REFRESH_TOKEN, "")
+            val acctAt = getAccountScopedString(acctId, KEY_ACCESS_TOKEN, "")
+            val verifiedOwner = getAccountScopedString(acctId, KEY_VERIFIED_TOKEN_OWNER, "").trim()
+            val isUnverifiedBridgeRt = bridgeRt.isNotBlank() &&
+                acctRt == bridgeRt &&
+                (!verifiedOwner.equals(email, ignoreCase = true) ||
+                    (bridgeVerifiedOwner.isNotBlank() && !bridgeVerifiedOwner.equals(email, ignoreCase = true)))
+            if (isUnverifiedBridgeRt || (acctRt.isBlank() && acctAt.isBlank() && verifiedOwner.isBlank())) {
+                putAccountScopedString(acctId, KEY_REFRESH_TOKEN, "")
+                putAccountScopedString(acctId, KEY_ACCESS_TOKEN, "")
+                putAccountScopedLong(acctId, KEY_TOKEN_EXPIRES_AT, 0L)
+                putAccountScopedString(acctId, KEY_ROOT_FOLDER_ID, "")
             }
         }
 
-        if (currentEmail.isNotBlank() && !currentEmail.equals(CLOUD_BRIDGE_OWNER_EMAIL, ignoreCase = true)) {
+        if (currentEmail.isNotBlank()) {
+            val currentAcctId = normalizeAccountId(currentEmail)
+            val verifiedOwner = getAccountScopedString(currentAcctId, KEY_VERIFIED_TOKEN_OWNER, "").trim()
             val globalRt = getString(KEY_REFRESH_TOKEN, "")
-            val globalRootId = getString(KEY_ROOT_FOLDER_ID, "")
-            val hasGlobalBridgeRt = bridgeRt.isNotBlank() && globalRt == bridgeRt
-            val hasGlobalBridgeRoot = globalRootId == CLOUD_BRIDGE_OWNER_ROOT_FOLDER_ID
-            if (hasGlobalBridgeRt || hasGlobalBridgeRoot) {
-                if (hasGlobalBridgeRt) {
-                    putString(KEY_REFRESH_TOKEN, "")
-                    putString(KEY_ACCESS_TOKEN, "")
-                    putLong(KEY_TOKEN_EXPIRES_AT, 0L)
-                    putBoolean(KEY_CONNECTED, false)
-                }
+            val globalAt = getString(KEY_ACCESS_TOKEN, "")
+            val isGlobalUnverifiedBridgeRt = bridgeRt.isNotBlank() &&
+                globalRt == bridgeRt &&
+                (!verifiedOwner.equals(currentEmail, ignoreCase = true) ||
+                    (bridgeVerifiedOwner.isNotBlank() && !bridgeVerifiedOwner.equals(currentEmail, ignoreCase = true)))
+            if (isGlobalUnverifiedBridgeRt || (globalRt.isBlank() && globalAt.isBlank() && verifiedOwner.isBlank())) {
+                putString(KEY_REFRESH_TOKEN, "")
+                putString(KEY_ACCESS_TOKEN, "")
+                putLong(KEY_TOKEN_EXPIRES_AT, 0L)
+                putBoolean(KEY_CONNECTED, false)
                 putString(KEY_ROOT_FOLDER_ID, "")
+                putAccountScopedString(currentAcctId, KEY_ROOT_FOLDER_ID, "")
             }
         }
     }
@@ -216,15 +219,7 @@ class GoogleAuthManager(
         val scopedExpiresAt = getAccountScopedLong(newAccountId, KEY_TOKEN_EXPIRES_AT, 0L)
         val scopedLastRefresh = getAccountScopedLong(newAccountId, KEY_LAST_REFRESH, 0L)
         val scopedScopes = getAccountScopedString(newAccountId, KEY_GRANTED_SCOPES, "")
-        val rawScopedRootId = getAccountScopedString(newAccountId, KEY_ROOT_FOLDER_ID, "")
-        val scopedRootId = if (!cleanEmail.equals(CLOUD_BRIDGE_OWNER_EMAIL, ignoreCase = true) &&
-            rawScopedRootId == CLOUD_BRIDGE_OWNER_ROOT_FOLDER_ID
-        ) {
-            putAccountScopedString(newAccountId, KEY_ROOT_FOLDER_ID, "")
-            null
-        } else {
-            rawScopedRootId.ifBlank { null }
-        }
+        val scopedRootId = getAccountScopedString(newAccountId, KEY_ROOT_FOLDER_ID, "").ifBlank { null }
         val scopedRootName = getAccountScopedString(newAccountId, KEY_ROOT_FOLDER_NAME, "")
             .ifBlank { ROOT_BACKUP_FOLDER_NAME }
 
@@ -329,8 +324,8 @@ class GoogleAuthManager(
 
     /**
      * Authorizes using the pre-configured Cloud Bridge refresh token ONLY when [targetEmail] is empty
-     * or matches the actual Google Account that owns the Cloud Bridge token.
-     * Never spoofs a different selected email with the Cloud Bridge owner's token.
+     * or dynamically verified by Google Drive API to match the account that owns the token.
+     * Zero hardcoded emails; never spoofs a different selected email.
      */
     fun authorizeViaCloudDriveBridge(
         targetEmail: String,
@@ -342,7 +337,11 @@ class GoogleAuthManager(
             return SilentAuthOutcome(authorized = false, errorMessage = "Cloud Drive OAuth bridge refresh token not present.")
         }
         val requestedEmail = targetEmail.trim()
-        if (requestedEmail.isNotBlank() && !requestedEmail.equals(CLOUD_BRIDGE_OWNER_EMAIL, ignoreCase = true)) {
+        val cachedBridgeOwner = getString(KEY_BRIDGE_VERIFIED_OWNER_EMAIL, "").trim()
+        if (requestedEmail.isNotBlank() &&
+            cachedBridgeOwner.isNotBlank() &&
+            !cachedBridgeOwner.equals(requestedEmail, ignoreCase = true)
+        ) {
             return SilentAuthOutcome(
                 authorized = false,
                 errorMessage = "Selected account '$requestedEmail' requires direct OAuth sign-in."
@@ -378,13 +377,23 @@ class GoogleAuthManager(
                     )
                 }
                 val profile = fetchAuthenticatedUserProfile(accessToken)
-                val verifiedOwnerEmail = profile?.first?.trim().orEmpty().ifBlank { CLOUD_BRIDGE_OWNER_EMAIL }
+                val verifiedOwnerEmail = profile?.first?.trim().orEmpty()
+                if (verifiedOwnerEmail.isBlank()) {
+                    return SilentAuthOutcome(
+                        authorized = false,
+                        errorMessage = "Unable to verify token owner email from Google Drive API."
+                    )
+                }
+                putString(KEY_BRIDGE_VERIFIED_OWNER_EMAIL, verifiedOwnerEmail)
                 if (requestedEmail.isNotBlank() && !verifiedOwnerEmail.equals(requestedEmail, ignoreCase = true)) {
+                    purgeMismatchedBridgeTokensIfNeeded()
                     return SilentAuthOutcome(
                         authorized = false,
                         errorMessage = "Cloud Bridge token belongs to $verifiedOwnerEmail, not $requestedEmail."
                     )
                 }
+                val ownerAccountId = normalizeAccountId(verifiedOwnerEmail)
+                putAccountScopedString(ownerAccountId, KEY_VERIFIED_TOKEN_OWNER, verifiedOwnerEmail)
                 val displayName = profile?.second?.ifBlank { deriveDisplayName(verifiedOwnerEmail) }
                     ?: deriveDisplayName(verifiedOwnerEmail)
                 onAccountAuthorized(
@@ -403,9 +412,9 @@ class GoogleAuthManager(
     }
 
     /**
-     * Starts an RFC 8252 Loopback HTTP OAuth 2.0 listener on `127.0.0.1:<ephemeral_port>` for authorizing
-     * ANY user-selected Google Account (such as `irakiroan@gmail.com`) without requiring the APK's
-     * signing certificate SHA-1 to be registered in Google Cloud Console.
+     *Starts an RFC 8252 Loopback HTTP OAuth 2.0 listener on `127.0.0.1:<ephemeral_port>` for authorizing
+     * ANY user-selected Google Account without requiring the APK's signing certificate SHA-1 to be
+     * registered in Google Cloud Console.
      */
     fun prepareLoopbackOAuthSession(
         targetEmail: String,
@@ -633,18 +642,10 @@ class GoogleAuthManager(
         } else {
             getAccountScopedString(accountId, KEY_GRANTED_SCOPES, "")
         }
-        val rawRootFolderId = if (accountId.isNotBlank()) {
+        val rootFolderId = if (accountId.isNotBlank()) {
             getAccountScopedString(accountId, KEY_ROOT_FOLDER_ID, "").ifBlank { null }
         } else {
             getString(KEY_ROOT_FOLDER_ID, "").ifBlank { null }
-        }
-        val rootFolderId = if (email.isNotBlank() &&
-            !email.equals(CLOUD_BRIDGE_OWNER_EMAIL, ignoreCase = true) &&
-            rawRootFolderId == CLOUD_BRIDGE_OWNER_ROOT_FOLDER_ID
-        ) {
-            null
-        } else {
-            rawRootFolderId
         }
         val rootFolderName = if (accountId.isNotBlank()) {
             getAccountScopedString(accountId, KEY_ROOT_FOLDER_NAME, "").ifBlank { ROOT_BACKUP_FOLDER_NAME }
@@ -762,9 +763,10 @@ class GoogleAuthManager(
 
         // 0b. If this exact account already has its own saved refresh_token, refresh it silently
         val existingAccountRefresh = getAccountScopedString(accountId, KEY_REFRESH_TOKEN, "")
+        val verifiedOwner = getAccountScopedString(accountId, KEY_VERIFIED_TOKEN_OWNER, "").trim()
         val bridge = decodeCloudBridgePayload()
         val isGenuineAccountRefresh = existingAccountRefresh.isNotBlank() &&
-            (cleanEmail.equals(CLOUD_BRIDGE_OWNER_EMAIL, ignoreCase = true) || existingAccountRefresh != bridge?.third)
+            (existingAccountRefresh != bridge?.third || verifiedOwner.equals(cleanEmail, ignoreCase = true))
         if (isGenuineAccountRefresh) {
             try {
                 val refreshed = refreshAccessToken(existingAccountRefresh)
@@ -907,6 +909,7 @@ class GoogleAuthManager(
         val accountId = normalizeAccountId(cleanEmail)
         val now = System.currentTimeMillis()
         val expiresAt = if (accessToken.isNotBlank()) now + (expiresInSeconds * 1000L) else 0L
+        val bridge = decodeCloudBridgePayload()
 
         putBoolean(KEY_CONNECTED, true)
         putBoolean(KEY_USER_DISCONNECTED, false)
@@ -922,23 +925,18 @@ class GoogleAuthManager(
         if (!refreshToken.isNullOrBlank()) {
             putString(KEY_REFRESH_TOKEN, refreshToken)
             putAccountScopedString(accountId, KEY_REFRESH_TOKEN, refreshToken)
+            if (refreshToken != bridge?.third) {
+                putAccountScopedString(accountId, KEY_VERIFIED_TOKEN_OWNER, cleanEmail)
+            }
         } else {
             putString(KEY_REFRESH_TOKEN, getAccountScopedString(accountId, KEY_REFRESH_TOKEN, ""))
+            putAccountScopedString(accountId, KEY_VERIFIED_TOKEN_OWNER, cleanEmail)
         }
         putLong(KEY_TOKEN_EXPIRES_AT, expiresAt)
         putLong(KEY_LAST_REFRESH, now)
         registerKnownAccountEmail(cleanEmail)
 
-        val rawExistingRoot = getAccountScopedString(accountId, KEY_ROOT_FOLDER_ID, "").ifBlank { null }
-        val existingRoot = if (cleanEmail.isNotBlank() &&
-            !cleanEmail.equals(CLOUD_BRIDGE_OWNER_EMAIL, ignoreCase = true) &&
-            rawExistingRoot == CLOUD_BRIDGE_OWNER_ROOT_FOLDER_ID
-        ) {
-            putAccountScopedString(accountId, KEY_ROOT_FOLDER_ID, "")
-            null
-        } else {
-            rawExistingRoot
-        }
+        val existingRoot = getAccountScopedString(accountId, KEY_ROOT_FOLDER_ID, "").ifBlank { null }
         putString(KEY_ROOT_FOLDER_ID, existingRoot.orEmpty())
         val existingRootName = getAccountScopedString(accountId, KEY_ROOT_FOLDER_NAME, "").ifBlank {
             ROOT_BACKUP_FOLDER_NAME
@@ -963,6 +961,47 @@ class GoogleAuthManager(
             lastSuccessfulConnectionMs = now,
             connectionError = null
         )
+    }
+
+    /**
+     * Dynamically updates the verified account profile from Google Drive API `about` response.
+     * If Google Drive API reports that the active token belongs to a different email address
+     * than the currently selected account, purges the mismatched token & root folder ID immediately.
+     */
+    fun updateVerifiedUserProfile(verifiedEmail: String, verifiedDisplayName: String): Boolean {
+        val cleanVerified = verifiedEmail.trim()
+        val currentEmail = _accountState.value.email.trim()
+        if (cleanVerified.isNotBlank() && currentEmail.isNotBlank() && !cleanVerified.equals(currentEmail, ignoreCase = true)) {
+            val currentAcctId = normalizeAccountId(currentEmail)
+            putAccountScopedString(currentAcctId, KEY_ACCESS_TOKEN, "")
+            putAccountScopedString(currentAcctId, KEY_REFRESH_TOKEN, "")
+            putAccountScopedLong(currentAcctId, KEY_TOKEN_EXPIRES_AT, 0L)
+            putAccountScopedString(currentAcctId, KEY_ROOT_FOLDER_ID, "")
+            putString(KEY_ACCESS_TOKEN, "")
+            putString(KEY_REFRESH_TOKEN, "")
+            putLong(KEY_TOKEN_EXPIRES_AT, 0L)
+            putString(KEY_ROOT_FOLDER_ID, "")
+            putBoolean(KEY_CONNECTED, false)
+            _accountState.value = _accountState.value.copy(
+                isConnected = false,
+                authState = AccountAuthState.AUTHORIZATION_REQUIRED,
+                rootDriveFolderId = null,
+                lastTokenRefreshStatus = "REAUTH_REQUIRED",
+                connectionError = "Token belonged to $cleanVerified instead of $currentEmail. Please authorize $currentEmail."
+            )
+            return false
+        }
+        val activeEmail = cleanVerified.ifBlank { currentEmail }
+        if (activeEmail.isNotBlank()) {
+            val acctId = normalizeAccountId(activeEmail)
+            putAccountScopedString(acctId, KEY_VERIFIED_TOKEN_OWNER, activeEmail)
+            val resolvedName = verifiedDisplayName.trim().ifBlank { _accountState.value.displayName }
+            if (resolvedName.isNotBlank()) {
+                putString(KEY_DISPLAY_NAME, resolvedName)
+                _accountState.value = _accountState.value.copy(displayName = resolvedName)
+            }
+        }
+        return true
     }
 
     /**
@@ -995,8 +1034,9 @@ class GoogleAuthManager(
         // Check if this specific account already has its own valid saved refresh token
         val bridge = decodeCloudBridgePayload()
         val savedRefresh = getAccountScopedString(accountId, KEY_REFRESH_TOKEN, "")
+        val verifiedOwner = getAccountScopedString(accountId, KEY_VERIFIED_TOKEN_OWNER, "").trim()
         val isGenuineSavedRefresh = savedRefresh.isNotBlank() &&
-            (cleanEmail.equals(CLOUD_BRIDGE_OWNER_EMAIL, ignoreCase = true) || savedRefresh != bridge?.third)
+            (savedRefresh != bridge?.third || verifiedOwner.equals(cleanEmail, ignoreCase = true))
         if (isGenuineSavedRefresh) {
             try {
                 val refreshedToken = refreshAccessToken(savedRefresh)
@@ -1074,16 +1114,8 @@ class GoogleAuthManager(
     }
 
     fun setRootDriveFolderId(folderId: String?) {
-        val rawId = folderId?.trim().orEmpty()
+        val cleanId = folderId?.trim().orEmpty()
         val currentEmail = _accountState.value.email.trim()
-        val cleanId = if (rawId == CLOUD_BRIDGE_OWNER_ROOT_FOLDER_ID &&
-            currentEmail.isNotBlank() &&
-            !currentEmail.equals(CLOUD_BRIDGE_OWNER_EMAIL, ignoreCase = true)
-        ) {
-            ""
-        } else {
-            rawId
-        }
         val accountId = _accountState.value.accountId.ifBlank {
             normalizeAccountId(currentEmail)
         }
@@ -1101,16 +1133,8 @@ class GoogleAuthManager(
             .replace("/", "_")
             .replace("\\", "_")
             .ifBlank { ROOT_BACKUP_FOLDER_NAME }
-        val rawId = folderId?.trim().orEmpty()
+        val cleanId = folderId?.trim().orEmpty()
         val currentEmail = _accountState.value.email.trim()
-        val cleanId = if (rawId == CLOUD_BRIDGE_OWNER_ROOT_FOLDER_ID &&
-            currentEmail.isNotBlank() &&
-            !currentEmail.equals(CLOUD_BRIDGE_OWNER_EMAIL, ignoreCase = true)
-        ) {
-            ""
-        } else {
-            rawId
-        }
         val accountId = _accountState.value.accountId.ifBlank {
             normalizeAccountId(currentEmail)
         }
@@ -1209,10 +1233,11 @@ class GoogleAuthManager(
         } else {
             getString(KEY_REFRESH_TOKEN, "")
         }
+        val verifiedOwner = getAccountScopedString(accountId, KEY_VERIFIED_TOKEN_OWNER, "").trim()
         val isGenuineRefresh = refreshToken.isNotBlank() &&
             (state.email.isBlank() ||
-                state.email.equals(CLOUD_BRIDGE_OWNER_EMAIL, ignoreCase = true) ||
-                refreshToken != bridge?.third)
+                refreshToken != bridge?.third ||
+                verifiedOwner.equals(state.email, ignoreCase = true))
         if (isGenuineRefresh) {
             try {
                 return refreshAccessToken(refreshToken)

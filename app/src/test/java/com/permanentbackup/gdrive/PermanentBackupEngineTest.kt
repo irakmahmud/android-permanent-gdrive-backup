@@ -619,9 +619,8 @@ class InMemoryBackupDao : BackupDao {
     override suspend fun getDriveChangeToken(accountId: String): DriveChangeTokenEntity? =
         driveChangeTokens[accountId]
 
-    // v2.3.0 / v2.3.6 additions
-    private fun ownedBy(accountId: String, rowAccount: String) =
-        rowAccount == accountId || (accountId in setOf("default_account", "user@example.com") && rowAccount == "default_account")
+    // v2.3.0 / v2.3.7 additions
+    private fun ownedBy(accountId: String, rowAccount: String) = rowAccount == accountId
     private fun underPath(relativePath: String, prefix: String) = relativePath.startsWith("$prefix/")
 
     override suspend fun findVerifiedDuplicateBySha256(
@@ -860,6 +859,16 @@ class InMemoryBackupDao : BackupDao {
             folderCache["bridge_archive:$key"] = entity.copy(relativePath = "bridge_archive:$key")
         }
     }
+
+    override suspend fun clearRootFolderIdForAccount(accountId: String) {
+        accounts[accountId]?.let { acc ->
+            accounts[accountId] = acc.copy(backupRootFolderId = null)
+        }
+        notifyChange()
+    }
+
+    override suspend fun getFolderCacheEntriesByPrefix(prefix: String): List<DriveFolderCacheEntity> =
+        folderCache.values.filter { it.relativePath.startsWith(prefix) }
 
     fun getAllRecordsSnapshot(): List<BackupFileEntity> = records.values.toList()
     fun getAllSyncJobsSnapshot(): List<SyncJobEntity> = syncJobs.values.toList()
@@ -1232,6 +1241,7 @@ class PermanentBackupEngineTest {
     fun test06_appCrashDuringBackup_recoversIncompleteTasksWithoutHistoryLoss() = runTest {
         dao.insertRecord(
             BackupFileEntity(
+                accountId = "user@example.com",
                 sourceUri = "/storage/emulated/0/DCIM/old.jpg",
                 sourceFileIdentity = "vol0:DCIM/old.jpg",
                 relativePath = "DCIM/old.jpg",
@@ -1253,6 +1263,7 @@ class PermanentBackupEngineTest {
 
         val crashedId = dao.insertRecord(
             BackupFileEntity(
+                accountId = "user@example.com",
                 sourceUri = "/storage/emulated/0/Movies/large.mp4",
                 sourceFileIdentity = "vol0:Movies/large.mp4",
                 relativePath = "Movies/large.mp4",
@@ -1334,6 +1345,7 @@ class PermanentBackupEngineTest {
 
         val pendingId = dao.insertRecord(
             BackupFileEntity(
+                accountId = "user@example.com",
                 sourceUri = File(tempStorageDir, "deleted_before_upload.txt").absolutePath,
                 sourceFileIdentity = "vol0:deleted_before_upload.txt",
                 relativePath = "deleted_before_upload.txt",
@@ -1573,6 +1585,7 @@ class PermanentBackupEngineTest {
         // Insert a record that had retryCount = 1 after a crash before DB update completed
         val recId = dao.insertRecord(
             BackupFileEntity(
+                accountId = "user@example.com",
                 sourceUri = contractFile.absolutePath,
                 sourceFileIdentity = "vol0:Documents/contract.pdf",
                 relativePath = "Documents/contract.pdf",
@@ -3426,13 +3439,14 @@ class PermanentBackupEngineTest {
             writeText("CAMERA_PHOTO_SWITCH_2026")
         }
 
-        // Simulate contaminated v2.3.4 state where irakiroan@gmail.com had the Cloud Bridge owner's
-        // root folder ID (19pEu61NKlENus5JAEmUkST5EimE6KOm_) and VERIFIED records in SQLite
+        // Simulate contaminated legacy state where irakiroan@gmail.com had another account's
+        // root folder ID and VERIFIED records in SQLite without any hardcoded production constants
+        val foreignBridgeRootId = "foreign_owner_root_folder_id_999"
         val authPrefs = TestInMemorySharedPreferences()
         authPrefs.edit()
             .putString("account_email", "irakiroan@gmail.com")
-            .putString("root_drive_folder_id", GoogleAuthManager.CLOUD_BRIDGE_OWNER_ROOT_FOLDER_ID)
-            .putString("irakiroan@gmail.com_root_drive_folder_id", GoogleAuthManager.CLOUD_BRIDGE_OWNER_ROOT_FOLDER_ID)
+            .putString("root_drive_folder_id", foreignBridgeRootId)
+            .putString("irakiroan@gmail.com_root_drive_folder_id", foreignBridgeRootId)
             .apply()
 
         val switchAuth = GoogleAuthManager(
@@ -3442,9 +3456,26 @@ class PermanentBackupEngineTest {
             customPrefs = authPrefs
         )
 
-        // Verify constructor immediately purged the bridge owner's root folder ID from irakiroan@gmail.com
+        // Verify constructor immediately purged the unverified root folder ID from irakiroan@gmail.com
         assertEquals(null, switchAuth.accountState.value.rootDriveFolderId)
 
+        dao.upsertGoogleAccount(
+            GoogleAccountEntity(
+                accountId = "mdkamruzzamanirak@gmail.com",
+                email = "mdkamruzzamanirak@gmail.com",
+                displayName = "Md Kamruzzaman Irak",
+                selectedAccountRef = "mdkamruzzamanirak@gmail.com",
+                isActive = false,
+                authorizationState = AccountAuthState.AUTHORIZED.name,
+                grantedScopes = GoogleAuthManager.LEAST_PRIVILEGE_SCOPE,
+                lastSuccessfulConnectionMs = 900L,
+                lastTokenRefreshStatus = "OK",
+                lastTokenRefreshMs = 900L,
+                connectionError = null,
+                backupRootFolderId = foreignBridgeRootId,
+                backupRootFolderName = "Android_Permanent_Backup"
+            )
+        )
         dao.upsertGoogleAccount(
             GoogleAccountEntity(
                 accountId = "irakiroan@gmail.com",
@@ -3458,7 +3489,7 @@ class PermanentBackupEngineTest {
                 lastTokenRefreshStatus = "OK",
                 lastTokenRefreshMs = 1000L,
                 connectionError = null,
-                backupRootFolderId = GoogleAuthManager.CLOUD_BRIDGE_OWNER_ROOT_FOLDER_ID,
+                backupRootFolderId = foreignBridgeRootId,
                 backupRootFolderName = "Android_Permanent_Backup"
             )
         )
@@ -3476,7 +3507,7 @@ class PermanentBackupEngineTest {
                 sha256Hash = "dummy_sha256_hash",
                 md5Hash = "dummy_md5_hash",
                 driveFileId = "old_bridge_owner_file_id",
-                driveFolderId = GoogleAuthManager.CLOUD_BRIDGE_OWNER_ROOT_FOLDER_ID,
+                driveFolderId = foreignBridgeRootId,
                 driveStoredName = "photo_switch.jpg",
                 backupVersion = 1,
                 uploadedBytes = localPhoto.length(),
@@ -3486,9 +3517,9 @@ class PermanentBackupEngineTest {
         )
         dao.cacheDriveFolder(
             DriveFolderCacheEntity(
-                relativePath = "irakiroan@gmail.com:${GoogleAuthManager.CLOUD_BRIDGE_OWNER_ROOT_FOLDER_ID}:DCIM/Camera",
+                relativePath = "irakiroan@gmail.com:$foreignBridgeRootId:DCIM/Camera",
                 driveFolderId = "old_bridge_camera_folder_id",
-                parentDriveFolderId = GoogleAuthManager.CLOUD_BRIDGE_OWNER_ROOT_FOLDER_ID
+                parentDriveFolderId = foreignBridgeRootId
             )
         )
 
@@ -3503,15 +3534,15 @@ class PermanentBackupEngineTest {
             customSettingsPrefs = repoPrefs
         )
 
-        // 1. Startup remediation moves spoofed rows to mdkamruzzamanirak@gmail.com and clears irakiroan@gmail.com
+        // 1. Startup remediation dynamically moves unverified rows to the matching owner account and clears irakiroan@gmail.com
         repository.syncPersistedAccountOnStartup()
         assertEquals(
-            "Startup must never restore bridge owner's folder ID onto irakiroan@gmail.com",
+            "Startup must never restore unverified folder ID onto irakiroan@gmail.com",
             null,
             switchAuth.accountState.value.rootDriveFolderId
         )
         assertEquals(
-            "Spoofed record must be reassigned to mdkamruzzamanirak@gmail.com",
+            "Spoofed record must be dynamically reassigned to the account owning foreignBridgeRootId",
             1,
             dao.countVerifiedRecordsForAccount("mdkamruzzamanirak@gmail.com")
         )
@@ -3528,7 +3559,7 @@ class PermanentBackupEngineTest {
             accessToken = "owner_token",
             refreshToken = "owner_refresh"
         )
-        switchAuth.setRootDriveFolderName("Android_Permanent_Backup", GoogleAuthManager.CLOUD_BRIDGE_OWNER_ROOT_FOLDER_ID)
+        switchAuth.setRootDriveFolderName("Android_Permanent_Backup", foreignBridgeRootId)
         repository.backupEngine.refreshRemoteQuotaAndRootFolder(createFolderIfMissing = false)
         val ownerDash = repository.buildDashboardSummary()
         assertEquals("mdkamruzzamanirak@gmail.com", ownerDash.accountState.email)
