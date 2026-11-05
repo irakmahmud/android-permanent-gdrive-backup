@@ -3176,7 +3176,8 @@ class PermanentBackupEngineTest {
 
         assertTrue("Loopback OAuth code exchange must succeed: ${loopOutcome.errorMessage}", loopOutcome.authorized)
         assertEquals("irakiroan@gmail.com", isolatedAuth.accountState.value.email)
-        assertEquals("irakiroan_real_access_token", isolatedAuth.accountState.value.accessToken)
+        assertEquals("irakiroan_real_access_token", loopOutcome.accessToken)
+        assertEquals("irakiroan_real_access_token", isolatedAuth.getValidAccessToken())
 
         // 4. Immediate folder creation upon account connection (without waiting for full phone scan)
         val scanner = AndroidStorageScanner(null, listOf(tempStorageDir), true)
