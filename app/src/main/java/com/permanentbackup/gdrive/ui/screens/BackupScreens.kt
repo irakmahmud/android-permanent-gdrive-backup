@@ -81,7 +81,7 @@ enum class AppScreen(val title: String) {
 
 @Composable
 fun LoadingStateCard(
-    message: String = "Loading... Please wait while all files are being loaded...",
+    message: String = "Refreshing...",
     detail: String? = null
 ) {
     Card(
@@ -210,31 +210,15 @@ fun HomeDashboardScreen(
         )
     }
 
-    val isAnyLoading = summary.isDashboardLoading ||
-        summary.isScanningPhoneStorage ||
-        summary.isVerifyingOrCreatingDriveFolder ||
-        isCreatingOrRenamingDriveFolder
-
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        if (isAnyLoading) {
+        if (isCreatingOrRenamingDriveFolder) {
             item {
-                val loadingDetail = when {
-                    isCreatingOrRenamingDriveFolder || summary.isVerifyingOrCreatingDriveFolder ->
-                        "Verifying / creating folder '$rootDriveName' on Google Drive..."
-                    summary.isScanningPhoneStorage ->
-                        summary.currentScanningOrUploadingFile ?: "Scanning phone folders and verifying file states..."
-                    else ->
-                        "Checking Google Drive connection, folder state, and phone storage..."
-                }
-                LoadingStateCard(
-                    message = "Loading... Please wait while all files are being loaded...",
-                    detail = loadingDetail
-                )
+                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
             }
         }
 
@@ -257,7 +241,6 @@ fun HomeDashboardScreen(
         // STATE-AWARE LIVE AUTO-BACKUP DESTINATION & PHONE SOURCE CARD
         item {
             val statusHeaderText = when {
-                isAnyLoading -> "⏳ LOADING CURRENT STATE — PLEASE WAIT..."
                 !summary.accountState.isConnected -> "⚠️ GOOGLE ACCOUNT NOT CONNECTED — BACKUP INACTIVE"
                 !summary.hasStoragePermission -> "⚠️ PHONE STORAGE PERMISSION REQUIRED — BACKUP WAITING"
                 !settings.userBackupConsentGranted -> "⚠️ USER BACKUP CONSENT DISABLED IN SETTINGS"
@@ -361,8 +344,6 @@ fun HomeDashboardScreen(
                     )
                     val phoneSourceStatusText = when {
                         summary.currentPhoneSourcePath.isNotBlank() -> summary.currentPhoneSourcePath
-                        summary.isScanningPhoneStorage || summary.isDashboardLoading ->
-                            "Loading... Please wait while all files are being loaded..."
                         !summary.hasStoragePermission ->
                             "Storage permission not granted yet — grant permission below to scan phone folders."
                         summary.accessibleFolderCount == 0 ->
@@ -378,10 +359,8 @@ fun HomeDashboardScreen(
                     val liveEngineStatusText = when {
                         !summary.currentScanningOrUploadingFile.isNullOrBlank() ->
                             summary.currentScanningOrUploadingFile
-                        isAnyLoading ->
-                            "Loading... Please wait while all files are being loaded..."
                         summary.isBackupRunning ->
-                            "Scanning phone folders & uploading files..."
+                            "Active — Backing up phone folders & uploading files..."
                         !summary.accountState.isConnected ->
                             "Waiting for Google Account sign-in."
                         !summary.hasStoragePermission ->
@@ -550,13 +529,6 @@ fun HomeDashboardScreen(
                         it.accessStatus == FolderAccessStatus.ACCESSIBLE
                     }
                     when {
-                        summary.isDashboardLoading || summary.isScanningPhoneStorage -> {
-                            Text(
-                                text = "Loading... Please wait while all files and folders are being loaded...",
-                                style = MaterialTheme.typography.bodySmall,
-                                fontWeight = FontWeight.SemiBold
-                            )
-                        }
                         !summary.hasStoragePermission -> {
                             Text(
                                 text = "Phone storage permission is not granted yet. Grant storage permission above to scan and list your actual phone folders.",
@@ -625,13 +597,6 @@ fun HomeDashboardScreen(
                         .distinctBy { it.id }
                         .take(10)
                     when {
-                        summary.isDashboardLoading || summary.isScanningPhoneStorage -> {
-                            Text(
-                                text = "Loading... Please wait while all files are being loaded...",
-                                style = MaterialTheme.typography.bodySmall,
-                                fontWeight = FontWeight.SemiBold
-                            )
-                        }
                         combinedFiles.isEmpty() -> {
                             val emptyMessage = when {
                                 !summary.hasStoragePermission ->
@@ -1111,10 +1076,7 @@ fun MyDriveExplorerScreen(
         }
 
         if (isLoadingCloudDrive) {
-            LoadingStateCard(
-                message = "Loading... Please wait while all files are being loaded...",
-                detail = "Querying Google Drive API for '${currentFilter.title}'..."
-            )
+            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
         }
 
         cloudDriveErrorMessage?.takeIf { it.isNotBlank() }?.let { err ->
@@ -1424,11 +1386,8 @@ fun PhoneStorageExplorerScreen(
             }
         }
 
-        if (isLoadingLocalBrowser) {
-            LoadingStateCard(
-                message = "Loading... Please wait while all files are being loaded...",
-                detail = "Scanning /storage/emulated/0/${currentPath.ifBlank { "" }}..."
-            )
+        if (isLoadingLocalBrowser && localItems.isEmpty()) {
+            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
         }
 
         if (!showCoverageTab) {
@@ -1646,11 +1605,8 @@ fun BackupVersionHistoryScreen(
             text = "Every file modification creates a new immutable version (v1, v2, ...). Restoring a version NEVER overwrites existing local files.",
             style = MaterialTheme.typography.bodySmall
         )
-        if (isLoading) {
-            LoadingStateCard(
-                message = "Loading... Please wait while all files are being loaded...",
-                detail = "Loading backup version history..."
-            )
+        if (isLoading && verifiedHistory.isEmpty() && accountBackupVersions.isEmpty()) {
+            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
         }
         actionFeedback?.let { msg ->
             Card(
@@ -1778,12 +1734,9 @@ fun RecentActivityScreen(
                 fontWeight = FontWeight.Bold
             )
         }
-        if (isLoading) {
+        if (isLoading && recentRecords.isEmpty() && syncEvents.isEmpty()) {
             item {
-                LoadingStateCard(
-                    message = "Loading... Please wait while all files are being loaded...",
-                    detail = "Loading recent file records and sync events..."
-                )
+                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
             }
         }
         if (!isLoading && recentRecords.isEmpty() && syncEvents.isEmpty()) {
@@ -1878,15 +1831,6 @@ fun TransferManagerScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-        if (summary.isDashboardLoading || summary.isScanningPhoneStorage) {
-            item {
-                LoadingStateCard(
-                    message = "Loading... Please wait while all files are being loaded...",
-                    detail = summary.currentScanningOrUploadingFile ?: "Scanning files and transfer queue..."
-                )
-            }
-        }
-
         item {
             Row(
                 modifier = Modifier.fillMaxWidth(),

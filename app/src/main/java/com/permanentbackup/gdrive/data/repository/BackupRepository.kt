@@ -546,6 +546,13 @@ class BackupRepository(
         }
     }
 
+    suspend fun getCachedCloudBrowseItems(
+        filter: DriveViewFilter = DriveViewFilter.BACKUP_ROOT,
+        parentFolderId: String? = null,
+        searchQuery: String = ""
+    ): List<CloudBrowseItem> =
+        loadCachedCloudBrowseItems(currentAccountId(), filter, parentFolderId, searchQuery)
+
     private suspend fun loadCachedCloudBrowseItems(
         accountId: String,
         filter: DriveViewFilter = DriveViewFilter.BACKUP_ROOT,
@@ -1077,7 +1084,7 @@ class BackupRepository(
             currentScanningOrUploadingFile = backupEngine.currentScanActivity.value,
             isContinuousAutoBackupServiceActive = isAutoBackupActive,
             isDashboardLoading = isDashboardLoading,
-            isScanningPhoneStorage = isScanningPhoneStorage || backupEngine.isRunning.value,
+            isScanningPhoneStorage = isScanningPhoneStorage,
             isVerifyingOrCreatingDriveFolder = backupEngine.isVerifyingOrCreatingDriveFolder.value,
             hasStoragePermission = hasStoragePerm,
             hasManageAllFilesPermission = hasManagePerm,

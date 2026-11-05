@@ -48,16 +48,26 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
         _actionFeedbackMessage.value = throwable.message ?: "Background sync operation encountered an error."
     }
 
-    private val _dashboardSummary = MutableStateFlow(DashboardSummary())
+    private val _dashboardSummary = MutableStateFlow(
+        DashboardSummary(
+            accountState = repository.authManager.accountState.value,
+            hasStoragePermission = repository.storageSource.hasStoragePermission,
+            hasManageAllFilesPermission = repository.storageSource.hasManageAllFilesPermission(),
+            isDriveRootFolderCreated = repository.authManager.accountState.value.isConnected &&
+                !repository.authManager.accountState.value.rootDriveFolderId.isNullOrBlank(),
+            isDashboardLoading = false,
+            isScanningPhoneStorage = false
+        )
+    )
     val dashboardSummary: StateFlow<DashboardSummary> = _dashboardSummary.asStateFlow()
 
     private val _folderCoverage = MutableStateFlow<List<FolderCoverageItem>>(emptyList())
     val folderCoverage: StateFlow<List<FolderCoverageItem>> = _folderCoverage.asStateFlow()
 
-    private val _isDashboardLoading = MutableStateFlow(true)
+    private val _isDashboardLoading = MutableStateFlow(false)
     val isDashboardLoading: StateFlow<Boolean> = _isDashboardLoading.asStateFlow()
 
-    private val _isScanningPhoneStorage = MutableStateFlow(true)
+    private val _isScanningPhoneStorage = MutableStateFlow(false)
     val isScanningPhoneStorage: StateFlow<Boolean> = _isScanningPhoneStorage.asStateFlow()
 
     private val _isLoadingCloudDrive = MutableStateFlow(false)
@@ -65,7 +75,7 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
 
     val cloudDriveErrorMessage: StateFlow<String?> = repository.lastCloudBrowseError
 
-    private val _isLoadingLocalBrowser = MutableStateFlow(true)
+    private val _isLoadingLocalBrowser = MutableStateFlow(false)
     val isLoadingLocalBrowser: StateFlow<Boolean> = _isLoadingLocalBrowser.asStateFlow()
 
     private val _isCreatingOrRenamingDriveFolder = MutableStateFlow(false)
@@ -94,7 +104,9 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
     private val _isDriveGridView = MutableStateFlow(false)
     val isDriveGridView: StateFlow<Boolean> = _isDriveGridView.asStateFlow()
 
-    private val _localPhoneItems = MutableStateFlow<List<LocalBrowseItem>>(emptyList())
+    private val _localPhoneItems = MutableStateFlow<List<LocalBrowseItem>>(
+        runCatching { repository.storageSource.browseLocalDirectory("") }.getOrDefault(emptyList())
+    )
     val localPhoneItems: StateFlow<List<LocalBrowseItem>> = _localPhoneItems.asStateFlow()
 
     private val _currentLocalPath = MutableStateFlow("")
@@ -185,18 +197,34 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
     private var dashboardRefreshJob: kotlinx.coroutines.Job? = null
 
     init {
-        viewModelScope.launch(vmExceptionHandler) {
-            _isDashboardLoading.value = true
-            _isScanningPhoneStorage.value = true
-            withContext(Dispatchers.IO) {
-                runCatching { repository.syncPersistedAccountOnStartup() }
-                runCatching { fileObserverManager.startWatching() }
-                runCatching { BackupWorkScheduler.schedulePeriodicBackup(getApplication(), settings.value) }
-                runCatching { BackupWorkScheduler.scheduleContentUriTriggeredBackup(getApplication(), settings.value) }
-                runCatching { ensureAutoBackupRunning() }
-            }
-            refreshDashboardAndCoverage(fetchRemoteQuota = true, forceCoverage = true)
-            refreshLocalPhoneBrowser("")
+        viewModelScope.launch(Dispatchers.IO + vmExceptionHandler) {
+            runCatching { repository.syncPersistedAccountOnStartup() }
+            // Zero-delay instant local snapshot before any network or background watcher work
+            val initialCoverage = runCatching { repository.getFolderCoverageItems() }.getOrDefault(emptyList())
+            lastCoverageScanMs = System.currentTimeMillis()
+            _folderCoverage.value = initialCoverage
+            _dashboardSummary.value = runCatching {
+                repository.buildDashboardSummary(
+                    precomputedCoverage = initialCoverage,
+                    isDashboardLoading = false,
+                    isScanningPhoneStorage = false
+                )
+            }.getOrDefault(_dashboardSummary.value.copy(isDashboardLoading = false, isScanningPhoneStorage = false))
+            _localPhoneItems.value = runCatching { repository.browseLocalPhoneStorage("") }.getOrDefault(_localPhoneItems.value)
+            _cloudDriveItems.value = runCatching {
+                repository.getCachedCloudBrowseItems(
+                    filter = _driveFilter.value,
+                    parentFolderId = null,
+                    searchQuery = ""
+                )
+            }.getOrDefault(emptyList())
+
+            // Start watchers and remote cloud sync non-blockingly in the background
+            runCatching { fileObserverManager.startWatching() }
+            runCatching { BackupWorkScheduler.schedulePeriodicBackup(getApplication(), settings.value) }
+            runCatching { BackupWorkScheduler.scheduleContentUriTriggeredBackup(getApplication(), settings.value) }
+            runCatching { ensureAutoBackupRunning() }
+            refreshDashboardAndCoverage(fetchRemoteQuota = true, forceCoverage = false)
         }
 
         // Real-time stream of active scan/upload activity so the UI immediately reflects the true runtime state
@@ -276,7 +304,7 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
                     currentDriveTargetPath = driveTarget,
                     currentScanningOrUploadingFile = scanActivity ?: current.currentScanningOrUploadingFile,
                     isContinuousAutoBackupServiceActive = isAutoActive,
-                    isScanningPhoneStorage = _isScanningPhoneStorage.value || running,
+                    isScanningPhoneStorage = false,
                     isVerifyingOrCreatingDriveFolder = verifyingFolder || _isCreatingOrRenamingDriveFolder.value,
                     hasStoragePermission = hasStoragePerm,
                     hasManageAllFilesPermission = repository.storageSource.hasManageAllFilesPermission(),
@@ -335,55 +363,51 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
         }
         dashboardRefreshJob = viewModelScope.launch(vmExceptionHandler) {
             withContext(Dispatchers.IO) {
-                if (fetchRemoteQuota && repository.authManager.accountState.value.isConnected) {
-                    runCatching { repository.backupEngine.refreshRemoteQuotaAndRootFolder(createFolderIfMissing = true) }
-                    runCatching { repository.backupEngine.syncCloudChangesIncremental() }
-                    runCatching { repository.persistCurrentAccountToDatabase() }
-                }
-                val dbOk = if (!hasVerifiedDbIntegrityOnce) {
-                    hasVerifiedDbIntegrityOnce = true
-                    runCatching {
-                        app.database.checkDatabaseIntegrity() || app.database.attemptNonDestructiveRecovery()
-                    }.getOrDefault(true)
-                } else {
-                    _dashboardSummary.value.dbIntegrityOk
-                }
                 val now = System.currentTimeMillis()
                 val shouldScanCoverage = forceCoverage ||
                     _folderCoverage.value.isEmpty() ||
                     now - lastCoverageScanMs > 15_000L
-                if (shouldScanCoverage) {
-                    _isScanningPhoneStorage.value = true
-                }
                 val coverage = if (shouldScanCoverage) {
                     lastCoverageScanMs = now
-                    try {
-                        runCatching { repository.getFolderCoverageItems() }.getOrDefault(_folderCoverage.value)
-                    } finally {
-                        _isScanningPhoneStorage.value = false
-                    }
+                    runCatching { repository.getFolderCoverageItems() }.getOrDefault(_folderCoverage.value)
                 } else {
                     _folderCoverage.value
                 }
                 val watchedCount = fileObserverManager.getWatchedDirectoryPaths().size
-                val summary = runCatching {
+                val localSummary = runCatching {
                     repository.buildDashboardSummary(
                         precomputedCoverage = coverage,
                         isDashboardLoading = false,
-                        isScanningPhoneStorage = _isScanningPhoneStorage.value,
+                        isScanningPhoneStorage = false,
                         watchedFolderCountOverride = watchedCount
-                    ).copy(dbIntegrityOk = dbOk)
-                }.getOrDefault(DashboardSummary(dbIntegrityOk = dbOk, isDashboardLoading = false))
+                    )
+                }.getOrDefault(_dashboardSummary.value.copy(isDashboardLoading = false, isScanningPhoneStorage = false))
                 val versions = runCatching {
                     repository.getAccountBackupVersionsPaged(limit = 200)
                 }.getOrDefault(emptyList())
                 val diag = runCatching { repository.getOAuthDiagnostics() }.getOrDefault(_oauthDiagnostics.value)
 
                 _folderCoverage.value = coverage
-                _dashboardSummary.value = summary
+                _dashboardSummary.value = localSummary
                 _isDashboardLoading.value = false
+                _isScanningPhoneStorage.value = false
                 _accountBackupVersions.value = versions
                 _oauthDiagnostics.value = diag
+
+                if (fetchRemoteQuota && repository.authManager.accountState.value.isConnected) {
+                    runCatching { repository.backupEngine.refreshRemoteQuotaAndRootFolder(createFolderIfMissing = true) }
+                    runCatching { repository.backupEngine.syncCloudChangesIncremental() }
+                    runCatching { repository.persistCurrentAccountToDatabase() }
+                    val updatedSummary = runCatching {
+                        repository.buildDashboardSummary(
+                            precomputedCoverage = _folderCoverage.value,
+                            isDashboardLoading = false,
+                            isScanningPhoneStorage = false,
+                            watchedFolderCountOverride = watchedCount
+                        )
+                    }.getOrDefault(_dashboardSummary.value)
+                    _dashboardSummary.value = updatedSummary
+                }
             }
             if (fetchRemoteQuota) {
                 refreshCloudDriveExplorer()
@@ -393,9 +417,21 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
 
     fun refreshCloudDriveExplorer() {
         viewModelScope.launch(Dispatchers.IO + vmExceptionHandler) {
+            val currentFolderId = _driveFolderBreadcrumbs.value.lastOrNull()?.first
+            if (_cloudDriveItems.value.isEmpty()) {
+                val cached = runCatching {
+                    repository.getCachedCloudBrowseItems(
+                        filter = _driveFilter.value,
+                        parentFolderId = currentFolderId,
+                        searchQuery = _driveSearchQuery.value
+                    )
+                }.getOrDefault(emptyList())
+                if (cached.isNotEmpty()) {
+                    _cloudDriveItems.value = cached
+                }
+            }
             _isLoadingCloudDrive.value = true
             try {
-                val currentFolderId = _driveFolderBreadcrumbs.value.lastOrNull()?.first
                 val items = repository.browseCloudDriveFiles(
                     filter = _driveFilter.value,
                     parentFolderId = currentFolderId,
@@ -611,14 +647,13 @@ class BackupViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun refreshLocalPhoneBrowser(relativeSubPath: String = _currentLocalPath.value) {
+        _currentLocalPath.value = relativeSubPath
+        runCatching {
+            _localPhoneItems.value = repository.storageSource.browseLocalDirectory(relativeSubPath)
+        }
         viewModelScope.launch(Dispatchers.IO + vmExceptionHandler) {
-            _isLoadingLocalBrowser.value = true
-            try {
-                _currentLocalPath.value = relativeSubPath
-                _localPhoneItems.value = repository.browseLocalPhoneStorage(relativeSubPath)
-            } finally {
-                _isLoadingLocalBrowser.value = false
-            }
+            _isLoadingLocalBrowser.value = false
+            _localPhoneItems.value = repository.browseLocalPhoneStorage(relativeSubPath)
         }
     }
 

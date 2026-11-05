@@ -760,18 +760,17 @@ class PermanentBackupEngine(
             var skippedUnchanged = 0
             val discoveredIdentities = HashSet<String>(4096)
 
-            val rootFolderName = activeRootFolderName()
-            val isDriveFolderCreated = authManager.accountState.value.isConnected &&
-                !authManager.accountState.value.rootDriveFolderId.isNullOrBlank()
-
             for (discovered in storageSource.scanFilesSequence(computeHashes = false)) {
                 scannedCount++
                 discoveredIdentities.add(discovered.sourceFileIdentity)
-                if (scannedCount == 1 || scannedCount % 10 == 0) {
-                    _currentScanActivity.value = if (isDriveFolderCreated) {
-                        "From Phone: /storage/emulated/0/${discovered.relativePath} → To Google Drive: My Drive/$rootFolderName/${discovered.relativePath}"
+                val liveRootName = activeRootFolderName()
+                val liveFolderCreated = authManager.accountState.value.isConnected &&
+                    !authManager.accountState.value.rootDriveFolderId.isNullOrBlank()
+                if (scannedCount == 1 || scannedCount % 25 == 0) {
+                    _currentScanActivity.value = if (liveFolderCreated) {
+                        "From Phone: /storage/emulated/0/${discovered.relativePath} → To Google Drive: My Drive/$liveRootName/${discovered.relativePath}"
                     } else {
-                        "Scanning Phone: /storage/emulated/0/${discovered.relativePath} (Google Drive folder '$rootFolderName' will be created on upload)"
+                        "From Phone: /storage/emulated/0/${discovered.relativePath} → Target: My Drive/$liveRootName/${discovered.relativePath}"
                     }
                 }
 
@@ -786,21 +785,26 @@ class PermanentBackupEngine(
                 val queued = evaluateAndQueueDiscoveredFile(discovered)
                 if (queued) {
                     newlyQueued++
-                    _currentScanActivity.value = if (isDriveFolderCreated) {
-                        "Queued from Phone: /storage/emulated/0/${discovered.relativePath} → To Google Drive: My Drive/$rootFolderName/${discovered.relativePath}"
-                    } else {
-                        "Queued from Phone: /storage/emulated/0/${discovered.relativePath} (Waiting to create Google Drive folder '$rootFolderName')"
+                    if (newlyQueued == 1 || newlyQueued % 10 == 0) {
+                        _currentScanActivity.value = if (liveFolderCreated) {
+                            "Queued from Phone: /storage/emulated/0/${discovered.relativePath} → To Google Drive: My Drive/$liveRootName/${discovered.relativePath}"
+                        } else {
+                            "Queued from Phone: /storage/emulated/0/${discovered.relativePath} → Target: My Drive/$liveRootName/${discovered.relativePath}"
+                        }
                     }
                 } else {
                     skippedUnchanged++
                 }
             }
 
+            val finalRootName = activeRootFolderName()
+            val finalFolderCreated = authManager.accountState.value.isConnected &&
+                !authManager.accountState.value.rootDriveFolderId.isNullOrBlank()
             if (scannedCount > 0 && newlyQueued == 0) {
-                _currentScanActivity.value = if (isDriveFolderCreated) {
-                    "Verified $scannedCount phone files → Google Drive: My Drive/$rootFolderName/ (100% Up to Date)"
+                _currentScanActivity.value = if (finalFolderCreated) {
+                    "Verified $scannedCount phone files → Google Drive: My Drive/$finalRootName/ (100% Up to Date)"
                 } else {
-                    "Scanned $scannedCount phone files (Google Drive folder '$rootFolderName' not created yet)"
+                    "Indexed $scannedCount phone files → Target: My Drive/$finalRootName/"
                 }
             }
 
@@ -855,8 +859,32 @@ class PermanentBackupEngine(
      */
     suspend fun evaluateAndQueueDiscoveredFile(rawDiscovered: DiscoveredSourceFile): Boolean {
         val accountId = currentAccountId()
+        val latestForAccount = backupDao.getLatestVersionForAccountAndIdentity(accountId, rawDiscovered.sourceFileIdentity)
 
-        // Fast metadata-first hash resolution: reuse cached SHA-256/MD5 if file size & mtime are unchanged
+        // Zero-delay fast path: if the active account already has a record with identical size & mtime
+        // (and no conflicting precomputed SHA-256), skip without any disk read or hashing.
+        if (latestForAccount != null &&
+            latestForAccount.accountId == accountId &&
+            latestForAccount.fileSize == rawDiscovered.fileSize &&
+            latestForAccount.lastModifiedMs == rawDiscovered.lastModifiedMs &&
+            (rawDiscovered.sha256Hash == null ||
+                latestForAccount.sha256Hash == null ||
+                latestForAccount.sha256Hash.equals(rawDiscovered.sha256Hash, ignoreCase = true))
+        ) {
+            if (!latestForAccount.localExists) {
+                backupDao.updateRecord(latestForAccount.copy(localExists = true))
+            }
+            return latestForAccount.uploadStatus != UploadStatus.VERIFIED
+        }
+
+        // Fast metadata-first hash resolution: reuse cached SHA-256/MD5 if file size & mtime are unchanged,
+        // and defer full-stream hashing of large new files (> 256 KiB) to uploadSingleRecordResumableInternal
+        // so scanning thousands of phone files completes in milliseconds.
+        val needSyncHashToCompareExisting = latestForAccount != null &&
+            latestForAccount.fileSize == rawDiscovered.fileSize &&
+            latestForAccount.sha256Hash != null
+        val maxSyncScanHashBytes = if (needSyncHashToCompareExisting) 64L * 1024L * 1024L else 256L * 1024L
+
         val discovered = if (rawDiscovered.sha256Hash != null && rawDiscovered.md5Hash != null) {
             rawDiscovered
         } else {
@@ -872,7 +900,7 @@ class PermanentBackupEngine(
                     sha256Hash = cachedLocal.latestSha256,
                     md5Hash = cachedLocal.latestMd5
                 )
-            } else if (rawDiscovered.fileSize <= 64L * 1024L * 1024L) {
+            } else if (rawDiscovered.fileSize <= maxSyncScanHashBytes) {
                 try {
                     val hashes = SourceFileReadOnlyGuard.computeStreamingHashes {
                         storageSource.openInputStream(rawDiscovered.sourceUri)
@@ -888,8 +916,6 @@ class PermanentBackupEngine(
                 rawDiscovered
             }
         }
-
-        val latestForAccount = backupDao.getLatestVersionForAccountAndIdentity(accountId, discovered.sourceFileIdentity)
 
         if (latestForAccount == null) {
             val recordId = backupDao.insertRecord(
@@ -1346,7 +1372,7 @@ class PermanentBackupEngine(
             return false
         }
 
-        // Compute streaming SHA-256 and MD5 lazily if not yet computed (e.g. for multi-GB files)
+        // Compute streaming SHA-256 and MD5 lazily if not yet computed (e.g. for files > 256 KiB queued with fast scan)
         val record = if (initialRecord.sha256Hash == null || initialRecord.md5Hash == null) {
             try {
                 val hashes = SourceFileReadOnlyGuard.computeStreamingHashes {
@@ -1357,6 +1383,14 @@ class PermanentBackupEngine(
                     md5Hash = hashes.md5Hex
                 )
                 backupDao.updateRecord(updated)
+                backupDao.getLocalFileByIdentity(updated.sourceFileIdentity)?.let { local ->
+                    backupDao.upsertLocalFile(
+                        local.copy(
+                            latestSha256 = hashes.sha256Hex,
+                            latestMd5 = hashes.md5Hex
+                        )
+                    )
+                }
                 updated
             } catch (e: Exception) {
                 val detail = "Unable to read source stream: ${e.message}"

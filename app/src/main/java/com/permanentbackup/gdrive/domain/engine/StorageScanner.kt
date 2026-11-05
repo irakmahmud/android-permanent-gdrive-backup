@@ -79,6 +79,51 @@ class AndroidStorageScanner(
         }
 
     private val persistedSafTreeUris: MutableSet<String> = Collections.synchronizedSet(LinkedHashSet())
+    private val folderFileCountCache = java.util.concurrent.ConcurrentHashMap<String, Triple<Long, Long, Int>>()
+    private val dirChildCountCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, Int>>()
+
+    private fun fastCachedChildCount(dir: File): Int {
+        return try {
+            val key = dir.absolutePath
+            val mod = dir.lastModified()
+            val cached = dirChildCountCache[key]
+            if (cached != null && cached.first == mod) {
+                return cached.second
+            }
+            val count = dir.list()?.size ?: 0
+            dirChildCountCache[key] = mod to count
+            count
+        } catch (_: Throwable) {
+            0
+        }
+    }
+
+    private fun fastCachedFileCount(dir: File, nowMs: Long): Int {
+        return try {
+            val key = dir.absolutePath
+            val mod = dir.lastModified()
+            val cached = folderFileCountCache[key]
+            if (cached != null && cached.first == mod && (nowMs - cached.second) < 180_000L) {
+                return cached.third
+            }
+            val maxCap = if (customRootDirectories != null) Int.MAX_VALUE else 2000
+            var count = 0
+            for (f in dir.walkTopDown()
+                .maxDepth(4)
+                .onFail { _, _ -> }
+                .onEnter { d -> !isMirrorOrRestoreDirectory(d.name, d.name) && !d.name.startsWith(".thumbnails") && d.canRead() }
+            ) {
+                if (f.isFile && f.canRead()) {
+                    count++
+                    if (count >= maxCap) break
+                }
+            }
+            folderFileCountCache[key] = Triple(mod, nowMs, count)
+            count
+        } catch (_: Throwable) {
+            0
+        }
+    }
 
     override fun registerPersistedSafTreeUri(treeUri: String) {
         if (treeUri.isNotBlank()) {
@@ -480,7 +525,7 @@ class AndroidStorageScanner(
                     val fullRel = "$activeRootPrefix$relInsideRoot"
                     val restricted = isRestrictedAndroidPath(relInsideRoot)
                     val childCount = if (child.isDirectory && !restricted && child.canRead()) {
-                        child.list()?.size ?: 0
+                        fastCachedChildCount(child)
                     } else {
                         0
                     }
@@ -518,15 +563,7 @@ class AndroidStorageScanner(
                 else -> FolderAccessStatus.NOT_PRESENT_ON_DEVICE
             }
             val discoveredCount = if (status == FolderAccessStatus.ACCESSIBLE && folderFile != null) {
-                try {
-                    folderFile.walkTopDown()
-                        .maxDepth(5)
-                        .onFail { _, _ -> }
-                        .onEnter { d -> !isMirrorOrRestoreDirectory(d.name, d.name) && d.canRead() }
-                        .count { it.isFile && it.canRead() }
-                } catch (_: Throwable) {
-                    0
-                }
+                fastCachedFileCount(folderFile, nowMs)
             } else {
                 0
             }
@@ -564,14 +601,7 @@ class AndroidStorageScanner(
                         it.first.equals(topDir.name, ignoreCase = true)
                     }
                     if (!alreadyListed) {
-                        val count = try {
-                            topDir.walkTopDown()
-                                .maxDepth(5)
-                                .onFail { _, _ -> }
-                                .count { it.isFile && it.canRead() }
-                        } catch (_: Throwable) {
-                            0
-                        }
+                        val count = fastCachedFileCount(topDir, nowMs)
                         items.add(
                             FolderCoverageItem(
                                 folderName = "Dynamic Folder: ${topDir.name}",
@@ -593,14 +623,7 @@ class AndroidStorageScanner(
             for (sdIdx in 1 until roots.size) {
                 val sdRoot = roots[sdIdx]
                 val count = if (hasStoragePermission && sdRoot.canRead()) {
-                    try {
-                        sdRoot.walkTopDown()
-                            .maxDepth(5)
-                            .onFail { _, _ -> }
-                            .count { it.isFile && it.canRead() }
-                    } catch (_: Throwable) {
-                        0
-                    }
+                    fastCachedFileCount(sdRoot, nowMs)
                 } else {
                     0
                 }
